@@ -793,7 +793,18 @@ pub(super) async fn handle_client(
                                 messages.push(ctx_msg);
                             }
                             if let Some(sp) = result.system_prompt {
-                                system_prompt = Some(sp);
+                                // Plugins may only append to the system prompt, not replace it.
+                                // Full replacement would let a compromised plugin override all
+                                // safety instructions embedded in the base prompt.
+                                match &mut system_prompt {
+                                    Some(existing) => {
+                                        existing.push_str("\n\n");
+                                        existing.push_str(&sp);
+                                    }
+                                    None => {
+                                        system_prompt = Some(sp);
+                                    }
+                                }
                             }
                         }
                     }
