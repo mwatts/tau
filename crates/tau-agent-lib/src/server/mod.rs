@@ -530,6 +530,16 @@ pub async fn run() -> crate::Result<()> {
     let listener = Async::<UnixListener>::bind(&sock)
         .map_err(|e| crate::Error::Io(format!("bind {}: {}", sock.display(), e)))?;
 
+    // Restrict socket to owner-only access (0o600) so other local users
+    // cannot connect and issue arbitrary requests.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&sock, perms)
+            .map_err(|e| crate::Error::Io(format!("chmod socket: {}", e)))?;
+    }
+
     let pid = std::process::id();
     std::fs::write(pid_path(), pid.to_string())
         .map_err(|e| crate::Error::Io(format!("write pidfile: {}", e)))?;
