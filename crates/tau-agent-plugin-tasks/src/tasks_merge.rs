@@ -32,14 +32,21 @@
 //! of its merge. See [`sessions_to_archive`] for the filter and the unit
 //! tests below.
 
+use std::borrow::Cow;
 use std::io::{BufRead, Write};
 
 use serde::Deserialize;
 use serde_json::json;
+use shell_escape::escape;
 
 use crate::tasks_db::{TaskSession, TasksDb};
 use crate::tasks_state::TaskState;
 use tau_agent_plugin::{Request, Response};
+
+/// Shell-escape a string for safe interpolation into a bash command.
+fn sh(s: &str) -> Cow<'_, str> {
+    escape(Cow::Borrowed(s))
+}
 
 /// Session roles that should be archived when a task merges.
 ///
@@ -240,7 +247,7 @@ fn execute_bash(
 /// ENOENT before git is even exec'd — the silent post-merge
 /// branch-leak reported in task #581.
 fn build_branch_delete_command(project_dir: &str, branch: &str) -> String {
-    format!("git -C '{}' branch -D {}", project_dir, branch)
+    format!("git -C {} branch -D {}", sh(project_dir), sh(branch))
 }
 
 /// Execute the merge sequence for a task.
@@ -374,7 +381,7 @@ pub fn merge_task_for_caller(
         writer,
         reader,
         &log_session,
-        &format!("git -C '{}' rev-parse --abbrev-ref HEAD", project_dir),
+        &format!("git -C {} rev-parse --abbrev-ref HEAD", sh(project_dir)),
         None,
     )?;
     let head_branch = main_head_preflight.trim();
@@ -412,7 +419,7 @@ pub fn merge_task_for_caller(
     let rebase_cmd = format!(
         "GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
          git -c advice.resolveConflict=false rebase {}",
-        merge_target,
+        sh(&merge_target),
     );
     let (output, is_error) = execute_bash(writer, reader, &log_session, &rebase_cmd, None)?;
     log.push_str(&output);
@@ -475,7 +482,7 @@ pub fn merge_task_for_caller(
         &log_session,
         &format!(
             "git merge-base --is-ancestor {} {} && git update-ref refs/heads/{} $(git rev-parse {})",
-            merge_target, branch, merge_target, branch
+            sh(&merge_target), sh(&branch), sh(&merge_target), sh(&branch)
         ),
         None,
     )?;
@@ -521,7 +528,7 @@ pub fn merge_task_for_caller(
         writer,
         reader,
         &log_session,
-        &format!("git -C '{}' rev-parse --abbrev-ref HEAD", project_dir),
+        &format!("git -C {} rev-parse --abbrev-ref HEAD", sh(project_dir)),
         None,
     ) {
         Ok((output, _is_error)) => output,
@@ -539,7 +546,7 @@ pub fn merge_task_for_caller(
             writer,
             reader,
             &log_session,
-            &format!("git -C '{}' reset --hard HEAD", project_dir),
+            &format!("git -C {} reset --hard HEAD", sh(project_dir)),
             None,
         ) {
             Ok((output, _)) => {
