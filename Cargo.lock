@@ -1540,6 +1540,8 @@ dependencies = [
 [[package]]
 name = "myelin"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1852544cc387a5b7a24af7c29183d1027ece89722faa18b863b69929daaf3d2"
 dependencies = [
  "async-channel",
  "atomic-waker",
@@ -1554,6 +1556,8 @@ dependencies = [
 [[package]]
 name = "myelin-macros"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0949d1b680a1b8923d955043f1802f2d8e422fac92d485bacd8793c14e3f6e18"
 dependencies = [
  "convert_case 0.6.0",
  "proc-macro2",

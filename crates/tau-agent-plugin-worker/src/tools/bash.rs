@@ -159,12 +159,16 @@ pub fn close_fds_from_3() {
     // wrappers), and we ignore every error — this routine is
     // best-effort cleanup.
     unsafe {
-        // Try close_range(3, ~0u32, 0). On a Linux kernel ≥ 5.9 this
-        // closes every open fd ≥ 3 in one syscall. Older kernels
-        // return ENOSYS; we fall through to the loop below.
-        let ret = nix::libc::syscall(nix::libc::SYS_close_range, 3i64, !0u32 as i64, 0i64);
-        if ret == 0 {
-            return;
+        #[cfg(target_os = "linux")]
+        {
+            // Try close_range(3, ~0u32, 0). On a Linux kernel ≥ 5.9 this
+            // closes every open fd ≥ 3 in one syscall. Older kernels
+            // return ENOSYS; we fall through to the loop below.
+            let ret =
+                nix::libc::syscall(nix::libc::SYS_close_range, 3i64, !0u32 as i64, 0i64);
+            if ret == 0 {
+                return;
+            }
         }
 
         // Fallback: walk fds 3..max and close each. Use
@@ -174,9 +178,7 @@ pub fn close_fds_from_3() {
         let mut max_fd: nix::libc::c_int = 1024;
         let mut rl: nix::libc::rlimit = std::mem::zeroed();
         if nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur > 0 {
-            // Cap at i32::MAX (well above any realistic NOFILE) so
-            // the loop bound is always representable as c_int.
-            let cap: u64 = 1 << 20; // 1M fds is far beyond anything sane.
+            let cap: u64 = 1 << 20;
             let cur: u64 = rl.rlim_cur as u64;
             let bound = cur.min(cap) as nix::libc::c_int;
             if bound > max_fd {
