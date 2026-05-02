@@ -97,6 +97,184 @@ orchestration beyond the current serial dispatch model.
 
 ---
 
+## Feature Map: Tau vs Hermes Agent
+
+Comparative analysis against [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+by Nous Research. Hermes is an open-source, self-improving AI agent framework
+(MIT, 130k+ GitHub stars) built around a closed learning loop: the agent
+accumulates procedural knowledge, builds a persistent user model, and improves
+its own skills autonomously over time without GPU training.
+
+Docs: https://hermes-agent.nousresearch.com/docs
+
+### Where Tau Leads
+
+| Area | Tau | Hermes |
+|---|---|---|
+| Task board + merge queue | Full lifecycle (planning → review → merge), DAG deps, file-conflict-aware scheduling, checklist-gated fast-forward merge | `todo` tool (in-session only), no merge automation |
+| Multi-agent primitives | Session tree with spawn/join/message, persistent hierarchy, blocking await-reply | `delegate_task` ephemeral children, max depth 3, non-durable |
+| Anti-stuck detection | Loop-review checkpoint every N turns, separate reviewer model, nudge injection | Not documented |
+| Cost tracking | Per-session + project-wide + subscription utilization with 5h/7d buckets | Per-session tokens/cost only |
+| Git worktree isolation | Per-task worktrees with branch management | Filesystem snapshots + `/rollback` |
+| Daemon architecture | Long-lived Unix daemon, attach/detach, multi-client, hot-reload config | Single-process CLI or gateway |
+
+### Where Hermes Leads
+
+| Area | Hermes | Tau |
+|---|---|---|
+| MCP integration | Full client — MCP tools auto-registered at startup, per-server filtering, `/reload-mcp` | Planned (Phase 2) |
+| Skills system | 118 bundled skills, auto-generated from tasks, agentskills.io hub, progressive disclosure | Planned (Phase 3), static only |
+| Self-improvement | Skill auto-gen + patching, memory curation, meta-cognition LLM calls | Loop-review (stuck detection only) |
+| Agent-writable memory | MEMORY.md (factual, bounded), USER.md (Honcho dialectic user modeling) | None — instructions.toml is static, human-written |
+| Cross-session recall | FTS5 search across all past sessions, LLM-summarized results | Sessions isolated, no search |
+| Scheduled automation | Built-in cron with natural-language spec, multi-platform delivery | Not built-in |
+| Sandbox backends | 7 backends (local, Docker, SSH, Modal, Daytona, Vercel, Singularity) | `sandbox.toml` prefix (Docker, SSH) |
+| Platform adapters | 21 messaging platforms (Telegram, Discord, Slack, WhatsApp, etc.) | TUI + Unix socket only |
+| Smart approval | LLM-assessed risk: auto-approve low-risk, escalate uncertain, deny dangerous | User permission mode only |
+| Web UI | Ships with web mode | Planned (Phase 6) |
+| Code execution | `execute_code` — Python scripts call agent tools via Unix socket RPC | `bash` tool only |
+| Provider breadth | 200+ via OpenRouter + custom endpoints | Anthropic native + OpenAI-compat |
+
+### Roughly Comparable
+
+| Area | Notes |
+|---|---|
+| Core agent loop | Both streaming, tool dispatch. Hermes broader (61 tools), tau more focused (~12) |
+| Context compaction | Both auto-trigger on context limit. Tau uses structured format (Goal/Progress/Decisions/Next). Hermes tracks compression lineage |
+| Plugin system | Both process-based. Tau is language-agnostic (JSON-lines). Hermes is Python-native |
+| Session persistence | Both SQLite-backed |
+| LLM provider support | Both multi-provider. Hermes wider via OpenRouter; tau deeper Anthropic integration |
+| Checkpoints | Hermes: filesystem snapshots. Tau: git worktrees. Different strategies, both valid |
+
+### Out of Scope for Tau
+
+| Hermes Feature | Why Skip |
+|---|---|
+| Platform adapters (Telegram, Discord, etc.) | Different design philosophy — tau is a dev tool, not a chatbot platform |
+| RL training pipeline (Atropos/GRPO) | Research infrastructure, not agent runtime |
+| Self-evolution (DSPy+GEPA prompt optimization) | Research-grade; requires trajectory collection infrastructure |
+| Honcho dialectic user modeling | Over-engineered for a coding agent |
+| `execute_code` RPC tool | Tau's session_spawn + bash covers this pattern differently |
+| Human delay simulation | Not relevant |
+
+---
+
+## Self-Improvement: Implementation Analysis
+
+Hermes has 5 self-improvement mechanisms. Analysis of each for tau,
+ordered by impact and feasibility.
+
+### SI-1: Skill Auto-Generation
+
+**What Hermes does:** After tasks with 5+ tool calls, a background LLM
+summarizes the approach into a SKILL.md file. Future similar tasks load
+the skill into the system prompt.
+
+**Tau approach:** Extend Phase 3 skills with auto-generation.
+
+- Hook into task completion — when a task reaches `merged` state, fire
+  an `after_task_merge` hook
+- Spawn a `model: "light"` child session with the task's full
+  conversation; prompt: extract reusable procedural knowledge
+- Output format: markdown with YAML frontmatter (`name`,
+  `trigger_patterns`, `affected_file_globs`, `description`); body:
+  approach, edge cases, domain knowledge
+- Storage: `.tau/skills/auto/` (project) and
+  `~/.config/tau/skills/auto/` (global), separate from hand-written
+  skills
+- Loading: at session start, match skills against task description and
+  file paths; inject into system prompt guidelines
+- Where to build: new tool in `tau-agent-plugin-worker` + hook in
+  `tau-agent-plugin-tasks` scheduler
+- Estimate: ~2-3 weeks (on top of Phase 3 base)
+
+**Decision:** TODO
+
+### SI-2: Cross-Session Episodic Memory (FTS5 Search)
+
+**What Hermes does:** FTS5 full-text search across all past sessions.
+Agent queries own history for continuity.
+
+**Tau approach:**
+
+- Add FTS5 virtual table to existing SQLite schema, index
+  `messages.content` for assistant and user messages
+- New tool: `session_search` — query string in, top-N matching excerpts
+  with session IDs and timestamps out
+- Optional: spawn `model: "light"` session to summarize search results
+  before injection
+- Where to build: schema migration in `tau-agent-lib::db`, new tool in
+  `tau-agent-plugin-worker`
+- Cost control: cap search results at ~2K tokens, agent decides when to
+  search
+- Estimate: ~1 week
+
+**Decision:** TODO
+
+### SI-3: Agent-Curated Factual Memory
+
+**What Hermes does:** Agent writes to MEMORY.md (facts) and USER.md
+(user profile). Changes persist to disk immediately, enter system prompt
+next session. Bounded capacity forces active curation.
+
+**Tau approach:**
+
+- New tool: `memory` with `add`/`replace`/`remove` actions targeting
+  `~/.config/tau/memory.md` (global) and `.tau/memory.md` (project)
+- Bounded capacity: hard character limit (~2200 chars project, ~1400
+  user profile) — agent must curate, not dump
+- Injection: load into system prompt at session start, after
+  instructions but before tools
+- Frozen snapshot: no mid-session mutation of prompt content; changes
+  apply next session
+- Where to build: new tool in `tau-agent-plugin-worker`, prompt assembly
+  in `tau-agent-engine`
+- Estimate: ~1 week
+
+**Decision:** TODO
+
+### SI-4: Meta-Cognitive Skill Patching
+
+**What Hermes does:** When using a skill and finding it wrong/outdated,
+patches it in-place during the session.
+
+**Tau approach:**
+
+- Extend skill tool with `patch` action
+- Auto-generated skills patchable freely; hand-written skills require
+  confirmation
+- Skills in `.tau/skills/` are git-tracked — natural audit trail
+- Depends on SI-1
+- Estimate: ~2-3 days
+
+**Decision:** TODO
+
+### SI-5: User Modeling
+
+**What Hermes does:** Honcho dialectic modeling builds persistent user
+profile across sessions — stack preferences, terminology, work style.
+
+**Tau approach:**
+
+- Lower priority — tau is primarily a coding agent, not a conversational
+  assistant
+- Partially covered by `instructions.toml` (human-written)
+- Could add `user_profile.md` that agent populates over time with coding
+  preferences, review style, stack familiarity
+- Lightweight version: fold into SI-3 memory tool with a `user` scope
+
+**Decision:** TODO
+
+### Recommended Priority
+
+1. **SI-1 + Phase 3 base** — biggest impact, makes tau self-improving
+2. **SI-2 FTS5 search** — low effort (SQLite already there), enables cross-session learning
+3. **SI-3 curated memory** — complements skills with factual knowledge
+4. **SI-4 skill patching** — incremental on top of SI-1
+5. **SI-5 user modeling** — defer or fold into SI-3
+
+---
+
 ## Non-Goals
 
 Things tau deliberately does not pursue:
