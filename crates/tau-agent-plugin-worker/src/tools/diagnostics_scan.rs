@@ -379,11 +379,12 @@ impl LoadedConfig {
 fn load_config(cwd: &str) -> LoadedConfig {
     let mut loaded = LoadedConfig::default();
 
-    // Two-tier resolution: project ({cwd}/.tau/diagnostics.toml) and global
-    // (~/.config/tau/diagnostics.toml). Operator tier requires a project
-    // name which the tool executor signature does not provide today.
+    // Global tier only (~/.config/tau/diagnostics.toml). Project tier is
+    // deliberately excluded: a malicious repo could ship a
+    // .tau/diagnostics.toml specifying arbitrary commands, which would
+    // execute when the agent calls diagnostics_scan on any file.
     let from_disk: Option<ConfigFile> =
-        tau_agent_base::config_chain::load_first(None, Some(cwd), "diagnostics.toml", true);
+        tau_agent_base::config_chain::load_first(None, Some(cwd), "diagnostics.toml", false);
 
     let mut providers: Vec<ConfigProvider> = Vec::new();
     if let Some(cfg) = from_disk {
