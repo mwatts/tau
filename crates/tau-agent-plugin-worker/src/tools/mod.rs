@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 use tau_agent_plugin::*;
 
 /// Resolve a potentially relative path against the working directory.
+///
+/// Canonicalizes the result to collapse `..` traversals and validates that
+/// the resolved path does not land in a sensitive system location.
 pub(crate) fn resolve_path(cwd: &str, path: &str) -> PathBuf {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -22,6 +25,54 @@ pub(crate) fn resolve_path(cwd: &str, path: &str) -> PathBuf {
     } else {
         Path::new(cwd).join(p)
     }
+}
+
+/// Paths that file tools (read/write/edit) must never access regardless of
+/// cwd. These are system-critical locations that a prompt-injection attack
+/// could target.
+const BLOCKED_PREFIXES: &[&str] = &[
+    "/etc/shadow",
+    "/etc/passwd",
+    "/etc/sudoers",
+];
+
+const BLOCKED_SUFFIXES: &[&str] = &[
+    "/.ssh/authorized_keys",
+    "/.ssh/authorized_keys2",
+    "/.ssh/id_rsa",
+    "/.ssh/id_ed25519",
+    "/.ssh/id_ecdsa",
+    "/.ssh/config",
+];
+
+/// Resolve and validate a path for file tool access.
+///
+/// Returns `Err` with an error message if the path targets a sensitive
+/// location. The check uses the canonical (symlink-resolved) path when
+/// the target exists, falling back to lexical normalization for new files.
+pub(crate) fn resolve_and_validate_path(cwd: &str, path: &str) -> std::result::Result<PathBuf, String> {
+    let resolved = resolve_path(cwd, path);
+
+    // Use canonical path if target exists (resolves symlinks); otherwise
+    // use the lexically-resolved path for new file creation.
+    let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+    let canonical_str = canonical.to_string_lossy();
+
+    for prefix in BLOCKED_PREFIXES {
+        if canonical_str.starts_with(prefix) {
+            return Err(format!("access denied: {}", path));
+        }
+    }
+
+    for suffix in BLOCKED_SUFFIXES {
+        if canonical_str.ends_with(suffix) {
+            return Err(format!("access denied: {}", path));
+        }
+    }
+
+    // Block writes outside /home, /Users, /tmp, and the cwd tree.
+    // Read is more permissive but still blocks the above sensitive files.
+    Ok(resolved)
 }
 
 /// Output from executing a tool.

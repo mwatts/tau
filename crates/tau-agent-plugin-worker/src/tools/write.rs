@@ -42,7 +42,10 @@ fn execute(
         return ToolOutput::error("missing 'content' argument");
     };
 
-    let path = super::resolve_path(cwd, path_str);
+    let path = match super::resolve_and_validate_path(cwd, path_str) {
+        Ok(p) => p,
+        Err(msg) => return ToolOutput::error(msg),
+    };
 
     // Create parent directories
     if let Some(parent) = path.parent()

@@ -199,7 +199,18 @@ fn read_one(
     limit: Option<usize>,
     remaining_bytes: usize,
 ) -> FileRead {
-    let path = super::resolve_path(cwd, path_str);
+    let path = match super::resolve_and_validate_path(cwd, path_str) {
+        Ok(p) => p,
+        Err(msg) => {
+            return FileRead {
+                path_str: path_str.to_string(),
+                body: FileBody::Error(msg),
+                total_lines: 0,
+                bytes: 0,
+                range: None,
+            };
+        }
+    };
 
     // Image branch: extension-based detection. We metadata-stat first so an
     // oversize image is rejected without slurping its bytes into memory.

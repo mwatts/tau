@@ -444,7 +444,10 @@ fn execute(
             }
         }
 
-        let resolved = super::resolve_path(cwd, path_str);
+        let resolved = match super::resolve_and_validate_path(cwd, path_str) {
+            Ok(p) => p,
+            Err(msg) => return ToolOutput::error(msg),
+        };
         files.push(FileEdits {
             path_str: path_str.to_string(),
             resolved,
