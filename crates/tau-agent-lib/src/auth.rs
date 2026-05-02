@@ -122,9 +122,16 @@ pub fn login_anthropic() -> crate::Result<OAuthCredentials> {
 /// Wait for the OAuth callback on the local server.
 /// Returns (code, state).
 fn wait_for_callback(listener: &TcpListener) -> crate::Result<(String, String)> {
-    let (mut stream, _) = listener
+    let (mut stream, peer_addr) = listener
         .accept()
         .map_err(|e| crate::Error::Io(format!("accept callback: {}", e)))?;
+
+    // Verify the callback originates from the loopback interface.
+    if !peer_addr.ip().is_loopback() {
+        return Err(crate::Error::Parse(
+            "OAuth callback rejected: connection not from localhost".into(),
+        ));
+    }
 
     let mut reader = BufReader::new(&stream);
     let mut request_line = String::new();
