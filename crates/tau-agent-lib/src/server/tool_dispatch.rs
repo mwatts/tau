@@ -241,10 +241,25 @@ pub(super) async fn handle_server_request(
             caller_session_id.as_deref(),
         ),
         Request::Chat {
-            session_id,
+            session_id: target_session_id,
             text,
             attachments,
         } => {
+            // Authorization: plugin can only chat in its own session or descendants.
+            if !session_id.is_empty() && target_session_id != session_id {
+                let is_descendant = {
+                    let st = lock_state(state);
+                    st.db.is_descendant(target_session_id, session_id).unwrap_or(false)
+                };
+                if !is_descendant {
+                    return Response::Error {
+                        message: format!(
+                            "permission denied: plugin in session {} cannot chat in session {}",
+                            session_id, target_session_id
+                        ),
+                    };
+                }
+            }
             // Validate attachments here so a bad payload from a plugin
             // surfaces synchronously instead of crashing the spawn task.
             for (i, att) in attachments.iter().enumerate() {
@@ -255,7 +270,7 @@ pub(super) async fn handle_server_request(
                 }
             }
             let spawn = super::state::ChatSpawn {
-                session_id: session_id.clone(),
+                session_id: target_session_id.clone(),
                 text: text.clone(),
                 attachments: attachments.clone(),
             };
@@ -684,6 +699,22 @@ pub(super) async fn handle_server_request(
             tool_name,
             arguments,
         } => {
+            // Authorization: plugin can only execute tools in its own session
+            // or descendant sessions it spawned.
+            if !session_id.is_empty() && target_session_id != session_id {
+                let is_descendant = {
+                    let st = lock_state(state);
+                    st.db.is_descendant(target_session_id, session_id).unwrap_or(false)
+                };
+                if !is_descendant {
+                    return Response::Error {
+                        message: format!(
+                            "permission denied: plugin in session {} cannot execute tools in session {}",
+                            session_id, target_session_id
+                        ),
+                    };
+                }
+            }
             execute_tool_impl(
                 state,
                 plugins,
