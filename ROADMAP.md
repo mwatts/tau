@@ -47,18 +47,18 @@ the task board + merge queue.
 
 - [ ] Upstream security fixes (shell-escape, path validation, socket perms, plugin auth, prompt append-only, OAuth peer check)
 - [ ] Publish patched `tau-agent 0.1.1` to crates.io
-- [ ] `cargo audit` clean (rustls-webpki updated)
+- [x] `cargo audit` clean (rustls-webpki 0.103.13, rand 0.10.1)
 
 ### Phase 2: MCP (remaining)
 
-- [ ] MCP prompts as slash commands
+- [x] MCP prompts as slash commands (`/prompt` list + invoke)
 - [ ] HTTP+SSE transport for MCP server (web integrations)
 
 ### SI-4: Meta-Cognitive Skill Patching
 
-- [ ] Extend skill tool with `patch` action
-- [ ] Auto-generated skills patchable freely; hand-written skills require confirmation
-- [ ] Skills in `.tau/skills/` are git-tracked — natural audit trail
+- [x] Extend skill tool with `patch` action (`skill_patch` tool: list/read/patch/delete)
+- [x] Auto-generated skills patchable freely; hand-written skills require confirmation
+- [x] Skills in `.tau/skills/` are git-tracked — natural audit trail
 
 ### Phase 4: External Agent Harness
 
