@@ -2391,7 +2391,7 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /compact [keep hint] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /compact [keep hint] /task [list|get|create|search|claim|approve|ready|status|mq] /skills /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /help /quit"
                         .into(),
                 });
                 None
@@ -2435,6 +2435,7 @@ impl App {
                     Some(Action::SetCwd(args.to_string()))
                 }
             }
+            "/skills" | "/skill" => self.handle_skills_command(args),
             "/task" | "/tasks" => self.handle_task_slash_command(args),
             "/project" | "/projects" => self.handle_project_slash_command(args),
             "/attach" => self.handle_attach_command(args),
@@ -2459,6 +2460,54 @@ impl App {
                 None
             }
         }
+    }
+
+    fn handle_skills_command(&mut self, args: &str) -> Option<Action> {
+        use tau_agent_lib::skills;
+        use std::collections::HashSet;
+
+        let cwd = self.session_cwd.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".into())
+        });
+        let project_name = self.session_project_name.as_deref();
+
+        let all_skills = skills::discover(Some(&cwd), project_name);
+
+        if all_skills.is_empty() {
+            self.messages.push(MessageItem::Status {
+                text: "No skills found.\n\nLocations searched:\n  ~/.config/tau/skills/\n  .tau/skills/\n  .agents/skills/".into(),
+            });
+            return None;
+        }
+
+        let args = args.trim();
+        if args.is_empty() || args == "list" {
+            let ctx = skills::MatchContext::default();
+            let active = skills::select(&all_skills, &ctx);
+            let active_names: HashSet<String> = active.iter().map(|s| s.name.clone()).collect();
+            let listing = skills::format_listing(&all_skills, &active_names);
+            self.messages.push(MessageItem::Status { text: listing });
+        } else if args == "reload" {
+            self.messages.push(MessageItem::Status {
+                text: format!("reloaded {} skill(s)", all_skills.len()),
+            });
+        } else {
+            // Treat as explicit skill name — show its content.
+            if let Some(skill) = all_skills.iter().find(|s| s.name == args) {
+                let info = format!(
+                    "## {}: {}\npriority: {}\nsource: {:?}\n\n{}",
+                    skill.name, skill.description, skill.priority, skill.source, skill.body
+                );
+                self.messages.push(MessageItem::Status { text: info });
+            } else {
+                self.messages.push(MessageItem::Error {
+                    text: format!("skill '{}' not found. Use /skills to list.", args),
+                });
+            }
+        }
+        None
     }
 
     /// Implement `/attach <path>`: read an image file, validate it, queue it

@@ -12,6 +12,7 @@ pub mod profile;
 pub mod replay;
 pub mod server;
 pub mod shutdown;
+pub mod skills;
 pub mod worker;
 
 /// Re-export of the server's chat-attachment helpers so CLI/TUI clients

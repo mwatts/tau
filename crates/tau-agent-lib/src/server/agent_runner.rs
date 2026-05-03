@@ -719,10 +719,28 @@ pub(super) async fn run_child_chat(
         let system_prompt = stored.system_prompt.clone().or_else(|| {
             let pm = plugins.lock().expect("plugins mutex poisoned");
             let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
+
+            // Skills injection
+            let skills_block = {
+                let all_skills = crate::skills::discover(Some(&cwd), stored.project_name.as_deref());
+                let ctx = crate::skills::MatchContext {
+                    user_message: Some(text.clone()),
+                    ..Default::default()
+                };
+                let active = crate::skills::select(&all_skills, &ctx);
+                crate::skills::format_for_prompt(&active)
+            };
+            let extra_guidelines = if skills_block.is_empty() {
+                vec![]
+            } else {
+                vec![skills_block]
+            };
+
             Some(crate::system_prompt::build(
                 &crate::system_prompt::PromptOptions {
                     cwd: Some(cwd.clone()),
                     tools: tool_prompts,
+                    extra_guidelines,
                     ..Default::default()
                 },
             ))
@@ -999,10 +1017,25 @@ pub(super) async fn resume_child_session(
         let system_prompt = stored.system_prompt.clone().or_else(|| {
             let pm = plugins.lock().expect("plugins mutex poisoned");
             let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
+
+            // Skills injection (resume path — no user message for matching)
+            let skills_block = {
+                let all_skills = crate::skills::discover(Some(&cwd), stored.project_name.as_deref());
+                let ctx = crate::skills::MatchContext::default();
+                let active = crate::skills::select(&all_skills, &ctx);
+                crate::skills::format_for_prompt(&active)
+            };
+            let extra_guidelines = if skills_block.is_empty() {
+                vec![]
+            } else {
+                vec![skills_block]
+            };
+
             Some(crate::system_prompt::build(
                 &crate::system_prompt::PromptOptions {
                     cwd: Some(cwd.clone()),
                     tools: tool_prompts,
+                    extra_guidelines,
                     ..Default::default()
                 },
             ))
