@@ -26,18 +26,18 @@ with external tools and context. This is the single highest-leverage gap.
 
 ### 2a: MCP Client (tau calls MCP servers)
 
-- [ ] Add `rmcp` crate (MIT) as workspace dependency
-- [ ] Config: `~/.config/tau/mcp.toml` + project `.tau/mcp.toml` (global tier only for security)
-- [ ] MCP server lifecycle manager (spawn, health-check, restart)
-- [ ] Surface MCP tools in the LLM tool list alongside built-in tools
-- [ ] Surface MCP resources as attachable context
+- [x] Add `rmcp` crate (MIT) as workspace dependency
+- [x] Config: `~/.config/tau/mcp.toml` + project `.tau/mcp.toml` (global tier only for security)
+- [x] MCP server lifecycle manager (spawn, health-check, restart)
+- [x] Surface MCP tools in the LLM tool list alongside built-in tools
+- [x] Surface MCP resources as attachable context
 - [ ] MCP prompts as slash commands
 
 ### 2b: MCP Server (tau exposes itself)
 
-- [ ] Expose tau's built-in tools (bash, read, write, edit, diagnostics) as MCP tools
-- [ ] Expose session/task management as MCP resources
-- [ ] stdio transport (for integration with other agents/editors)
+- [x] Expose tau's built-in tools (bash, read, write, edit, diagnostics) as MCP tools
+- [x] Expose session/task management as MCP resources
+- [x] stdio transport (for integration with other agents/editors)
 - [ ] HTTP+SSE transport (for web integrations)
 
 ---
@@ -47,11 +47,11 @@ with external tools and context. This is the single highest-leverage gap.
 Markdown-defined agent behaviors, loadable per-project or globally.
 Lightweight alternative to full plugins for customizing agent behavior.
 
-- [ ] Skill format: markdown files in `.tau/skills/` (project) and `~/.config/tau/skills/` (global)
-- [ ] Skill loading: inject matching skills into system prompt context
-- [ ] Skill matching: by name (explicit `/skill-name`) or by trigger pattern (file type, keyword)
-- [ ] Built-in skills: conventional commits, PR creation, code review, TDD
-- [ ] Skill discovery: `/skills` command lists available skills
+- [x] Skill format: markdown files in `.tau/skills/` (project) and `~/.config/tau/skills/` (global)
+- [x] Skill loading: inject matching skills into system prompt context
+- [x] Skill matching: by name (explicit `/skill-name`) or by trigger pattern (file type, keyword)
+- [x] Built-in skills: conventional commits, PR creation, code review, TDD
+- [x] Skill discovery: `/skills` command lists available skills
 
 ---
 
@@ -122,11 +122,11 @@ Docs: https://hermes-agent.nousresearch.com/docs
 
 | Area | Hermes | Tau |
 |---|---|---|
-| MCP integration | Full client — MCP tools auto-registered at startup, per-server filtering, `/reload-mcp` | Planned (Phase 2) |
-| Skills system | 118 bundled skills, auto-generated from tasks, agentskills.io hub, progressive disclosure | Planned (Phase 3), static only |
-| Self-improvement | Skill auto-gen + patching, memory curation, meta-cognition LLM calls | Loop-review (stuck detection only) |
-| Agent-writable memory | MEMORY.md (factual, bounded), USER.md (Honcho dialectic user modeling) | None — instructions.toml is static, human-written |
-| Cross-session recall | FTS5 search across all past sessions, LLM-summarized results | Sessions isolated, no search |
+| MCP integration | Full client — MCP tools auto-registered at startup, per-server filtering, `/reload-mcp` | Done (Phase 2) — client + server, stdio transport |
+| Skills system | 118 bundled skills, auto-generated from tasks, agentskills.io hub, progressive disclosure | Done (Phase 3) — 4 built-in, auto-gen from merged tasks, trigger matching |
+| Self-improvement | Skill auto-gen + patching, memory curation, meta-cognition LLM calls | Done (SI-1/2/3) — skill auto-gen, FTS5 recall, bounded memory |
+| Agent-writable memory | MEMORY.md (factual, bounded), USER.md (Honcho dialectic user modeling) | Done — `.tau/memory.md` + `~/.config/tau/memory.md`, bounded curation |
+| Cross-session recall | FTS5 search across all past sessions, LLM-summarized results | Done — `session_search` tool with FTS5, project-scoped |
 | Scheduled automation | Built-in cron with natural-language spec, multi-platform delivery | Not built-in |
 | Sandbox backends | 7 backends (local, Docker, SSH, Modal, Daytona, Vercel, Singularity) | `sandbox.toml` prefix (Docker, SSH) |
 | Platform adapters | 21 messaging platforms (Telegram, Discord, Slack, WhatsApp, etc.) | TUI + Unix socket only |
@@ -152,7 +152,7 @@ Docs: https://hermes-agent.nousresearch.com/docs
 |---|---|
 | Platform adapters (Telegram, Discord, etc.) | Different design philosophy — tau is a dev tool, not a chatbot platform |
 | RL training pipeline (Atropos/GRPO) | Research infrastructure, not agent runtime |
-| Self-evolution (DSPy+GEPA prompt optimization) | Research-grade; requires trajectory collection infrastructure |
+| Self-evolution (DSPy+GEPA prompt optimization) | Deferred — skill auto-gen covers 80%; DSPy-grade optimization is future work |
 | Honcho dialectic user modeling | Over-engineered for a coding agent |
 | `execute_code` RPC tool | Tau's session_spawn + bash covers this pattern differently |
 | Human delay simulation | Not relevant |
@@ -188,7 +188,8 @@ the skill into the system prompt.
   `tau-agent-plugin-tasks` scheduler
 - Estimate: ~2-3 weeks (on top of Phase 3 base)
 
-**Decision:** TODO
+**Decision:** DONE — `tasks_skill_autogen.rs` hooks both merge paths, spawns
+light-model child to extract skills into `.tau/skills/auto/`.
 
 ### SI-2: Cross-Session Episodic Memory (FTS5 Search)
 
@@ -209,7 +210,8 @@ Agent queries own history for continuity.
   search
 - Estimate: ~1 week
 
-**Decision:** TODO
+**Decision:** DONE — FTS5 virtual table in `db.rs`, `session_search` tool in
+orchestration plugin, project-scoped filtering.
 
 ### SI-3: Agent-Curated Factual Memory
 
@@ -231,7 +233,8 @@ next session. Bounded capacity forces active curation.
   in `tau-agent-engine`
 - Estimate: ~1 week
 
-**Decision:** TODO
+**Decision:** DONE — `memory.rs` module with add/replace/remove/list,
+bounded capacity, injected into system prompt via `load_for_prompt()`.
 
 ### SI-4: Meta-Cognitive Skill Patching
 
