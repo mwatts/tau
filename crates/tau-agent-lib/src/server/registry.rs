@@ -245,6 +245,8 @@ pub(super) fn build_registry() -> ProviderRegistry {
     registry.register(crate::providers::anthropic::Anthropic);
     registry.register(crate::providers::openai::OpenAi);
     registry.register(crate::providers::log::LogProvider);
+    #[cfg(feature = "bedrock")]
+    registry.register(crate::providers::bedrock::Bedrock);
     registry
 }
 

@@ -42,6 +42,9 @@ rmcp.workspace = true
 schemars.workspace = true
 globset.workspace = true
 
+[features]
+bedrock = ["tau-agent-engine/bedrock"]
+
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber.workspace = true

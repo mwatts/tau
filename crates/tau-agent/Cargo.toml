@@ -28,6 +28,10 @@ serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
 
+[features]
+default = ["bedrock"]
+bedrock = ["tau-agent-lib/bedrock"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix.workspace = true

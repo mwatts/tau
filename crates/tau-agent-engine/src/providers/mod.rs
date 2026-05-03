@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod anthropic_types;
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
 pub mod common;
 pub mod log;
 pub mod mock;
