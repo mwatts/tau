@@ -1707,6 +1707,14 @@ fn merge_one_task(
                 }
 
                 eprintln!("tasks scheduler: task {} merged successfully", task_id);
+
+                // SI-1: trigger skill extraction from the merged task's conversation.
+                if let Ok(Some(merged_task)) = db.get_task(task_id) {
+                    crate::tasks_skill_autogen::trigger_skill_extraction(
+                        db, &merged_task, &project_dir, writer, reader,
+                    );
+                }
+
                 MergeAttempt {
                     task_id,
                     title,

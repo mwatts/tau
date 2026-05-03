@@ -456,6 +456,13 @@ fn finish_success<W>(
 
     eprintln!("tasks merge worker: task {} merged successfully", task_id);
 
+    // SI-1: trigger skill extraction from the merged task's conversation.
+    if let Ok(Some(task)) = db.get_task(task_id) {
+        crate::tasks_skill_autogen::trigger_skill_extraction(
+            db, &task, project_dir, writer, reader,
+        );
+    }
+
     // Root cause of task #584: before this code existed, the merge
     // worker's `→ merged` transition bypassed the main-loop's
     // `SchedulerEvent::ScheduleNeeded` push (the main loop only pushes

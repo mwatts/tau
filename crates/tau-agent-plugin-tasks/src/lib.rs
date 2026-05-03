@@ -19,6 +19,7 @@ pub mod tasks_merge_worker;
 pub mod tasks_notify;
 pub mod tasks_scheduler;
 pub mod tasks_session;
+pub mod tasks_skill_autogen;
 pub mod tasks_state;
 
 /// Entry point for the `tau plugin-tasks` subprocess.
