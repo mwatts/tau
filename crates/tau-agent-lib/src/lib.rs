@@ -13,6 +13,7 @@ pub mod replay;
 pub mod memory;
 pub mod server;
 pub mod shutdown;
+pub mod skill_patch;
 pub mod skills;
 pub mod worker;
 

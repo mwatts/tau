@@ -323,6 +323,36 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             ],
         },
         PluginToolDef {
+            name: "skill_patch".into(),
+            description: "Read, patch, or delete skill files. Auto-generated skills (.tau/skills/auto/) are freely editable; hand-written skills warn but allow patches.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "read", "patch", "delete"],
+                        "description": "Action to perform"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Skill name (required for read, patch, delete)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "For patch: full new file content including YAML frontmatter"
+                    }
+                },
+                "required": ["action"]
+            }),
+            prompt_snippet: Some("Use skill_patch to fix or improve auto-generated skills when you discover they contain incorrect or outdated guidance.".into()),
+            prompt_guidelines: vec![
+                "Use 'list' first to see available skills and which are auto-generated.".into(),
+                "Use 'read' to see a skill's current content before patching.".into(),
+                "Patches must include the full YAML frontmatter (---...---) plus body.".into(),
+                "Only delete auto-generated skills that are actively harmful. Prefer patching over deletion.".into(),
+            ],
+        },
+        PluginToolDef {
             name: "session_search".into(),
             description: "Search across all past session messages using full-text search. Returns matching snippets with session context.".into(),
             parameters: serde_json::json!({

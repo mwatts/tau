@@ -33,6 +33,32 @@ pub(super) struct PluginExecutor {
 }
 
 impl PluginExecutor {
+    fn handle_skill_patch_tool(&self, tool_call: &ToolCall) -> ToolResultMessage {
+        let args = &tool_call.arguments;
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let name = args.get("name").and_then(|v| v.as_str());
+        let content = args.get("content").and_then(|v| v.as_str());
+
+        let result_text = crate::skill_patch::execute(action, name, content, &self.cwd);
+
+        ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: vec![crate::types::ToolResultContent::Text(
+                crate::types::TextContent {
+                    text: result_text,
+                    text_signature: None,
+                },
+            )],
+            details: None,
+            is_error: false,
+            timestamp: crate::types::timestamp_ms(),
+            duration_ms: None,
+            summary: None,
+            post_persist_actions: Vec::new(),
+        }
+    }
+
     fn handle_memory_tool(&self, tool_call: &ToolCall) -> ToolResultMessage {
         let args = &tool_call.arguments;
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
@@ -68,9 +94,12 @@ impl crate::worker::ToolExecutor for PluginExecutor {
         output_tx: &smol::channel::Sender<String>,
         cancel: &tau_agent_base::types::CancelToken,
     ) -> crate::Result<ToolResultMessage> {
-        // Handle memory tool directly (file I/O, no plugin needed).
+        // Handle memory and skill_patch tools directly (file I/O, no plugin needed).
         if tool_call.name == "memory" {
             return Ok(self.handle_memory_tool(tool_call));
+        }
+        if tool_call.name == "skill_patch" {
+            return Ok(self.handle_skill_patch_tool(tool_call));
         }
 
         // Take the plugin handle out of the manager (brief lock).
