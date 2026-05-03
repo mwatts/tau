@@ -228,6 +228,9 @@ If in doubt, don't extract. "NO_SKILL_EXTRACTED" is a perfectly valid outcome."#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufReader, Write};
+    use std::sync::{Arc, Mutex};
+    use tau_agent_plugin::{PluginMessage, PluginRequest, Response};
 
     fn make_task(id: i64, title: &str, tags: Option<serde_json::Value>) -> Task {
         Task {
@@ -254,6 +257,128 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    // -- Mock writer/reader infrastructure for multi-request tests --
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Reader that yields pre-canned responses for each successive ServerRequest.
+    /// Mirrors the request_id from the writer so the tunnel protocol matches.
+    struct SequencingReader {
+        writer: Arc<Mutex<Vec<u8>>>,
+        responses: Vec<Response>,
+        next: usize,
+        buf: Vec<u8>,
+        seen_requests: usize,
+    }
+
+    impl std::io::Read for SequencingReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.buf.is_empty() {
+                if self.next >= self.responses.len() {
+                    return Ok(0); // EOF
+                }
+                // Wait for a new request we haven't responded to yet.
+                let written = self.writer.lock().unwrap().clone();
+                let text = String::from_utf8_lossy(&written);
+                let mut count = 0;
+                let mut last_rid = None;
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Ok(PluginMessage::ServerRequest { request_id, .. }) =
+                        serde_json::from_str::<PluginMessage>(line)
+                    {
+                        count += 1;
+                        last_rid = Some(request_id);
+                    }
+                }
+                if count <= self.seen_requests {
+                    // No new request yet — yield empty to avoid busy spin
+                    // (the caller's read_line will retry)
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "waiting for next request",
+                    ));
+                }
+                self.seen_requests = count;
+                let rid = last_rid.unwrap();
+                let resp_line = serde_json::to_string(&PluginRequest::ServerResponse {
+                    request_id: rid,
+                    response: self.responses[self.next].clone(),
+                })
+                .unwrap();
+                self.next += 1;
+                self.buf = resp_line.into_bytes();
+                self.buf.push(b'\n');
+            }
+            let n = std::cmp::min(out.len(), self.buf.len());
+            out[..n].copy_from_slice(&self.buf[..n]);
+            self.buf.drain(..n);
+            Ok(n)
+        }
+    }
+
+    fn fake_session_info(id: &str, message_count: usize) -> tau_agent_plugin::SessionInfo {
+        tau_agent_plugin::SessionInfo {
+            id: id.into(),
+            model: "test".into(),
+            provider: "test".into(),
+            cwd: None,
+            message_count,
+            stats: tau_agent_base::protocol::SessionStats {
+                user_messages: 0,
+                assistant_messages: 0,
+                tool_calls: 0,
+                tool_results: 0,
+                tokens: Default::default(),
+                cost: 0.0,
+                is_subscription: false,
+                context_window: 0,
+                context_tokens: None,
+            },
+            last_activity: 0,
+            parent_id: None,
+            child_count: 0,
+            child_budget: 0,
+            tagline: None,
+            state: "idle".into(),
+            context_pct: None,
+            archived: false,
+            project_name: None,
+            last_exit_status: None,
+            is_live: false,
+            turn_started_at_ms: None,
+            phase_started_at_ms: None,
+        }
+    }
+
+    fn extract_requests(emitted: &[u8]) -> Vec<tau_agent_plugin::Request> {
+        let text = String::from_utf8_lossy(emitted);
+        let mut reqs = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(PluginMessage::ServerRequest { request: req, .. }) =
+                serde_json::from_str::<PluginMessage>(line)
+            {
+                reqs.push(req);
+            }
+        }
+        reqs
     }
 
     #[test]
@@ -300,5 +425,169 @@ mod tests {
         assert!(prompt.contains("s-def456"));
         assert!(prompt.contains(".tau/skills/auto/"));
         assert!(prompt.contains("NO_SKILL_EXTRACTED"));
+    }
+
+    #[test]
+    fn trigger_skips_when_below_message_threshold() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Small fix",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy { project: None, session_id: Some("s-parent") },
+            )
+            .unwrap();
+        db.record_session(task.id, "s-worker-1", "worker").unwrap();
+
+        // Return session info with only 3 messages (below threshold of 8)
+        let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut writer = SharedWriter(shared.clone());
+        let reader = SequencingReader {
+            writer: shared.clone(),
+            responses: vec![Response::SessionInfo {
+                info: fake_session_info("s-worker-1", 3),
+            }],
+            next: 0,
+            buf: Vec::new(),
+            seen_requests: 0,
+        };
+        let mut reader = BufReader::new(reader);
+
+        trigger_skill_extraction(&db, &task, "/tmp/project", &mut writer, &mut reader);
+
+        let reqs = extract_requests(&shared.lock().unwrap());
+        // Should only have the GetSessionInfo request, no CreateSession
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(
+            &reqs[0],
+            tau_agent_plugin::Request::GetSessionInfo { .. }
+        ));
+    }
+
+    #[test]
+    fn trigger_full_flow_creates_session_and_chats() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Implement feature X",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy { project: None, session_id: Some("s-parent") },
+            )
+            .unwrap();
+        db.record_session(task.id, "s-worker-1", "worker").unwrap();
+
+        // Sequence: GetSessionInfo (10 msgs) → CreateSession → Chat Ok
+        let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut writer = SharedWriter(shared.clone());
+        let reader = SequencingReader {
+            writer: shared.clone(),
+            responses: vec![
+                Response::SessionInfo {
+                    info: fake_session_info("s-worker-1", 10),
+                },
+                Response::SessionCreated {
+                    session_id: "s-extract-1".into(),
+                },
+                Response::Ok,
+            ],
+            next: 0,
+            buf: Vec::new(),
+            seen_requests: 0,
+        };
+        let mut reader = BufReader::new(reader);
+
+        trigger_skill_extraction(&db, &task, "/tmp/project", &mut writer, &mut reader);
+
+        let reqs = extract_requests(&shared.lock().unwrap());
+        assert_eq!(reqs.len(), 3, "expected 3 requests: {:?}", reqs);
+
+        // 1. GetSessionInfo
+        assert!(matches!(
+            &reqs[0],
+            tau_agent_plugin::Request::GetSessionInfo { session_id } if session_id == "s-worker-1"
+        ));
+
+        // 2. CreateSession with light model
+        match &reqs[1] {
+            tau_agent_plugin::Request::CreateSession { model, .. } => {
+                assert_eq!(model.as_deref(), Some("light"));
+            }
+            other => panic!("expected CreateSession, got {:?}", other),
+        }
+
+        // 3. Chat with extraction prompt
+        match &reqs[2] {
+            tau_agent_plugin::Request::Chat {
+                session_id, text, ..
+            } => {
+                assert_eq!(session_id, "s-extract-1");
+                assert!(text.contains("Implement feature X"));
+                assert!(text.contains("s-worker-1"));
+            }
+            other => panic!("expected Chat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trigger_skips_tagged_tasks_without_any_requests() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Automated",
+                None,
+                None,
+                Some(&serde_json::json!(["automated"])),
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy { project: None, session_id: Some("s-parent") },
+            )
+            .unwrap();
+        db.record_session(task.id, "s-worker-1", "worker").unwrap();
+
+        let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut writer = SharedWriter(shared.clone());
+        // No responses needed — should bail before any request
+        let reader = SequencingReader {
+            writer: shared.clone(),
+            responses: vec![],
+            next: 0,
+            buf: Vec::new(),
+            seen_requests: 0,
+        };
+        let mut reader = BufReader::new(reader);
+
+        trigger_skill_extraction(&db, &task, "/tmp/project", &mut writer, &mut reader);
+
+        let reqs = extract_requests(&shared.lock().unwrap());
+        assert_eq!(reqs.len(), 0);
     }
 }
