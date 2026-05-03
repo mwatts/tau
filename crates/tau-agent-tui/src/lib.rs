@@ -509,6 +509,16 @@ async fn run_inner(
                         text: "Config reloaded".into(),
                     });
                 }
+                Action::ListMcpPrompts => {
+                    send_request_and_recv(Request::ListMcpPrompts, server_tx.clone()).await?;
+                }
+                Action::GetMcpPrompt { name } => {
+                    send_request_and_recv(
+                        Request::GetMcpPrompt { name, arguments: None },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
                 Action::OpenSessionPicker => {
                     app.picker_previous_mode = app.mode;
                     app.mode = AppMode::SessionPicker;

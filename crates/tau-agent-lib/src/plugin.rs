@@ -1256,6 +1256,26 @@ impl PluginManager {
         }
     }
 
+    /// List MCP prompts from all running servers.
+    pub fn list_mcp_prompts(&self) -> Vec<(String, String, Option<String>)> {
+        match &self.mcp {
+            Some(mcp) => mcp.list_prompts(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Get a specific MCP prompt by name.
+    pub fn get_mcp_prompt(
+        &self,
+        name: &str,
+        arguments: Option<&std::collections::HashMap<String, String>>,
+    ) -> crate::Result<String> {
+        match &self.mcp {
+            Some(mcp) => mcp.get_prompt(name, arguments),
+            None => Err(crate::Error::Io("no MCP servers configured".into())),
+        }
+    }
+
     /// Rebuild the cached tool schemas/prompts from the current global plugins.
     fn rebuild_global_tool_cache(&mut self) {
         self.global_tool_cache = self

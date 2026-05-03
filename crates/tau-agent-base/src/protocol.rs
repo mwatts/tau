@@ -142,6 +142,14 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         project_name: Option<String>,
     },
+    /// List MCP prompts from all connected servers.
+    ListMcpPrompts,
+    /// Get a specific MCP prompt by name.
+    GetMcpPrompt {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<std::collections::HashMap<String, String>>,
+    },
     /// Subscribe to live events on a session (for multi-client).
     /// The connection stays open and receives Stream/AgentDone/Cancelled events.
     Subscribe { session_id: String },
@@ -425,6 +433,14 @@ pub enum Response {
     SearchResults {
         results: Vec<SearchResult>,
     },
+    /// MCP prompts listing.
+    McpPrompts {
+        prompts: Vec<McpPromptInfo>,
+    },
+    /// MCP prompt content.
+    McpPromptContent {
+        text: String,
+    },
     /// A user message was sent (broadcast to subscribers).
     UserMessage { text: String },
     /// Agent loop completed (all turns done).
@@ -613,6 +629,14 @@ pub struct SearchResult {
     pub role: String,
     /// Timestamp of the message.
     pub timestamp_ms: u64,
+}
+
+/// MCP prompt listing entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptInfo {
+    pub server: String,
+    pub name: String,
+    pub description: Option<String>,
 }
 
 fn default_wait_timeout() -> u64 {

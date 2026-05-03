@@ -1136,6 +1136,34 @@ pub(super) async fn handle_client(
                 };
                 send(&mut writer, &resp).await?;
             }
+            crate::protocol::Request::ListMcpPrompts => {
+                let resp = {
+                    let pm = plugins.lock().expect("plugins mutex poisoned");
+                    let prompts: Vec<crate::protocol::McpPromptInfo> = pm
+                        .list_mcp_prompts()
+                        .into_iter()
+                        .map(|(server, name, description)| crate::protocol::McpPromptInfo {
+                            server,
+                            name,
+                            description,
+                        })
+                        .collect();
+                    crate::protocol::Response::McpPrompts { prompts }
+                };
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::GetMcpPrompt { name, arguments } => {
+                let resp = {
+                    let pm = plugins.lock().expect("plugins mutex poisoned");
+                    match pm.get_mcp_prompt(&name, arguments.as_ref()) {
+                        Ok(text) => crate::protocol::Response::McpPromptContent { text },
+                        Err(e) => Response::Error {
+                            message: format!("{}", e),
+                        },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
             crate::protocol::Request::CancelChat {
                 session_id,
                 caller_session_id,

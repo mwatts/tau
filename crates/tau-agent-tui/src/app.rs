@@ -2436,6 +2436,7 @@ impl App {
                 }
             }
             "/skills" | "/skill" => self.handle_skills_command(args),
+            "/prompt" | "/prompts" => self.handle_prompt_command(args),
             "/task" | "/tasks" => self.handle_task_slash_command(args),
             "/project" | "/projects" => self.handle_project_slash_command(args),
             "/attach" => self.handle_attach_command(args),
@@ -2508,6 +2509,15 @@ impl App {
             }
         }
         None
+    }
+
+    fn handle_prompt_command(&mut self, args: &str) -> Option<Action> {
+        let args = args.trim();
+        if args.is_empty() || args == "list" {
+            Some(Action::ListMcpPrompts)
+        } else {
+            Some(Action::GetMcpPrompt { name: args.to_string() })
+        }
     }
 
     /// Implement `/attach <path>`: read an image file, validate it, queue it
@@ -3572,6 +3582,26 @@ impl App {
             Response::ProjectStats { stats } => {
                 self.render_project_stats(&stats);
             }
+            Response::McpPrompts { prompts } => {
+                if prompts.is_empty() {
+                    self.messages.push(MessageItem::Status {
+                        text: "No MCP prompts available".into(),
+                    });
+                } else {
+                    self.messages.push(MessageItem::Status {
+                        text: "MCP prompts:".into(),
+                    });
+                    for p in &prompts {
+                        let desc = p.description.as_deref().unwrap_or("");
+                        self.messages.push(MessageItem::Status {
+                            text: format!("  {} ({})\t{}", p.name, p.server, desc),
+                        });
+                    }
+                }
+            }
+            Response::McpPromptContent { text } => {
+                self.messages.push(MessageItem::User { text });
+            }
             _ => {}
         }
         None
@@ -3863,6 +3893,11 @@ pub enum Action {
     Compact {
         keep_hint: Option<String>,
     },
+
+    /// List MCP prompts from connected servers.
+    ListMcpPrompts,
+    /// Fetch an MCP prompt and inject as user chat message.
+    GetMcpPrompt { name: String },
 
     /// Open the session picker overlay.
     OpenSessionPicker,

@@ -546,6 +546,101 @@ impl McpManager {
         Ok(text)
     }
 
+    /// List MCP prompts from all running servers.
+    /// Returns (server_name, prompt_name, description).
+    pub fn list_prompts(&self) -> Vec<(String, String, Option<String>)> {
+        let rt_handle = self.rt.handle();
+        let mut results = Vec::new();
+        for (name, handle) in &self.servers {
+            let client = match &handle.client {
+                Some(c) => c,
+                None => continue,
+            };
+            match rt_handle.block_on(async { client.list_all_prompts().await }) {
+                Ok(prompts) => {
+                    for p in prompts {
+                        results.push((
+                            name.clone(),
+                            p.name.clone(),
+                            p.description.map(|d| d.to_string()),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(server = %name, %e, "failed to list prompts");
+                }
+            }
+        }
+        results
+    }
+
+    /// Get a prompt by name from the appropriate MCP server.
+    /// Returns the prompt messages as a formatted string.
+    pub fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<&std::collections::HashMap<String, String>>,
+    ) -> crate::Result<String> {
+        let rt_handle = self.rt.handle();
+
+        // Find which server has this prompt.
+        for (server_name, handle) in &self.servers {
+            let client = match &handle.client {
+                Some(c) => c,
+                None => continue,
+            };
+            let prompts = match rt_handle.block_on(async { client.list_all_prompts().await }) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !prompts.iter().any(|p| p.name == name) {
+                continue;
+            }
+
+            let mut params = rmcp::model::GetPromptRequestParams::new(name);
+            if let Some(args) = arguments {
+                let map: serde_json::Map<String, serde_json::Value> = args
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                params = params.with_arguments(map);
+            }
+            let result = rt_handle
+                .block_on(async { client.get_prompt(params).await })
+                .map_err(|e| {
+                    crate::Error::Io(format!(
+                        "failed to get prompt '{}' from server '{}': {}",
+                        name, server_name, e
+                    ))
+                })?;
+
+            let mut text = String::new();
+            if let Some(desc) = &result.description {
+                text.push_str(desc);
+                text.push_str("\n\n");
+            }
+            for msg in &result.messages {
+                let role = match msg.role {
+                    rmcp::model::PromptMessageRole::User => "user",
+                    rmcp::model::PromptMessageRole::Assistant => "assistant",
+                };
+                text.push_str(&format!("[{}]\n", role));
+                match &msg.content {
+                    rmcp::model::PromptMessageContent::Text { text: t } => {
+                        text.push_str(t);
+                    }
+                    _ => {
+                        text.push_str("(non-text content)");
+                    }
+                }
+                text.push('\n');
+            }
+            return Ok(text);
+        }
+
+        Err(crate::Error::Io(format!("prompt '{}' not found on any MCP server", name)))
+    }
+
     /// Get status information for all servers.
     pub fn server_statuses(&self) -> Vec<(String, McpServerStatus, usize)> {
         self.servers

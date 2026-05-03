@@ -108,6 +108,8 @@ impl Client {
                 | Response::ProjectStats { .. }
                 | Response::ProjectInfo { .. }
                 | Response::SearchResults { .. }
+                | Response::McpPrompts { .. }
+                | Response::McpPromptContent { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);
