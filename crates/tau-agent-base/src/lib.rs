@@ -5,6 +5,7 @@
 //! (for async JSON-line I/O helpers used by the client and plugin crates).
 
 pub mod config_chain;
+pub mod mcp_config;
 pub mod model_resolve;
 pub mod paths;
 pub mod plugin_protocol;

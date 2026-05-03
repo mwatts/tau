@@ -1113,7 +1113,7 @@ pub enum PluginSource {
     Global { index: usize },
 }
 
-/// Manages global plugins and per-session plugin sets.
+/// Manages global plugins, MCP servers, and per-session plugin sets.
 pub struct PluginManager {
     /// Global plugins (spawned once at server start).
     global_plugins: Vec<PluginHandle>,
@@ -1136,6 +1136,8 @@ pub struct PluginManager {
     initialized_sessions: std::collections::HashSet<String>,
     /// Config for spawning session plugins.
     config: PluginsConfig,
+    /// MCP client manager (connects to external MCP servers).
+    mcp: Option<crate::mcp_client::McpManager>,
 }
 
 impl PluginManager {
@@ -1146,6 +1148,7 @@ impl PluginManager {
             session_plugins: HashMap::new(),
             initialized_sessions: std::collections::HashSet::new(),
             config,
+            mcp: None,
         }
     }
 
@@ -1215,6 +1218,42 @@ impl PluginManager {
         // always return the complete set even when a handle is temporarily
         // taken for tool execution.
         self.rebuild_global_tool_cache();
+    }
+
+    /// Load and connect to MCP servers from `mcp.toml`.
+    pub fn load_mcp_servers(
+        &mut self,
+        project_name: Option<&str>,
+        project_path: Option<&str>,
+    ) {
+        match crate::mcp_client::McpManager::new() {
+            Ok(mut mgr) => {
+                mgr.load_and_connect(project_name, project_path);
+                if mgr.has_servers() {
+                    tracing::info!(
+                        servers = mgr.server_statuses().len(),
+                        "MCP servers loaded"
+                    );
+                }
+                self.mcp = Some(mgr);
+            }
+            Err(e) => {
+                tracing::warn!(%e, "failed to initialize MCP manager");
+            }
+        }
+    }
+
+    /// Reload MCP server configuration.
+    pub fn reload_mcp(
+        &mut self,
+        project_name: Option<&str>,
+        project_path: Option<&str>,
+    ) {
+        if let Some(mcp) = &mut self.mcp {
+            mcp.reload(project_name, project_path);
+        } else {
+            self.load_mcp_servers(project_name, project_path);
+        }
     }
 
     /// Rebuild the cached tool schemas/prompts from the current global plugins.
@@ -1319,7 +1358,7 @@ impl PluginManager {
         self.initialized_sessions.remove(session_id);
     }
 
-    /// Get all tool schemas (global + session).
+    /// Get all tool schemas (global + session + MCP).
     /// When `child_budget` is 0, session orchestration tools (session_*) are excluded.
     pub fn tool_schemas(&self, session_id: &str, child_budget: u32) -> Vec<Tool> {
         let mut schemas = Vec::new();
@@ -1332,13 +1371,17 @@ impl PluginManager {
         for (tool_schemas, _) in &self.global_tool_cache {
             schemas.extend(tool_schemas.iter().cloned());
         }
+        // MCP tools
+        if let Some(mcp) = &self.mcp {
+            schemas.extend(mcp.tool_schemas());
+        }
         if child_budget == 0 {
             schemas.retain(|t| !t.name.starts_with("session_"));
         }
         schemas
     }
 
-    /// Get all tool prompt contributions (global + session).
+    /// Get all tool prompt contributions (global + session + MCP).
     /// When `child_budget` is 0, session orchestration tools (session_*) are excluded.
     pub fn tool_prompts(
         &self,
@@ -1353,13 +1396,17 @@ impl PluginManager {
         for (_, tool_prompts) in &self.global_tool_cache {
             prompts.extend(tool_prompts.iter().cloned());
         }
+        // MCP tool prompts
+        if let Some(mcp) = &self.mcp {
+            prompts.extend(mcp.tool_prompts());
+        }
         if child_budget == 0 {
             prompts.retain(|t| !t.name.starts_with("session_"));
         }
         prompts
     }
 
-    /// Execute a tool call: try session plugins first, then global.
+    /// Execute a tool call: try session plugins first, then global, then MCP.
     /// Runs after_tool_result hooks on all plugins afterward.
     pub fn execute_tool(
         &mut self,
@@ -1384,13 +1431,24 @@ impl PluginManager {
                 let mut result =
                     p.execute_tool(tool_call, Some(cwd), Some(session_id), on_output)?;
                 self.run_after_tool_hooks(session_id, tool_call, &mut result);
-                Ok(result)
+                return Ok(result);
             }
-            None => Err(crate::Error::Io(format!(
-                "no plugin provides tool '{}'",
-                tool_call.name
-            ))),
+            None => {}
         }
+
+        // Fall through to MCP servers
+        if let Some(mcp) = &self.mcp {
+            if mcp.has_tool(&tool_call.name) {
+                let mut result = mcp.execute_tool(tool_call, on_output)?;
+                self.run_after_tool_hooks(session_id, tool_call, &mut result);
+                return Ok(result);
+            }
+        }
+
+        Err(crate::Error::Io(format!(
+            "no plugin provides tool '{}'",
+            tool_call.name
+        )))
     }
 
     /// Execute a tool call with server request handler.
@@ -1439,13 +1497,24 @@ impl PluginManager {
                     project_name,
                 )?;
                 self.run_after_tool_hooks(session_id, tool_call, &mut result);
-                Ok(result)
+                return Ok(result);
             }
-            None => Err(crate::Error::Io(format!(
-                "no plugin provides tool '{}'",
-                tool_call.name
-            ))),
+            None => {}
         }
+
+        // Fall through to MCP servers
+        if let Some(mcp) = &self.mcp {
+            if mcp.has_tool(&tool_call.name) {
+                let mut result = mcp.execute_tool(tool_call, on_output)?;
+                self.run_after_tool_hooks(session_id, tool_call, &mut result);
+                return Ok(result);
+            }
+        }
+
+        Err(crate::Error::Io(format!(
+            "no plugin provides tool '{}'",
+            tool_call.name
+        )))
     }
 
     /// Take a plugin handle out of the manager for tool execution.

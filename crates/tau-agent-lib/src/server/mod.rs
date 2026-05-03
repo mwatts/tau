@@ -548,6 +548,8 @@ pub async fn run() -> crate::Result<()> {
     let plugins_config = crate::plugin::load_plugins_config();
     let mut plugins = crate::plugin::PluginManager::new(plugins_config);
     plugins.load_global_plugins("/tmp");
+    // Load MCP servers from mcp.toml (no project context at server start)
+    plugins.load_mcp_servers(None, None);
     let plugins: Arc<Mutex<crate::plugin::PluginManager>> = Arc::new(Mutex::new(plugins));
 
     let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));

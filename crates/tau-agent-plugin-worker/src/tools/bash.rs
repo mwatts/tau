@@ -162,9 +162,12 @@ pub fn close_fds_from_3() {
         // Try close_range(3, ~0u32, 0). On a Linux kernel ≥ 5.9 this
         // closes every open fd ≥ 3 in one syscall. Older kernels
         // return ENOSYS; we fall through to the loop below.
-        let ret = nix::libc::syscall(nix::libc::SYS_close_range, 3i64, !0u32 as i64, 0i64);
-        if ret == 0 {
-            return;
+        #[cfg(target_os = "linux")]
+        {
+            let ret = nix::libc::syscall(nix::libc::SYS_close_range, 3i64, !0u32 as i64, 0i64);
+            if ret == 0 {
+                return;
+            }
         }
 
         // Fallback: walk fds 3..max and close each. Use

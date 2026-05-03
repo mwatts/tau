@@ -2182,7 +2182,8 @@ pub(super) async fn handle_client(
                             for msg in &failures {
                                 queue_info_to_session(&state, &session_id, msg);
                             }
-                            pm.load_global_plugins(&cwd)
+                            pm.load_global_plugins(&cwd);
+                            pm.reload_mcp(project_name.as_deref(), Some(&cwd));
                         })
                 };
                 match result {

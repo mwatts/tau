@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod mcp_client;
 pub mod logging;
 pub mod migration;
 pub mod models_config;
