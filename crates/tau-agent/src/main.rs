@@ -101,6 +101,13 @@ enum Commands {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Run tau as an MCP server (stdio transport)
+    #[command(name = "mcp-server", hide = true)]
+    McpServer {
+        /// Working directory for the session
+        #[arg(long, default_value = ".")]
+        cwd: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -682,6 +689,20 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
         },
         Commands::Profile { action } => {
             cmd_profile(action)?;
+        }
+        Commands::McpServer { cwd } => {
+            let cwd = if cwd == "." {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+                    .unwrap_or_else(|| ".".into())
+            } else {
+                cwd
+            };
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
+            rt.block_on(tau_agent_lib::mcp_server::run_stdio(cwd))
+                .map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
         }
     }
     Ok(())
