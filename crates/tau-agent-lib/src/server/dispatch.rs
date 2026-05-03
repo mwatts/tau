@@ -1119,6 +1119,23 @@ pub(super) async fn handle_client(
                 let resp = get_messages_impl(&state, &session_id);
                 send(&mut writer, &resp).await?;
             }
+            crate::protocol::Request::SearchMessages {
+                query,
+                limit,
+                project_name,
+            } => {
+                let resp = {
+                    let st = lock_state(&state);
+                    let limit = limit.min(50).max(1);
+                    match st.db.search_messages(&query, limit, project_name.as_deref()) {
+                        Ok(results) => crate::protocol::Response::SearchResults { results },
+                        Err(e) => Response::Error {
+                            message: format!("search failed: {}", e),
+                        },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
             crate::protocol::Request::CancelChat {
                 session_id,
                 caller_session_id,

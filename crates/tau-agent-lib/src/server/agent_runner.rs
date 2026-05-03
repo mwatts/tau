@@ -32,6 +32,34 @@ pub(super) struct PluginExecutor {
     pub(super) test_overrides: SharedTestOverrides,
 }
 
+impl PluginExecutor {
+    fn handle_memory_tool(&self, tool_call: &ToolCall) -> ToolResultMessage {
+        let args = &tool_call.arguments;
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("project");
+        let content = args.get("content").and_then(|v| v.as_str());
+
+        let result_text = crate::memory::execute(action, scope, content, &self.cwd);
+
+        ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: vec![crate::types::ToolResultContent::Text(
+                crate::types::TextContent {
+                    text: result_text,
+                    text_signature: None,
+                },
+            )],
+            details: None,
+            is_error: false,
+            timestamp: crate::types::timestamp_ms(),
+            duration_ms: None,
+            summary: None,
+            post_persist_actions: Vec::new(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::worker::ToolExecutor for PluginExecutor {
     async fn execute(
@@ -40,6 +68,11 @@ impl crate::worker::ToolExecutor for PluginExecutor {
         output_tx: &smol::channel::Sender<String>,
         cancel: &tau_agent_base::types::CancelToken,
     ) -> crate::Result<ToolResultMessage> {
+        // Handle memory tool directly (file I/O, no plugin needed).
+        if tool_call.name == "memory" {
+            return Ok(self.handle_memory_tool(tool_call));
+        }
+
         // Take the plugin handle out of the manager (brief lock).
         // This lets us execute tool I/O without holding the PluginManager lock,
         // preventing deadlocks when tools make ServerRequest calls that need
@@ -730,11 +763,17 @@ pub(super) async fn run_child_chat(
                 let active = crate::skills::select(&all_skills, &ctx);
                 crate::skills::format_for_prompt(&active)
             };
-            let extra_guidelines = if skills_block.is_empty() {
-                vec![]
-            } else {
-                vec![skills_block]
-            };
+
+            // Memory injection
+            let memory_block = crate::memory::load_for_prompt(Some(&cwd));
+
+            let mut extra_guidelines = Vec::new();
+            if !memory_block.is_empty() {
+                extra_guidelines.push(memory_block);
+            }
+            if !skills_block.is_empty() {
+                extra_guidelines.push(skills_block);
+            }
 
             Some(crate::system_prompt::build(
                 &crate::system_prompt::PromptOptions {
@@ -1025,11 +1064,17 @@ pub(super) async fn resume_child_session(
                 let active = crate::skills::select(&all_skills, &ctx);
                 crate::skills::format_for_prompt(&active)
             };
-            let extra_guidelines = if skills_block.is_empty() {
-                vec![]
-            } else {
-                vec![skills_block]
-            };
+
+            // Memory injection
+            let memory_block = crate::memory::load_for_prompt(Some(&cwd));
+
+            let mut extra_guidelines = Vec::new();
+            if !memory_block.is_empty() {
+                extra_guidelines.push(memory_block);
+            }
+            if !skills_block.is_empty() {
+                extra_guidelines.push(skills_block);
+            }
 
             Some(crate::system_prompt::build(
                 &crate::system_prompt::PromptOptions {

@@ -291,6 +291,65 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             prompt_snippet: None,
             prompt_guidelines: vec![],
         },
+        PluginToolDef {
+            name: "memory".into(),
+            description: "Manage persistent memory that carries across sessions. Add, replace, or remove facts the agent should remember.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "replace", "remove", "list"],
+                        "description": "Action to perform on memory"
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global"],
+                        "description": "project = .tau/memory.md, global = ~/.config/tau/memory.md (default: project)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "For add: text to append. For replace: new full content. For remove: text to remove (exact match of a line)."
+                    }
+                },
+                "required": ["action"]
+            }),
+            prompt_snippet: Some("Use memory to persist facts, preferences, and decisions across sessions. Project memory is shared by all sessions in this project; global memory is shared across all projects.".into()),
+            prompt_guidelines: vec![
+                "Add facts when you learn something reusable (user preferences, project conventions, key decisions).".into(),
+                "Keep memory concise — it's injected into every session's prompt. Curate actively.".into(),
+                "Use 'list' to see current memory before modifying.".into(),
+                "Project memory is capped at ~2200 chars, global at ~1400 chars. Remove stale entries to make room.".into(),
+            ],
+        },
+        PluginToolDef {
+            name: "session_search".into(),
+            description: "Search across all past session messages using full-text search. Returns matching snippets with session context.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "FTS5 search query (supports AND, OR, NOT, phrase matching with quotes)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 10, max 50)"
+                    },
+                    "project_name": {
+                        "type": "string",
+                        "description": "Restrict search to sessions in this project (omit for all)"
+                    }
+                },
+                "required": ["query"]
+            }),
+            prompt_snippet: Some("Use session_search to find relevant information from past sessions — useful for recalling previous decisions, approaches, or context.".into()),
+            prompt_guidelines: vec![
+                "Search before re-solving a problem — past sessions may have the answer.".into(),
+                "Use specific keywords or quoted phrases for precise results.".into(),
+                "Results include session_id — use session_read to get full context if needed.".into(),
+            ],
+        },
     ]
 }
 

@@ -227,6 +227,20 @@ pub(super) async fn handle_server_request(
             get_session_ancestors_impl(state, session_id)
         }
         Request::GetMessages { session_id } => get_messages_impl(state, session_id),
+        Request::SearchMessages {
+            query,
+            limit,
+            project_name,
+        } => {
+            let st = super::state::lock_state(state);
+            let limit = (*limit).min(50).max(1);
+            match st.db.search_messages(query, limit, project_name.as_deref()) {
+                Ok(results) => Response::SearchResults { results },
+                Err(e) => Response::Error {
+                    message: format!("search failed: {}", e),
+                },
+            }
+        }
         Request::ListSessions {
             include_archived,
             project_name,

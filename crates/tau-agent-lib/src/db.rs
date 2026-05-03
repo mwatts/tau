@@ -246,6 +246,18 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_queued_target ON queued_messages(target_session_id);",
         );
 
+        // FTS5 virtual table for cross-session search (SI-2).
+        // content_rowid links to messages.id for automatic content sync.
+        let _ = conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                session_id UNINDEXED,
+                role UNINDEXED,
+                content,
+                created_at UNINDEXED,
+                content_rowid='id'
+            );",
+        );
+
         Ok(Self { conn })
     }
 
@@ -305,6 +317,17 @@ impl Db {
             );",
         )
         .map_err(db_err("create tables"))?;
+
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                session_id UNINDEXED,
+                role UNINDEXED,
+                content,
+                created_at UNINDEXED,
+                content_rowid='id'
+            );",
+        )
+        .map_err(db_err("create fts table"))?;
 
         let _ = path; // suppress unused
         Ok(Self { conn })
@@ -818,6 +841,31 @@ impl Db {
                 params![session_id, json, now],
             )
             .map_err(db_err("insert message"))?;
+
+        // Index into FTS for cross-session search.
+        let (role, text) = match message {
+            Message::User(u) => (
+                "user",
+                u.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::types::UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            Message::Assistant(a) => ("assistant", a.text()),
+            _ => return Ok(()),
+        };
+        if !text.is_empty() {
+            let rowid = self.conn.last_insert_rowid();
+            let _ = self.conn.execute(
+                "INSERT INTO messages_fts (rowid, session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![rowid, session_id, role, text, now],
+            );
+        }
+
         Ok(())
     }
 
@@ -847,6 +895,75 @@ impl Db {
             messages.push(row.map_err(db_err("read message row"))?);
         }
         Ok(messages)
+    }
+
+    /// Full-text search across all session messages.
+    ///
+    /// Returns snippets with highlighting. If `project_name` is set, restricts
+    /// to sessions belonging to that project.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        project_name: Option<&str>,
+    ) -> crate::Result<Vec<crate::protocol::SearchResult>> {
+        use crate::protocol::SearchResult;
+
+        let mut results = Vec::new();
+
+        if let Some(pname) = project_name {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.session_id, f.role, f.created_at,
+                        snippet(messages_fts, 2, '>>>', '<<<', '...', 40) as snip,
+                        s.tagline
+                 FROM messages_fts f
+                 JOIN sessions s ON s.id = f.session_id
+                 WHERE messages_fts MATCH ?1 AND s.project_name = ?2
+                 ORDER BY rank
+                 LIMIT ?3",
+            ).map_err(db_err("prepare fts search"))?;
+
+            let rows = stmt.query_map(params![query, pname, limit as i64], |row| {
+                Ok(SearchResult {
+                    session_id: row.get(0)?,
+                    role: row.get(1)?,
+                    timestamp_ms: row.get::<_, i64>(2).map(|v| v as u64)?,
+                    snippet: row.get(3)?,
+                    tagline: row.get(4)?,
+                })
+            }).map_err(db_err("fts search"))?;
+
+            for row in rows.flatten() {
+                results.push(row);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT f.session_id, f.role, f.created_at,
+                        snippet(messages_fts, 2, '>>>', '<<<', '...', 40) as snip,
+                        s.tagline
+                 FROM messages_fts f
+                 JOIN sessions s ON s.id = f.session_id
+                 WHERE messages_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            ).map_err(db_err("prepare fts search"))?;
+
+            let rows = stmt.query_map(params![query, limit as i64], |row| {
+                Ok(SearchResult {
+                    session_id: row.get(0)?,
+                    role: row.get(1)?,
+                    timestamp_ms: row.get::<_, i64>(2).map(|v| v as u64)?,
+                    snippet: row.get(3)?,
+                    tagline: row.get(4)?,
+                })
+            }).map_err(db_err("fts search"))?;
+
+            for row in rows.flatten() {
+                results.push(row);
+            }
+        }
+
+        Ok(results)
     }
 
     /// Count messages in a session.
@@ -2953,5 +3070,67 @@ mod tests {
         let owned = HashSet::new();
         let deleted = db.gc_empty_sessions(0, &live, &owned).unwrap();
         assert_eq!(deleted, vec!["s1".to_string()]);
+    }
+
+    #[test]
+    fn fts_search_messages() {
+        let db = Db::open_memory().unwrap();
+        let session = StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: Some("test session".into()),
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: Some("myproject".into()),
+        };
+        db.create_session(&session).unwrap();
+
+        // Add messages
+        db.append_message("s1", &Message::User(UserMessage::text("How do I implement FTS5 in SQLite?")))
+            .unwrap();
+        db.append_message(
+            "s1",
+            &Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: "FTS5 is a full-text search extension for SQLite that supports ranking and snippets.".into(),
+                    text_signature: None,
+                })],
+                api: "test".into(),
+                provider: "test".into(),
+                model: "test".into(),
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: timestamp_ms(),
+            }),
+        )
+        .unwrap();
+
+        // Search should find results
+        let results = db.search_messages("FTS5", 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].snippet.contains("FTS5"));
+
+        // Search with project filter
+        let results = db.search_messages("FTS5", 10, Some("myproject")).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Search with wrong project
+        let results = db.search_messages("FTS5", 10, Some("other")).unwrap();
+        assert!(results.is_empty());
+
+        // Search for nonexistent term
+        let results = db.search_messages("nonexistent_xyz", 10, None).unwrap();
+        assert!(results.is_empty());
     }
 }

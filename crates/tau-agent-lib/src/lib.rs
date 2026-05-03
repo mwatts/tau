@@ -10,6 +10,7 @@ pub mod models_config;
 pub mod plugin;
 pub mod profile;
 pub mod replay;
+pub mod memory;
 pub mod server;
 pub mod shutdown;
 pub mod skills;

@@ -132,6 +132,16 @@ pub enum Request {
     GetSubscriptionUsage,
     /// Get message history for a session.
     GetMessages { session_id: String },
+    /// Full-text search across all session messages.
+    SearchMessages {
+        query: String,
+        /// Max results (default 10).
+        #[serde(default = "default_search_limit")]
+        limit: usize,
+        /// If set, restrict search to this project's sessions.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
+    },
     /// Subscribe to live events on a session (for multi-client).
     /// The connection stays open and receives Stream/AgentDone/Cancelled events.
     Subscribe { session_id: String },
@@ -411,6 +421,10 @@ pub enum Response {
     Messages {
         messages: Vec<crate::types::Message>,
     },
+    /// Full-text search results across sessions.
+    SearchResults {
+        results: Vec<SearchResult>,
+    },
     /// A user message was sent (broadcast to subscribers).
     UserMessage { text: String },
     /// Agent loop completed (all turns done).
@@ -587,6 +601,20 @@ pub struct SessionResult {
     pub summary: String,
 }
 
+/// A single search result from cross-session FTS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub session_id: String,
+    /// Session tagline (if any).
+    pub tagline: Option<String>,
+    /// Snippet of matching text with highlights.
+    pub snippet: String,
+    /// Role: "user" or "assistant".
+    pub role: String,
+    /// Timestamp of the message.
+    pub timestamp_ms: u64,
+}
+
 fn default_wait_timeout() -> u64 {
     300
 }
@@ -597,6 +625,10 @@ fn default_true() -> bool {
 
 fn default_state() -> String {
     "idle".into()
+}
+
+fn default_search_limit() -> usize {
+    10
 }
 
 fn default_recent_limit() -> usize {
