@@ -502,6 +502,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(crate::agent::AgentConfig::default().idle_timeout_secs),
+        tool_gate: Some(Box::new(crate::tool_gate::assess)),
         ..Default::default()
     };
 

@@ -15,6 +15,7 @@ pub mod server;
 pub mod shutdown;
 pub mod skill_patch;
 pub mod skills;
+pub mod tool_gate;
 pub mod worker;
 
 /// Re-export of the server's chat-attachment helpers so CLI/TUI clients

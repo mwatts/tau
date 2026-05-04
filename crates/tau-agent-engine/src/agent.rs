@@ -67,6 +67,21 @@ pub struct AgentConfig {
     /// per-action target, not by assuming "always the caller".
     #[allow(clippy::type_complexity)]
     pub post_persist_callback: Option<Box<dyn Fn(&[PostPersistAction]) + Send + Sync>>,
+    /// Pre-execution gate for tool calls. Called before each tool execution.
+    /// Returns `Allow` to proceed, `Deny(reason)` to block (returned as
+    /// error tool result so the LLM sees why), or `Escalate(reason)` to
+    /// deny with a hint that the user should be consulted.
+    #[allow(clippy::type_complexity)]
+    pub tool_gate: Option<Box<dyn Fn(&ToolCall) -> ToolGateVerdict + Send + Sync>>,
+}
+
+/// Verdict from the tool gate pre-execution check.
+#[derive(Debug, Clone)]
+pub enum ToolGateVerdict {
+    /// Proceed with execution.
+    Allow,
+    /// Block execution, return reason as error tool result.
+    Deny(String),
 }
 
 /// Default idle timeout for SSE stream chunks (90 seconds).
@@ -86,6 +101,7 @@ impl Default for AgentConfig {
             refresh_api_key: None,
             review_model: None,
             post_persist_callback: None,
+            tool_gate: None,
         }
     }
 }
@@ -411,6 +427,29 @@ pub async fn run(
                     max_turns_reached: false,
                 });
             }
+            // Tool gate: check if execution is allowed before proceeding.
+            if let Some(ref gate) = config.tool_gate {
+                if let ToolGateVerdict::Deny(reason) = gate(tc) {
+                    let denied = tau_agent_base::types::ToolResultMessage::error(
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        &format!("tool denied by safety gate: {}", reason),
+                    );
+                    let _ = event_tx.try_send(StreamEvent::ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        is_error: true,
+                        content: format!("tool denied by safety gate: {}", reason),
+                        summary: None,
+                    });
+                    let tool_msg = Message::ToolResult(denied.clone());
+                    emit_message(config, &tool_msg);
+                    new_messages.push(tool_msg.clone());
+                    context.messages.push(tool_msg);
+                    continue;
+                }
+            }
+
             // Execute tool with streaming output deltas via channel.
             // Errors (e.g. unknown tool) become error ToolResultMessages so
             // the LLM can see them and the agent loop continues.
