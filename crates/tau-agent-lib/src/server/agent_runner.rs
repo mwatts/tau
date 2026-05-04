@@ -876,6 +876,38 @@ pub(super) async fn run_child_chat(
     }
     .await;
 
+    // Record prompt metrics for optimization
+    {
+        let project_name = {
+            let st = lock_state(&state);
+            st.db.get_session(&session_id).ok().flatten().and_then(|s| s.project_name)
+        };
+        if let Some(ref project_name) = project_name {
+            let outcome = match &chat_result {
+                Ok((true, _)) => "cancelled",
+                Ok((false, _)) => "completed",
+                Err(_) => "error",
+            };
+            let (messages, sys_prompt) = {
+                let st = lock_state(&state);
+                let msgs = st.db.get_messages(&session_id).unwrap_or_default();
+                let sp = st.db.get_session(&session_id).ok().flatten().and_then(|s| s.system_prompt);
+                (msgs, sp)
+            };
+            let st = lock_state(&state);
+            crate::prompt_metrics::record_session_metrics(
+                &st.db,
+                project_name,
+                &session_id,
+                None,
+                outcome,
+                sys_prompt.as_deref(),
+                &messages,
+                &[],
+            );
+        }
+    }
+
     // Broadcast terminal response and notify parent. Terminal broadcasts use
     // the awaiting variant so subscribers observe them before the session
     // transitions to idle via another code path.
