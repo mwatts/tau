@@ -98,11 +98,15 @@ fn run_stream(
 
     // Local must outlive the &str borrow in `extra_headers`.
     let bearer;
-    let mut extra_headers: Vec<(&str, &str)> = Vec::with_capacity(2);
+    let mut extra_headers: Vec<(&str, &str)> = Vec::with_capacity(4);
     extra_headers.push(("accept", "text/event-stream"));
     if !ctx.api_key.is_empty() {
         bearer = format!("Bearer {}", ctx.api_key);
         extra_headers.push(("authorization", bearer.as_str()));
+    }
+    // Inject per-model headers (e.g. OpenRouter's HTTP-Referer, X-Title)
+    for (k, v) in &ctx.model.headers {
+        extra_headers.push((k.as_str(), v.as_str()));
     }
 
     let PreparedStream {

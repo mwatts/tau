@@ -132,6 +132,7 @@ pub fn resolve_models(config: &Config) -> Vec<Model> {
     // Built-in models
     models.extend(crate::providers::anthropic::models());
     models.extend(builtin_openai_models());
+    models.extend(builtin_openrouter_models());
     models.push(crate::providers::log::log_model());
 
     // Custom models from config
@@ -336,6 +337,101 @@ fn builtin_openai_models() -> Vec<Model> {
         oai("o3-mini", "o3-mini", O, 1.1, 4.4, 0.55, 200_000, 100_000),
         oai("o3-pro", "o3-pro", O, 20.0, 80.0, 0.0, 200_000, 100_000),
         oai("o4-mini", "o4-mini", O, 1.1, 4.4, 0.28, 200_000, 100_000),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Built-in OpenRouter models (OpenAI-compatible, routed through OpenRouter)
+// ---------------------------------------------------------------------------
+
+fn or_model(
+    id: &str,
+    name: &str,
+    thinking: ThinkingStyle,
+    input: f64,
+    output: f64,
+    ctx: u64,
+    max_tok: u64,
+) -> Model {
+    Model {
+        id: id.into(),
+        name: name.into(),
+        api: "openai-completions".into(),
+        provider: "openrouter".into(),
+        base_url: "https://openrouter.ai/api/v1".into(),
+        thinking,
+        cost: ModelCost {
+            input,
+            output,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        },
+        context_window: ctx,
+        max_tokens: max_tok,
+        headers: HashMap::from([
+            ("HTTP-Referer".into(), "https://github.com/tau-agent/tau".into()),
+            ("X-Title".into(), "tau".into()),
+        ]),
+    }
+}
+
+fn builtin_openrouter_models() -> Vec<Model> {
+    use ThinkingStyle::None as N;
+    vec![
+        or_model(
+            "google/gemini-2.5-pro",
+            "Gemini 2.5 Pro (OpenRouter)",
+            N,
+            1.25,
+            10.0,
+            1_048_576,
+            65_536,
+        ),
+        or_model(
+            "google/gemini-2.5-flash",
+            "Gemini 2.5 Flash (OpenRouter)",
+            N,
+            0.15,
+            0.60,
+            1_048_576,
+            65_536,
+        ),
+        or_model(
+            "deepseek/deepseek-r1",
+            "DeepSeek R1 (OpenRouter)",
+            N,
+            0.55,
+            2.19,
+            163_840,
+            65_536,
+        ),
+        or_model(
+            "meta-llama/llama-4-maverick",
+            "Llama 4 Maverick (OpenRouter)",
+            N,
+            0.20,
+            0.60,
+            1_048_576,
+            65_536,
+        ),
+        or_model(
+            "mistralai/mistral-large",
+            "Mistral Large (OpenRouter)",
+            N,
+            2.0,
+            6.0,
+            128_000,
+            32_768,
+        ),
+        or_model(
+            "qwen/qwen3-235b-a22b",
+            "Qwen3 235B (OpenRouter)",
+            N,
+            0.20,
+            1.20,
+            131_072,
+            32_768,
+        ),
     ]
 }
 
