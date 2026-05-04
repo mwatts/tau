@@ -111,6 +111,42 @@ pub struct Project {
     pub created_at: i64,
 }
 
+/// A row from the `prompt_metrics` table.
+#[derive(Debug, Clone)]
+pub struct PromptMetricRow {
+    pub id: i64,
+    pub project_name: String,
+    pub session_id: String,
+    pub task_id: Option<i64>,
+    pub outcome: String,
+    pub prompt_hash: String,
+    pub tool_error_count: i64,
+    pub tool_call_count: i64,
+    pub tool_errors_by_name: Option<String>,
+    pub active_skills: Option<String>,
+    pub effectiveness_score: Option<i64>,
+    pub inefficiency_notes: Option<String>,
+    pub prompt_suggestions: Option<String>,
+    pub optimization_id: Option<i64>,
+    pub created_at: i64,
+}
+
+/// A row from the `optimizations` table.
+#[derive(Debug, Clone)]
+pub struct OptimizationRow {
+    pub id: i64,
+    pub project_name: String,
+    pub target: String,
+    pub target_name: String,
+    pub old_hash: String,
+    pub new_hash: String,
+    pub risk: String,
+    pub status: String,
+    pub reverted_reason: Option<String>,
+    pub applied_at: i64,
+    pub reverted_at: Option<i64>,
+}
+
 /// SELECT column list shared across all queries that return `StoredSession` rows.
 const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name";
 
@@ -276,6 +312,51 @@ impl Db {
             );",
         );
 
+        // Prompt quality metrics and optimization tracking.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS prompt_metrics (
+                id                  INTEGER PRIMARY KEY,
+                project_name        TEXT NOT NULL,
+                session_id          TEXT NOT NULL,
+                task_id             INTEGER,
+                outcome             TEXT NOT NULL,
+                prompt_hash         TEXT NOT NULL,
+                tool_error_count    INTEGER NOT NULL DEFAULT 0,
+                tool_call_count     INTEGER NOT NULL DEFAULT 0,
+                tool_errors_by_name TEXT,
+                active_skills       TEXT,
+                effectiveness_score INTEGER,
+                inefficiency_notes  TEXT,
+                prompt_suggestions  TEXT,
+                optimization_id     INTEGER,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_metrics_project ON prompt_metrics(project_name);
+            CREATE TABLE IF NOT EXISTS optimizations (
+                id              INTEGER PRIMARY KEY,
+                project_name    TEXT NOT NULL,
+                target          TEXT NOT NULL,
+                target_name     TEXT NOT NULL,
+                old_hash        TEXT NOT NULL,
+                new_hash        TEXT NOT NULL,
+                risk            TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'active',
+                reverted_reason TEXT,
+                applied_at      INTEGER NOT NULL,
+                reverted_at     INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_optimizations_project ON optimizations(project_name);
+            CREATE TABLE IF NOT EXISTS promotions (
+                id              INTEGER PRIMARY KEY,
+                source_project  TEXT NOT NULL,
+                optimization_id INTEGER NOT NULL,
+                target_path     TEXT NOT NULL,
+                content_hash    TEXT NOT NULL,
+                promoted_at     INTEGER NOT NULL,
+                demoted_at      INTEGER
+            );",
+        );
+
         Ok(Self { conn })
     }
 
@@ -364,6 +445,51 @@ impl Db {
             );",
         )
         .map_err(db_err("create schedules table"))?;
+
+        conn.execute_batch(
+            "CREATE TABLE prompt_metrics (
+                id                  INTEGER PRIMARY KEY,
+                project_name        TEXT NOT NULL,
+                session_id          TEXT NOT NULL,
+                task_id             INTEGER,
+                outcome             TEXT NOT NULL,
+                prompt_hash         TEXT NOT NULL,
+                tool_error_count    INTEGER NOT NULL DEFAULT 0,
+                tool_call_count     INTEGER NOT NULL DEFAULT 0,
+                tool_errors_by_name TEXT,
+                active_skills       TEXT,
+                effectiveness_score INTEGER,
+                inefficiency_notes  TEXT,
+                prompt_suggestions  TEXT,
+                optimization_id     INTEGER,
+                created_at          INTEGER NOT NULL
+            );
+            CREATE INDEX idx_prompt_metrics_project ON prompt_metrics(project_name);
+            CREATE TABLE optimizations (
+                id              INTEGER PRIMARY KEY,
+                project_name    TEXT NOT NULL,
+                target          TEXT NOT NULL,
+                target_name     TEXT NOT NULL,
+                old_hash        TEXT NOT NULL,
+                new_hash        TEXT NOT NULL,
+                risk            TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'active',
+                reverted_reason TEXT,
+                applied_at      INTEGER NOT NULL,
+                reverted_at     INTEGER
+            );
+            CREATE INDEX idx_optimizations_project ON optimizations(project_name);
+            CREATE TABLE promotions (
+                id              INTEGER PRIMARY KEY,
+                source_project  TEXT NOT NULL,
+                optimization_id INTEGER NOT NULL,
+                target_path     TEXT NOT NULL,
+                content_hash    TEXT NOT NULL,
+                promoted_at     INTEGER NOT NULL,
+                demoted_at      INTEGER
+            );",
+        )
+        .map_err(db_err("create metrics/optimizations tables"))?;
 
         let _ = path; // suppress unused
         Ok(Self { conn })
@@ -1667,6 +1793,174 @@ impl Db {
                 rusqlite::params![last_run_at, next_run_at, id],
             )
             .map_err(db_err("update schedule run"))?;
+        Ok(())
+    }
+
+    // ----- prompt_metrics -----
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_prompt_metric(
+        &self,
+        project_name: &str,
+        session_id: &str,
+        task_id: Option<i64>,
+        outcome: &str,
+        prompt_hash: &str,
+        tool_error_count: i64,
+        tool_call_count: i64,
+        tool_errors_by_name: Option<&str>,
+        active_skills: Option<&str>,
+        effectiveness_score: Option<i64>,
+        inefficiency_notes: Option<&str>,
+        prompt_suggestions: Option<&str>,
+        optimization_id: Option<i64>,
+    ) -> crate::Result<i64> {
+        let now = (crate::types::timestamp_ms() / 1000) as i64;
+        self.conn
+            .execute(
+                "INSERT INTO prompt_metrics (
+                    project_name, session_id, task_id, outcome, prompt_hash,
+                    tool_error_count, tool_call_count, tool_errors_by_name, active_skills,
+                    effectiveness_score, inefficiency_notes, prompt_suggestions,
+                    optimization_id, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    project_name,
+                    session_id,
+                    task_id,
+                    outcome,
+                    prompt_hash,
+                    tool_error_count,
+                    tool_call_count,
+                    tool_errors_by_name,
+                    active_skills,
+                    effectiveness_score,
+                    inefficiency_notes,
+                    prompt_suggestions,
+                    optimization_id,
+                    now,
+                ],
+            )
+            .map_err(db_err("insert prompt metric"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_prompt_metrics(&self, project_name: &str, limit: usize) -> crate::Result<Vec<PromptMetricRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_name, session_id, task_id, outcome, prompt_hash,
+                        tool_error_count, tool_call_count, tool_errors_by_name, active_skills,
+                        effectiveness_score, inefficiency_notes, prompt_suggestions,
+                        optimization_id, created_at
+                 FROM prompt_metrics WHERE project_name = ?1
+                 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(db_err("prepare get_prompt_metrics"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project_name, limit as i64], |row| {
+                Ok(PromptMetricRow {
+                    id: row.get(0)?,
+                    project_name: row.get(1)?,
+                    session_id: row.get(2)?,
+                    task_id: row.get(3)?,
+                    outcome: row.get(4)?,
+                    prompt_hash: row.get(5)?,
+                    tool_error_count: row.get(6)?,
+                    tool_call_count: row.get(7)?,
+                    tool_errors_by_name: row.get(8)?,
+                    active_skills: row.get(9)?,
+                    effectiveness_score: row.get(10)?,
+                    inefficiency_notes: row.get(11)?,
+                    prompt_suggestions: row.get(12)?,
+                    optimization_id: row.get(13)?,
+                    created_at: row.get(14)?,
+                })
+            })
+            .map_err(db_err("query prompt metrics"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(db_err("read prompt metric row"))?);
+        }
+        Ok(result)
+    }
+
+    pub fn count_prompt_metrics(&self, project_name: &str) -> crate::Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM prompt_metrics WHERE project_name = ?1",
+                rusqlite::params![project_name],
+                |row| row.get(0),
+            )
+            .map_err(db_err("count prompt metrics"))
+    }
+
+    // ----- optimizations -----
+
+    pub fn insert_optimization(
+        &self,
+        project_name: &str,
+        target: &str,
+        target_name: &str,
+        old_hash: &str,
+        new_hash: &str,
+        risk: &str,
+    ) -> crate::Result<i64> {
+        let now = (crate::types::timestamp_ms() / 1000) as i64;
+        self.conn
+            .execute(
+                "INSERT INTO optimizations (
+                    project_name, target, target_name, old_hash, new_hash, risk,
+                    status, applied_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+                rusqlite::params![project_name, target, target_name, old_hash, new_hash, risk, now],
+            )
+            .map_err(db_err("insert optimization"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_active_optimizations(&self, project_name: &str) -> crate::Result<Vec<OptimizationRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_name, target, target_name, old_hash, new_hash, risk,
+                        status, reverted_reason, applied_at, reverted_at
+                 FROM optimizations WHERE project_name = ?1 AND status = 'active'
+                 ORDER BY applied_at DESC",
+            )
+            .map_err(db_err("prepare get_active_optimizations"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![project_name], |row| {
+                Ok(OptimizationRow {
+                    id: row.get(0)?,
+                    project_name: row.get(1)?,
+                    target: row.get(2)?,
+                    target_name: row.get(3)?,
+                    old_hash: row.get(4)?,
+                    new_hash: row.get(5)?,
+                    risk: row.get(6)?,
+                    status: row.get(7)?,
+                    reverted_reason: row.get(8)?,
+                    applied_at: row.get(9)?,
+                    reverted_at: row.get(10)?,
+                })
+            })
+            .map_err(db_err("query active optimizations"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(db_err("read optimization row"))?);
+        }
+        Ok(result)
+    }
+
+    pub fn revert_optimization(&self, id: i64, reason: &str) -> crate::Result<()> {
+        let now = (crate::types::timestamp_ms() / 1000) as i64;
+        self.conn
+            .execute(
+                "UPDATE optimizations SET status = 'reverted', reverted_reason = ?1, reverted_at = ?2 WHERE id = ?3",
+                rusqlite::params![reason, now, id],
+            )
+            .map_err(db_err("revert optimization"))?;
         Ok(())
     }
 }
@@ -3278,5 +3572,43 @@ mod tests {
         // Search for nonexistent term
         let results = db.search_messages("nonexistent_xyz", 10, None).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn prompt_metrics_insert_and_query() {
+        let db = Db::open_memory().unwrap();
+        let id = db
+            .insert_prompt_metric(
+                "myproject", "s-1", Some(42), "merged", "abc123hash",
+                3, 10, Some(r#"{"bash":2,"edit":1}"#), Some(r#"["auto/rust.md"]"#),
+                Some(4), Some("took unnecessary steps"), Some("add path validation hint"), None,
+            )
+            .unwrap();
+        assert!(id > 0);
+
+        let metrics = db.get_prompt_metrics("myproject", 10).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].session_id, "s-1");
+        assert_eq!(metrics[0].outcome, "merged");
+        assert_eq!(metrics[0].tool_error_count, 3);
+        assert_eq!(metrics[0].effectiveness_score, Some(4));
+    }
+
+    #[test]
+    fn optimizations_insert_and_revert() {
+        let db = Db::open_memory().unwrap();
+        let id = db
+            .insert_optimization("myproject", "tool_guideline", "bash", "old123", "new456", "low")
+            .unwrap();
+        assert!(id > 0);
+
+        let active = db.get_active_optimizations("myproject").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].target_name, "bash");
+        assert_eq!(active[0].status, "active");
+
+        db.revert_optimization(id, "regression detected").unwrap();
+        let active = db.get_active_optimizations("myproject").unwrap();
+        assert!(active.is_empty());
     }
 }
