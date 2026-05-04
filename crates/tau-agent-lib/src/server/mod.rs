@@ -391,6 +391,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     )
     .await;
     crate::prompt_optimizer::register(&bg).await;
+    crate::prompt_promoter::register(&bg).await;
     bg.run_startup().await;
 
     let shutdown_watcher = shutdown.clone();
@@ -605,6 +606,7 @@ pub async fn run() -> crate::Result<()> {
     )
     .await;
     crate::prompt_optimizer::register(&bg).await;
+    crate::prompt_promoter::register(&bg).await;
     bg.run_startup().await;
 
     // Install signal-driven graceful shutdown.  SIGTERM (e.g. systemd
