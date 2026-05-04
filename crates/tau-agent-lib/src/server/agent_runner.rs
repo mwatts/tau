@@ -782,6 +782,8 @@ pub(super) async fn run_child_chat(
         let system_prompt = stored.system_prompt.clone().or_else(|| {
             let pm = plugins.lock().expect("plugins mutex poisoned");
             let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
+            let tool_overrides = crate::tool_prompt_overrides::load_overrides(stored.cwd.as_deref());
+            let tool_prompts = crate::tool_prompt_overrides::apply_overrides(tool_prompts, &tool_overrides);
 
             // Skills injection
             let skills_block = {
@@ -1086,6 +1088,8 @@ pub(super) async fn resume_child_session(
         let system_prompt = stored.system_prompt.clone().or_else(|| {
             let pm = plugins.lock().expect("plugins mutex poisoned");
             let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
+            let tool_overrides = crate::tool_prompt_overrides::load_overrides(stored.cwd.as_deref());
+            let tool_prompts = crate::tool_prompt_overrides::apply_overrides(tool_prompts, &tool_overrides);
 
             // Skills injection (resume path — no user message for matching)
             let skills_block = {
