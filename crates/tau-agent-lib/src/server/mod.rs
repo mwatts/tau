@@ -2,14 +2,14 @@
 
 mod agent_runner;
 mod bg_jobs;
-mod bg_tasks;
+pub(crate) mod bg_tasks;
 pub mod chat_attachments;
 mod dispatch;
 mod notifications;
 mod post_idle;
 mod registry;
 mod schedule_runner;
-mod state;
+pub(crate) mod state;
 pub(crate) mod task_handlers;
 mod tool_dispatch;
 
@@ -390,6 +390,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         throttle.clone(),
     )
     .await;
+    crate::prompt_optimizer::register(&bg).await;
     bg.run_startup().await;
 
     let shutdown_watcher = shutdown.clone();
@@ -603,6 +604,7 @@ pub async fn run() -> crate::Result<()> {
         throttle.clone(),
     )
     .await;
+    crate::prompt_optimizer::register(&bg).await;
     bg.run_startup().await;
 
     // Install signal-driven graceful shutdown.  SIGTERM (e.g. systemd

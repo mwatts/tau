@@ -18,6 +18,7 @@ pub mod skills;
 pub mod tool_gate;
 pub mod tool_prompt_overrides;
 pub mod prompt_metrics;
+pub mod prompt_optimizer;
 pub mod worker;
 
 /// Re-export of the server's chat-attachment helpers so CLI/TUI clients

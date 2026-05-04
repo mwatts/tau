@@ -58,7 +58,7 @@ use super::state::{SharedState, lock_state};
 ///
 /// Mirrors the constant of the same name in the legacy `post_idle`
 /// module.
-pub(super) const MAX_DRAIN_ROUNDS: usize = 5;
+pub(crate) const MAX_DRAIN_ROUNDS: usize = 5;
 
 /// A unit of background work.
 ///
@@ -66,7 +66,7 @@ pub(super) const MAX_DRAIN_ROUNDS: usize = 5;
 /// [`SharedState`] handle and grab the lock the same way other server
 /// code does.  Errors are logged inside `run`, never propagated.
 #[async_trait]
-pub(super) trait BgJob: Send + Sync + 'static {
+pub(crate) trait BgJob: Send + Sync + 'static {
     /// Stable name for logging and the periodic re-entrancy guard.
     ///
     /// Must be globally unique across all *periodic* registrations —
@@ -83,7 +83,7 @@ pub(super) trait BgJob: Send + Sync + 'static {
 #[allow(dead_code)] // OnShutdown / AfterDelay / WhenAllSessionsIdle are not
 // wired up yet; the variants exist on the public surface
 // so the first consumer doesn't have to widen the enum.
-pub(super) enum BgTrigger {
+pub(crate) enum BgTrigger {
     /// Run once after the next time `session_id`'s agent loop exits.
     /// Inline-runs immediately if the session is not currently live.
     AfterSessionIdle { session_id: String },
@@ -106,7 +106,7 @@ pub(super) enum BgTrigger {
 /// [`bg_scheduler`].  The cycle `State -> Arc<BgTaskScheduler> ->
 /// SharedState -> State` is intentional and process-lifetime-scoped;
 /// process exit reclaims the memory.
-pub(super) struct BgTaskScheduler {
+pub(crate) struct BgTaskScheduler {
     /// Strong reference back to the server's `SharedState`.  Forms a
     /// cycle with [`State::bg_scheduler`]; see the type-level note.
     state: SharedState,
@@ -127,7 +127,7 @@ pub(super) struct BgTaskScheduler {
 }
 
 impl BgTaskScheduler {
-    pub(super) fn new(state: SharedState, shutdown: ShutdownHandle) -> Arc<Self> {
+    pub(crate) fn new(state: SharedState, shutdown: ShutdownHandle) -> Arc<Self> {
         Arc::new(Self {
             state,
             shutdown,
@@ -146,7 +146,7 @@ impl BgTaskScheduler {
     ///   [`Self::enqueue_for_session`] alias for clarity.
     /// - Others — logs a warning and returns.
     #[allow(dead_code)] // first production caller lands with #745
-    pub(super) async fn register(self: &Arc<Self>, trigger: BgTrigger, job: Arc<dyn BgJob>) {
+    pub(crate) async fn register(self: &Arc<Self>, trigger: BgTrigger, job: Arc<dyn BgJob>) {
         match trigger {
             BgTrigger::AfterSessionIdle { session_id } => {
                 self.enqueue_for_session(&session_id, job).await;
@@ -188,7 +188,7 @@ impl BgTaskScheduler {
     /// The "push + check live" pair runs under a single `lock_state`
     /// to preserve atomicity; this is the moral equivalent of the
     /// legacy `post_idle::enqueue_and_maybe_drain`.
-    pub(super) async fn enqueue_for_session(
+    pub(crate) async fn enqueue_for_session(
         self: &Arc<Self>,
         session_id: &str,
         job: Arc<dyn BgJob>,
@@ -211,7 +211,7 @@ impl BgTaskScheduler {
     /// Call this *after* the session's lock has been released.  Jobs
     /// that themselves enqueue more work for the same session are
     /// picked up on the next round, capped at [`MAX_DRAIN_ROUNDS`].
-    pub(super) async fn drain_for_session(self: &Arc<Self>, session_id: &str) {
+    pub(crate) async fn drain_for_session(self: &Arc<Self>, session_id: &str) {
         for _round in 0..MAX_DRAIN_ROUNDS {
             let batch = {
                 let mut st = lock_state(&self.state);
@@ -239,7 +239,7 @@ impl BgTaskScheduler {
 
     /// Run all `OnStartup` jobs sequentially.  Called once by
     /// `Server::run` before the listener accepts connections.
-    pub(super) async fn run_startup(self: &Arc<Self>) {
+    pub(crate) async fn run_startup(self: &Arc<Self>) {
         let jobs: Vec<Arc<dyn BgJob>> = {
             let mut q = self
                 .startup
@@ -324,7 +324,7 @@ impl BgTaskScheduler {
 /// attaching a scheduler (test fixtures, defensive only — production
 /// code paths attach one synchronously after wrapping `State` into
 /// `SharedState`).
-pub(super) fn bg_scheduler(state: &SharedState) -> Option<Arc<BgTaskScheduler>> {
+pub(crate) fn bg_scheduler(state: &SharedState) -> Option<Arc<BgTaskScheduler>> {
     let st = lock_state(state);
     st.bg_scheduler.clone()
 }

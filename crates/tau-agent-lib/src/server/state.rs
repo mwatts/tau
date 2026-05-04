@@ -9,27 +9,27 @@ use crate::protocol::{ChatAttachment, Response};
 use crate::provider::ProviderRegistry;
 use crate::types::Model;
 
-pub(super) struct State {
-    pub(super) db: Db,
-    pub(super) registry: ProviderRegistry,
-    pub(super) auth: AuthStorage,
-    pub(super) config: config::Config,
+pub(crate) struct State {
+    pub(crate) db: Db,
+    pub(crate) registry: ProviderRegistry,
+    pub(crate) auth: AuthStorage,
+    pub(crate) config: config::Config,
     /// Global model aliases loaded from `~/.config/tau/models.toml`
     /// (with a legacy fallback to `providers.toml [aliases]`).  See
     /// [`crate::models_config::load_global_aliases`].
-    pub(super) global_aliases: HashMap<String, String>,
-    pub(super) default_model: Model,
+    pub(crate) global_aliases: HashMap<String, String>,
+    pub(crate) default_model: Model,
     /// All known models (for /model listing).
-    pub(super) all_models: Vec<Model>,
+    pub(crate) all_models: Vec<Model>,
     /// Cached subscription usage (value, fetched_at_ms).
-    pub(super) usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
+    pub(crate) usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
     /// Per-session cancel flags.  Set by CancelChat, cleared on Chat start.
-    pub(super) cancel_flags: HashMap<String, Arc<AtomicBool>>,
+    pub(crate) cancel_flags: HashMap<String, Arc<AtomicBool>>,
     /// Per-session flag indicating queued messages are pending.
-    pub(super) has_queued: HashMap<String, Arc<AtomicBool>>,
+    pub(crate) has_queued: HashMap<String, Arc<AtomicBool>>,
     /// Per-session broadcast subscribers.
     /// Other clients watching a session receive streamed responses.
-    pub(super) subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
+    pub(crate) subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
     /// Current agent phase per session, for new subscribers.
     /// Tuple is `(phase, turn_started_at_ms, phase_started_at_ms)`.
     /// `turn_started_at_ms` is `Some(_)` while the session is in a
@@ -40,23 +40,23 @@ pub(super) struct State {
     /// re-stamped on every phase transition (so the client can render
     /// a per-phase elapsed counter); cleared on Idle.
     /// See `set_phase_and_stamp`.
-    pub(super) phases: HashMap<String, (crate::types::AgentPhase, Option<u64>, Option<u64>)>,
+    pub(crate) phases: HashMap<String, (crate::types::AgentPhase, Option<u64>, Option<u64>)>,
     /// Sessions with an actively running agent turn in this process.
     /// Inserted at the start of each Chat/resume turn, removed on completion.
     /// This is the authoritative "is something happening right now" signal.
-    pub(super) live_sessions: HashSet<String>,
+    pub(crate) live_sessions: HashSet<String>,
     /// Sessions currently being waited on by WaitSessions/WaitAnySessions.
     /// Maps child_session_id -> parent_session_id. Used to suppress redundant
     /// completion notifications when parent is actively joining.
-    pub(super) waited_sessions: HashSet<String>,
+    pub(crate) waited_sessions: HashSet<String>,
     /// Waiters notified when any session's agent turn completes.
     /// Each entry is a one-shot-ish sender; closed/full senders are pruned on notify.
-    pub(super) session_done_waiters: Vec<smol::channel::Sender<()>>,
+    pub(crate) session_done_waiters: Vec<smol::channel::Sender<()>>,
     /// Pending reply waiters for `await_reply` messages.
     /// Key is msg_id, value is a oneshot sender for the reply content.
-    pub(super) reply_waiters: HashMap<String, smol::channel::Sender<String>>,
+    pub(crate) reply_waiters: HashMap<String, smol::channel::Sender<String>>,
     /// Monotonic counter for generating unique msg_ids.
-    pub(super) next_msg_id: u64,
+    pub(crate) next_msg_id: u64,
     /// Per-session deferred background-job queue.  Drained after the
     /// session's lock is released (agent turn exits) by
     /// [`super::bg_tasks::BgTaskScheduler::drain_for_session`].  Jobs
@@ -68,7 +68,7 @@ pub(super) struct State {
     /// [`super::bg_tasks::BgTaskScheduler::enqueue_for_session`] is
     /// atomic — same single-lock discipline as the legacy
     /// `post_idle_queue` it replaces.
-    pub(super) bg_after_idle: HashMap<String, Vec<Arc<dyn super::bg_tasks::BgJob>>>,
+    pub(crate) bg_after_idle: HashMap<String, Vec<Arc<dyn super::bg_tasks::BgJob>>>,
     /// Background-task scheduler handle.  Set immediately after this
     /// `State` is wrapped into `SharedState`; `None` only inside test
     /// fixtures that don't exercise the scheduler.
@@ -77,12 +77,12 @@ pub(super) struct State {
     /// forming a process-lifetime-scoped reference cycle.  Process
     /// exit reclaims the memory; we accept the cycle rather than
     /// pollute every call site with `Weak::upgrade`.
-    pub(super) bg_scheduler: Option<Arc<super::bg_tasks::BgTaskScheduler>>,
+    pub(crate) bg_scheduler: Option<Arc<super::bg_tasks::BgTaskScheduler>>,
 }
 
-pub(super) type SharedState = Arc<Mutex<State>>;
+pub(crate) type SharedState = Arc<Mutex<State>>;
 
-pub(super) fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, State> {
+pub(crate) fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| {
         tracing::warn!("recovering from poisoned mutex");
         e.into_inner()
@@ -92,7 +92,7 @@ pub(super) fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, State
 /// Per-session async locks to serialize Chat requests.
 /// The outer std::Mutex is only held briefly to get/create a lock.
 /// The inner smol::lock::Mutex is held across the entire agent turn.
-pub(super) type SessionLocks = Arc<Mutex<HashMap<String, Arc<smol::lock::Mutex<()>>>>>;
+pub(crate) type SessionLocks = Arc<Mutex<HashMap<String, Arc<smol::lock::Mutex<()>>>>>;
 
 /// Get or create an async lock for a session.
 /// Element type for the chat-spawn channel that drives `run_child_chat`.
@@ -108,7 +108,7 @@ pub(crate) struct ChatSpawn {
     pub attachments: Vec<ChatAttachment>,
 }
 
-pub(super) fn session_lock(locks: &SessionLocks, session_id: &str) -> Arc<smol::lock::Mutex<()>> {
+pub(crate) fn session_lock(locks: &SessionLocks, session_id: &str) -> Arc<smol::lock::Mutex<()>> {
     let mut map = locks.lock().expect("session locks mutex poisoned");
     map.entry(session_id.to_string())
         .or_insert_with(|| Arc::new(smol::lock::Mutex::new(())))
@@ -120,7 +120,7 @@ pub(super) fn session_lock(locks: &SessionLocks, session_id: &str) -> Arc<smol::
 /// Instead, a diagnostic warning is logged listing sessions whose persisted
 /// phase was non-idle — indicating the previous server instance may have
 /// exited uncleanly while those sessions were mid-turn.
-pub(super) fn log_stale_phases_at_startup(state: &SharedState) {
+pub(crate) fn log_stale_phases_at_startup(state: &SharedState) {
     let st = lock_state(state);
     let sessions = match st.db.list_sessions(false) {
         Ok(s) => s,
