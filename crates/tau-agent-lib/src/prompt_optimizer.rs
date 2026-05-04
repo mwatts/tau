@@ -481,4 +481,45 @@ mod tests {
         assert_eq!(reverts.len(), 1);
         assert!(reverts[0].1.contains("regression"));
     }
+
+    #[test]
+    fn full_cycle_seeds_metrics_and_detects_regression() {
+        let db = Db::open_memory().unwrap();
+
+        // Seed 5 "before" metrics (good)
+        for i in 0..5 {
+            db.insert_prompt_metric(
+                "proj", &format!("before-{}", i), None, "merged", "h1",
+                0, 5, None, None, Some(4), None, None, None,
+            ).unwrap();
+        }
+
+        // Apply an optimization
+        let opt_id = db.insert_optimization("proj", "tool_guideline", "bash", "old", "new", "low").unwrap();
+
+        // Seed 5 "after" metrics (bad — linked to the optimization)
+        for i in 0..5 {
+            db.insert_prompt_metric(
+                "proj", &format!("after-{}", i), None, "failed", "h2",
+                4, 5, None, None, Some(1), None, None, Some(opt_id),
+            ).unwrap();
+        }
+
+        // Load and split
+        let metrics = db.get_prompt_metrics("proj", 10).unwrap();
+        let active = db.get_active_optimizations("proj").unwrap();
+        assert_eq!(active.len(), 1);
+
+        let before: Vec<_> = metrics.iter().filter(|m| m.optimization_id.is_none()).cloned().collect();
+        let after: Vec<_> = metrics.iter().filter(|m| m.optimization_id.is_some()).cloned().collect();
+
+        let reverts = check_for_regressions(&active, &before, &after);
+        assert_eq!(reverts.len(), 1);
+        assert!(reverts[0].1.contains("regression"));
+
+        // Apply revert
+        db.revert_optimization(reverts[0].0, &reverts[0].1).unwrap();
+        let active = db.get_active_optimizations("proj").unwrap();
+        assert!(active.is_empty());
+    }
 }
