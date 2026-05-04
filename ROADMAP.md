@@ -154,7 +154,7 @@ its own skills autonomously over time without GPU training.
 |---|---|
 | Platform adapters (Telegram, Discord, etc.) | Different design philosophy — tau is a dev tool, not a chatbot platform |
 | RL training pipeline (Atropos/GRPO) | Research infrastructure, not agent runtime |
-| DSPy+GEPA prompt optimization | Deferred — skill auto-gen covers 80%; DSPy-grade optimization is future work |
+| DSPy+GEPA prompt optimization | ~~Deferred~~ Done — native prompt optimizer with per-project metrics, auto-revert, and global promotion |
 | Honcho dialectic user modeling | Over-engineered for a coding agent |
 | `execute_code` RPC tool | Tau's session_spawn + bash covers this pattern differently |
 | Human delay simulation | Not relevant |
