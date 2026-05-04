@@ -33,6 +33,7 @@ base64.workspace = true
 rand.workspace = true
 fs2.workspace = true
 chrono.workspace = true
+cron.workspace = true
 nix.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

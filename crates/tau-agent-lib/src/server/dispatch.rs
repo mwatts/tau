@@ -383,6 +383,45 @@ pub(super) fn get_project_info_impl(
     }
 }
 
+pub(super) fn create_schedule_impl(
+    state: &SharedState,
+    name: &str,
+    cron_expr: &str,
+    prompt: &str,
+    model: Option<&str>,
+    cwd: Option<&str>,
+    system_prompt: Option<&str>,
+    project_name: Option<&str>,
+) -> crate::protocol::Response {
+    use cron::Schedule;
+    use std::str::FromStr;
+
+    // Validate cron expression (cron crate expects 7-field with seconds+year,
+    // but users write standard 5-field; prepend "0 " for seconds and append " *" for year).
+    let full_expr = format!("0 {} *", cron_expr);
+    let schedule = match Schedule::from_str(&full_expr) {
+        Ok(s) => s,
+        Err(e) => {
+            return crate::protocol::Response::Error {
+                message: format!("invalid cron expression '{}': {}", cron_expr, e),
+            };
+        }
+    };
+
+    let next_run_at = schedule
+        .upcoming(chrono::Utc)
+        .next()
+        .map(|dt| dt.timestamp());
+
+    let st = lock_state(state);
+    match st.db.create_schedule(name, cron_expr, prompt, model, cwd, system_prompt, project_name, next_run_at) {
+        Ok(id) => crate::protocol::Response::ScheduleCreated { id },
+        Err(e) => crate::protocol::Response::Error {
+            message: format!("create schedule: {}", e),
+        },
+    }
+}
+
 pub(super) fn list_sessions_impl(
     state: &SharedState,
     include_archived: bool,
@@ -2487,6 +2526,50 @@ pub(super) async fn handle_client(
             }
             crate::protocol::Request::GetProjectInfo { project_name } => {
                 let resp = get_project_info_impl(&state, &project_name);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::CreateSchedule {
+                name,
+                cron_expr,
+                prompt,
+                model,
+                cwd,
+                system_prompt,
+                project_name,
+            } => {
+                let resp = create_schedule_impl(
+                    &state,
+                    &name,
+                    &cron_expr,
+                    &prompt,
+                    model.as_deref(),
+                    cwd.as_deref(),
+                    system_prompt.as_deref(),
+                    project_name.as_deref(),
+                );
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::ListSchedules => {
+                let resp = {
+                    let st = lock_state(&state);
+                    let schedules = st.db.list_schedules().unwrap_or_default();
+                    Response::Schedules { schedules }
+                };
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::DeleteSchedule { id } => {
+                let resp = {
+                    let st = lock_state(&state);
+                    match st.db.delete_schedule(id) {
+                        Ok(true) => Response::ScheduleDeleted,
+                        Ok(false) => Response::Error {
+                            message: format!("schedule {} not found", id),
+                        },
+                        Err(e) => Response::Error {
+                            message: format!("delete schedule: {}", e),
+                        },
+                    }
+                };
                 send(&mut writer, &resp).await?;
             }
         }

@@ -120,12 +120,12 @@ its own skills autonomously over time without GPU training.
 
 | Area | Hermes | Tau |
 |---|---|---|
-| Scheduled automation | Built-in cron with natural-language spec, multi-platform delivery | Not built-in |
+| Scheduled automation | Built-in cron with natural-language spec, multi-platform delivery | ~~Not built-in~~ Done — cron schedules via protocol |
 | Sandbox backends | 7 backends (local, Docker, SSH, Modal, Daytona, Vercel, Singularity) | `sandbox.toml` prefix (Docker, SSH) |
 | Platform adapters | 21 messaging platforms (Telegram, Discord, Slack, WhatsApp, etc.) | TUI + Unix socket only |
-| Smart approval | LLM-assessed risk: auto-approve low-risk, escalate uncertain, deny dangerous | User permission mode only |
+| Smart approval | LLM-assessed risk: auto-approve low-risk, escalate uncertain, deny dangerous | ~~User permission mode only~~ Done — static risk gate blocks dangerous ops |
 | Web UI | Ships with web mode | Planned (Phase 6) |
-| Provider breadth | 200+ via OpenRouter + custom endpoints | Anthropic native + OpenAI-compat |
+| Provider breadth | 200+ via OpenRouter + custom endpoints | ~~Anthropic native + OpenAI-compat~~ Done — OpenRouter + Bedrock + OpenAI-compat |
 
 ### Now Comparable (previously Hermes-only)
 

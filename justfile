@@ -11,6 +11,10 @@ fmt:
 build:
     cargo build -p tau-agent
 
+# Install the tau binary to ~/.cargo/bin
+install:
+    cargo install --path crates/tau-agent
+
 # Run the full workspace test suite.
 #
 # Parallelism is intentionally capped to keep machine-resource pressure

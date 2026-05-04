@@ -1030,6 +1030,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cron"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "089df96cf6a25253b4b6b6744d86f91150a3d4df546f31a95def47976b8cba97"
+dependencies = [
+ "chrono",
+ "once_cell",
+ "phf",
+ "winnow 0.7.15",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4044,6 +4056,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "cron",
  "fs2",
  "futures",
  "globset",
@@ -5448,6 +5461,15 @@ name = "winnow"
 version = "0.5.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f593a95398737aeed53e489c785df13f3618e41dbcd6718c6addbf1395aa6876"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]

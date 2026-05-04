@@ -258,6 +258,24 @@ impl Db {
             );",
         );
 
+        // Scheduled automation: recurring cron-like jobs.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schedules (
+                id            INTEGER PRIMARY KEY,
+                name          TEXT NOT NULL,
+                cron_expr     TEXT NOT NULL,
+                prompt        TEXT NOT NULL,
+                model         TEXT,
+                cwd           TEXT,
+                system_prompt TEXT,
+                project_name  TEXT,
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                created_at    INTEGER NOT NULL,
+                last_run_at   INTEGER,
+                next_run_at   INTEGER
+            );",
+        );
+
         Ok(Self { conn })
     }
 
@@ -328,6 +346,24 @@ impl Db {
             );",
         )
         .map_err(db_err("create fts table"))?;
+
+        conn.execute_batch(
+            "CREATE TABLE schedules (
+                id            INTEGER PRIMARY KEY,
+                name          TEXT NOT NULL,
+                cron_expr     TEXT NOT NULL,
+                prompt        TEXT NOT NULL,
+                model         TEXT,
+                cwd           TEXT,
+                system_prompt TEXT,
+                project_name  TEXT,
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                created_at    INTEGER NOT NULL,
+                last_run_at   INTEGER,
+                next_run_at   INTEGER
+            );",
+        )
+        .map_err(db_err("create schedules table"))?;
 
         let _ = path; // suppress unused
         Ok(Self { conn })
@@ -1522,6 +1558,116 @@ impl Db {
         let result = f(self)?;
         tx.commit().map_err(db_err("commit transaction"))?;
         Ok(result)
+    }
+
+    // -----------------------------------------------------------------------
+    // Schedules
+    // -----------------------------------------------------------------------
+
+    pub fn create_schedule(
+        &self,
+        name: &str,
+        cron_expr: &str,
+        prompt: &str,
+        model: Option<&str>,
+        cwd: Option<&str>,
+        system_prompt: Option<&str>,
+        project_name: Option<&str>,
+        next_run_at: Option<i64>,
+    ) -> crate::Result<i64> {
+        let now = (crate::types::timestamp_ms() / 1000) as i64;
+        self.conn
+            .execute(
+                "INSERT INTO schedules (name, cron_expr, prompt, model, cwd, system_prompt, project_name, enabled, created_at, next_run_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)",
+                rusqlite::params![name, cron_expr, prompt, model, cwd, system_prompt, project_name, now, next_run_at],
+            )
+            .map_err(db_err("insert schedule"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_schedules(&self) -> crate::Result<Vec<tau_agent_base::protocol::ScheduleInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, cron_expr, prompt, model, cwd, system_prompt, project_name, enabled, created_at, last_run_at, next_run_at
+                 FROM schedules ORDER BY id",
+            )
+            .map_err(db_err("prepare list schedules"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(tau_agent_base::protocol::ScheduleInfo {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    cron_expr: row.get(2)?,
+                    prompt: row.get(3)?,
+                    model: row.get(4)?,
+                    cwd: row.get(5)?,
+                    system_prompt: row.get(6)?,
+                    project_name: row.get(7)?,
+                    enabled: row.get::<_, i64>(8)? != 0,
+                    created_at: row.get(9)?,
+                    last_run_at: row.get(10)?,
+                    next_run_at: row.get(11)?,
+                })
+            })
+            .map_err(db_err("query schedules"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(db_err("read schedule row"))?);
+        }
+        Ok(result)
+    }
+
+    pub fn delete_schedule(&self, id: i64) -> crate::Result<bool> {
+        let count = self
+            .conn
+            .execute("DELETE FROM schedules WHERE id = ?1", [id])
+            .map_err(db_err("delete schedule"))?;
+        Ok(count > 0)
+    }
+
+    pub fn get_due_schedules(&self, now_secs: i64) -> crate::Result<Vec<tau_agent_base::protocol::ScheduleInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, cron_expr, prompt, model, cwd, system_prompt, project_name, enabled, created_at, last_run_at, next_run_at
+                 FROM schedules WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1",
+            )
+            .map_err(db_err("prepare due schedules"))?;
+        let rows = stmt
+            .query_map([now_secs], |row| {
+                Ok(tau_agent_base::protocol::ScheduleInfo {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    cron_expr: row.get(2)?,
+                    prompt: row.get(3)?,
+                    model: row.get(4)?,
+                    cwd: row.get(5)?,
+                    system_prompt: row.get(6)?,
+                    project_name: row.get(7)?,
+                    enabled: row.get::<_, i64>(8)? != 0,
+                    created_at: row.get(9)?,
+                    last_run_at: row.get(10)?,
+                    next_run_at: row.get(11)?,
+                })
+            })
+            .map_err(db_err("query due schedules"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(db_err("read due schedule row"))?);
+        }
+        Ok(result)
+    }
+
+    pub fn update_schedule_run(&self, id: i64, last_run_at: i64, next_run_at: Option<i64>) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE schedules SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
+                rusqlite::params![last_run_at, next_run_at, id],
+            )
+            .map_err(db_err("update schedule run"))?;
+        Ok(())
     }
 }
 

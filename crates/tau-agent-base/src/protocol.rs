@@ -336,6 +336,31 @@ pub enum Request {
     /// (worktree removed, etc.) and the worker wants to fall back to the
     /// project root before executing a bash command. See task 720.
     GetProjectInfo { project_name: String },
+    /// Create a recurring scheduled job.
+    CreateSchedule {
+        /// Human-readable name for this schedule.
+        name: String,
+        /// Cron expression (5-field: min hour dom month dow).
+        cron_expr: String,
+        /// Prompt text sent as the chat message each time the schedule fires.
+        prompt: String,
+        /// Model id to use (optional, defaults to server default).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Working directory for the spawned session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// System prompt override (optional).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+        /// Project name to associate the session with.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
+    },
+    /// List all schedules.
+    ListSchedules,
+    /// Delete a schedule by id.
+    DeleteSchedule { id: i64 },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -528,6 +553,12 @@ pub enum Response {
     /// not treated as an error response so callers can match on "unknown
     /// project" cleanly.
     ProjectInfo { project: Option<ProjectInfoEntry> },
+    /// Schedule created (response to CreateSchedule).
+    ScheduleCreated { id: i64 },
+    /// List of schedules (response to ListSchedules).
+    Schedules { schedules: Vec<ScheduleInfo> },
+    /// Schedule deleted (response to DeleteSchedule).
+    ScheduleDeleted,
     /// Error.
     Error { message: String },
 }
@@ -892,6 +923,29 @@ pub struct ProjectStatsInfo {
 pub struct ProjectInfoEntry {
     pub name: String,
     pub path: String,
+}
+
+/// Schedule info for wire protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleInfo {
+    pub id: i64,
+    pub name: String,
+    pub cron_expr: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<i64>,
 }
 
 /// Format a token count for display: 1234 → "1.2K", 1234567 → "1.2M".

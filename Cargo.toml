@@ -48,6 +48,7 @@ rmcp = { version = "1", features = ["client", "server", "macros", "transport-chi
 schemars = "1"
 serde_yaml = "0.9"
 globset = "0.4"
+cron = "0.16"
 rig-bedrock = "0.4"
 rig-core = "0.36"
 # myelin: bidirectional RPC over a single byte stream. Used by the plugin

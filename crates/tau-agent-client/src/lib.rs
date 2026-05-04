@@ -110,6 +110,9 @@ impl Client {
                 | Response::SearchResults { .. }
                 | Response::McpPrompts { .. }
                 | Response::McpPromptContent { .. }
+                | Response::ScheduleCreated { .. }
+                | Response::Schedules { .. }
+                | Response::ScheduleDeleted
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);
