@@ -193,7 +193,7 @@ pub(super) fn model_info(m: &Model) -> ModelInfo {
 }
 
 /// Resolve API key: auth.json → config provider api_key → env var.
-pub(super) fn resolve_api_key(
+pub(crate) fn resolve_api_key(
     auth: &crate::auth::AuthStorage,
     cfg: &crate::config::Config,
     provider: &str,

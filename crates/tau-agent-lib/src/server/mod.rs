@@ -7,7 +7,7 @@ pub mod chat_attachments;
 mod dispatch;
 mod notifications;
 mod post_idle;
-mod registry;
+pub(crate) mod registry;
 mod schedule_runner;
 pub(crate) mod state;
 pub(crate) mod task_handlers;

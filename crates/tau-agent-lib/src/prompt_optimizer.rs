@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::db::{OptimizationRow, PromptMetricRow};
 use crate::server::bg_tasks::{BgJob, BgTaskScheduler, BgTrigger};
 use crate::server::state::{SharedState, lock_state};
+use crate::types::{Message, UserMessage};
 
 pub const OPTIMIZATION_THRESHOLD: i64 = 10;
 
@@ -44,22 +45,181 @@ async fn run_optimizer_tick(state: &SharedState) -> crate::Result<()> {
         for p in projects {
             let count = st.db.count_prompt_metrics(&p.name)?;
             if count >= OPTIMIZATION_THRESHOLD {
-                ready.push(p.name);
+                ready.push((p.name, p.path));
             }
         }
         ready
     };
 
-    for project in projects_to_optimize {
-        tracing::info!(project = %project, "prompt-optimizer: running for project");
-        // Full LLM integration will be added in Task 7
-        let _metrics = {
+    for (project, project_path) in projects_to_optimize {
+        tracing::info!(project = %project, "prompt-optimizer: analyzing");
+
+        let metrics = {
             let st = lock_state(state);
             st.db.get_prompt_metrics(&project, OPTIMIZATION_THRESHOLD as usize)?
         };
+
+        // Check regressions on active optimizations
+        let active_opts = {
+            let st = lock_state(state);
+            st.db.get_active_optimizations(&project)?
+        };
+        if !active_opts.is_empty() && metrics.len() >= 2 {
+            let half = metrics.len() / 2;
+            let recent = &metrics[..half];
+            let older = &metrics[half..];
+            let reverts = check_for_regressions(&active_opts, older, recent);
+            if !reverts.is_empty() {
+                let st = lock_state(state);
+                for (id, reason) in &reverts {
+                    tracing::warn!(id, %reason, "prompt-optimizer: reverting optimization");
+                    let _ = st.db.revert_optimization(*id, reason);
+                }
+                continue;
+            }
+        }
+
+        // Load current state for context
+        let tool_guidelines = crate::tool_prompt_overrides::load_overrides(Some(&project_path));
+        let guidelines_vec: Vec<(String, Vec<String>)> = tool_guidelines.into_iter().collect();
+        let auto_skills = load_auto_skills(&project_path);
+
+        let ctx = build_optimizer_context(&metrics, &guidelines_vec, &auto_skills);
+
+        // Call LLM
+        let response = {
+            let (model, registry, api_key) = {
+                let st = lock_state(state);
+                let model = st.default_model.clone();
+                let api_key = crate::server::registry::resolve_api_key(
+                    &st.auth, &st.config, &model.provider,
+                ).ok().flatten();
+                let registry = st.registry.clone();
+                (model, registry, api_key)
+            };
+
+            let context = crate::types::Context {
+                system_prompt: Some("You are a prompt optimization assistant. Respond only with a JSON array.".into()),
+                messages: vec![Message::User(UserMessage::text(&ctx))],
+                tools: Vec::new(),
+            };
+            let options = crate::types::StreamOptions {
+                api_key,
+                max_tokens: Some(2000),
+                ..Default::default()
+            };
+            let rx = match registry.stream(&model, &context, &options) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    tracing::warn!(%e, "prompt-optimizer: failed to start LLM stream");
+                    continue;
+                }
+            };
+            match smol::unblock(move || crate::compaction::extract_summary(&rx)).await {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::warn!(%e, "prompt-optimizer: LLM call failed");
+                    continue;
+                }
+            }
+        };
+
+        let proposals = parse_proposals(&response);
+        if proposals.is_empty() {
+            tracing::debug!(project = %project, "prompt-optimizer: no proposals");
+            continue;
+        }
+
+        tracing::info!(project = %project, count = proposals.len(), "prompt-optimizer: applying proposals");
+
+        for proposal in &proposals {
+            apply_proposal(state, &project, &project_path, proposal);
+        }
     }
 
     Ok(())
+}
+
+fn load_auto_skills(project_path: &str) -> Vec<(String, String)> {
+    let skills_dir = std::path::Path::new(project_path).join(".tau").join("skills").join("auto");
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().map(|e| e == "md").unwrap_or(false) {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    skills.push((name, content));
+                }
+            }
+        }
+    }
+    skills
+}
+
+fn apply_proposal(
+    state: &SharedState,
+    project: &str,
+    project_path: &str,
+    proposal: &OptimizationProposal,
+) {
+    use sha2::{Digest, Sha256};
+
+    let new_hash = Sha256::new()
+        .chain_update(proposal.content.as_bytes())
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+
+    match (proposal.risk.as_str(), proposal.target.as_str()) {
+        ("low", "tool_guideline") => {
+            let guidelines: Vec<String> = proposal.content.lines().map(String::from).collect();
+            if let Err(e) = crate::tool_prompt_overrides::write_tool_override(
+                project_path,
+                &proposal.target_name,
+                &guidelines,
+            ) {
+                tracing::warn!(%e, "prompt-optimizer: failed to write tool override");
+                return;
+            }
+            let st = lock_state(state);
+            let _ = st.db.insert_optimization(
+                project, &proposal.target, &proposal.target_name, "", &new_hash, &proposal.risk,
+            );
+        }
+        ("low", "skill") => {
+            let skill_path = std::path::Path::new(project_path)
+                .join(".tau").join("skills").join("auto").join(&proposal.target_name);
+            if let Some(parent) = skill_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&skill_path, &proposal.content) {
+                tracing::warn!(%e, "prompt-optimizer: failed to write skill");
+                return;
+            }
+            let st = lock_state(state);
+            let _ = st.db.insert_optimization(
+                project, &proposal.target, &proposal.target_name, "", &new_hash, &proposal.risk,
+            );
+        }
+        _ => {
+            // Medium/high risk or system_prompt: write proposal file
+            let proposals_path = std::path::Path::new(project_path)
+                .join(".tau").join("optimization_proposals.md");
+            if let Some(parent) = proposals_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut content = std::fs::read_to_string(&proposals_path).unwrap_or_default();
+            content.push_str(&format!(
+                "\n## Proposal: {} ({})\nRisk: {}\nReasoning: {}\n\n```\n{}\n```\n",
+                proposal.target_name, proposal.target, proposal.risk, proposal.reasoning, proposal.content
+            ));
+            let _ = std::fs::write(&proposals_path, content);
+        }
+    }
 }
 
 /// Build the optimizer prompt context from collected metrics.
