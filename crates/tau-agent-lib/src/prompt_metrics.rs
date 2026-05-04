@@ -78,6 +78,77 @@ pub fn record_session_metrics(
     }
 }
 
+/// Build the LLM assessment prompt from session context.
+pub fn build_assessment_prompt(
+    messages: &[Message],
+    active_guidelines: &[String],
+    outcome: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are evaluating the effectiveness of an AI agent's prompt configuration.\n\n");
+    prompt.push_str(&format!("Task outcome: {}\n\n", outcome));
+
+    prompt.push_str("Active guidelines:\n");
+    for g in active_guidelines {
+        prompt.push_str(&format!("- {}\n", g));
+    }
+    prompt.push_str("\nLast messages from the session:\n");
+
+    // Include last 5 messages (truncated)
+    let tail = if messages.len() > 5 { &messages[messages.len() - 5..] } else { messages };
+    for msg in tail {
+        match msg {
+            Message::User(u) => {
+                let text: String = u.content.iter().filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join(" ");
+                prompt.push_str(&format!("[User]: {}\n", crate::truncate_str(&text, 200)));
+            }
+            Message::Assistant(a) => {
+                let text: String = a.content.iter().filter_map(|c| match c {
+                    AssistantContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join(" ");
+                prompt.push_str(&format!("[Assistant]: {}\n", crate::truncate_str(&text, 200)));
+            }
+            Message::ToolResult(tr) => {
+                let err_marker = if tr.is_error { " [ERROR]" } else { "" };
+                prompt.push_str(&format!("[Tool:{}{}]\n", tr.tool_name, err_marker));
+            }
+            _ => {}
+        }
+    }
+
+    prompt.push_str("\nRespond with JSON only:\n");
+    prompt.push_str(r#"{"effectiveness_score": <1-5>, "inefficiency_notes": "<text>", "prompt_suggestions": "<text>"}"#);
+    prompt.push_str("\n");
+    prompt
+}
+
+/// Parsed assessment response from the LLM.
+#[derive(Debug, serde::Deserialize)]
+pub struct Assessment {
+    pub effectiveness_score: i64,
+    pub inefficiency_notes: String,
+    pub prompt_suggestions: String,
+}
+
+/// Parse the LLM's JSON response into an Assessment.
+pub fn parse_assessment(response: &str) -> Option<Assessment> {
+    // Try to extract JSON from the response (LLM might wrap in markdown)
+    let json_str = if let Some(start) = response.find('{') {
+        if let Some(end) = response.rfind('}') {
+            &response[start..=end]
+        } else {
+            response
+        }
+    } else {
+        response
+    };
+    serde_json::from_str(json_str).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +195,38 @@ mod tests {
         assert_eq!(stats.error_count, 2);
         assert_eq!(stats.errors_by_name["bash"], 1);
         assert_eq!(stats.errors_by_name["edit"], 1);
+    }
+
+    #[test]
+    fn build_assessment_prompt_includes_messages_and_guidelines() {
+        let messages = vec![
+            Message::User(UserMessage::text("fix the auth bug")),
+            Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent { text: "I'll look at auth.rs".into(), text_signature: None })],
+                api: "test".into(),
+                provider: "test".into(),
+                model: "test".into(),
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }),
+        ];
+        let guidelines = vec!["Always run tests after changes".to_string()];
+        let prompt = build_assessment_prompt(&messages, &guidelines, "merged");
+        assert!(prompt.contains("fix the auth bug"));
+        assert!(prompt.contains("Always run tests after changes"));
+        assert!(prompt.contains("merged"));
+    }
+
+    #[test]
+    fn parse_assessment_from_json() {
+        let response = r#"```json
+{"effectiveness_score": 4, "inefficiency_notes": "took extra steps", "prompt_suggestions": "add hint"}
+```"#;
+        let assessment = parse_assessment(response).unwrap();
+        assert_eq!(assessment.effectiveness_score, 4);
+        assert_eq!(assessment.inefficiency_notes, "took extra steps");
     }
 }
