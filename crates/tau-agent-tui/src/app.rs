@@ -5,7 +5,7 @@ use ratatui_textarea::TextArea;
 
 use tau_agent_lib::auth::SubscriptionUsage;
 use tau_agent_lib::protocol::{
-    ChatAttachment, ProjectStatsInfo, Response, SessionInfo, TaskHistoryInfo, TaskInfo,
+    ChatAttachment, ModelInfo, ProjectStatsInfo, Response, SessionInfo, TaskHistoryInfo, TaskInfo,
     TaskMessageInfo, TaskRelationInfo, TaskSessionInfo,
 };
 use tau_agent_lib::types::{
@@ -33,6 +33,8 @@ pub enum AppMode {
     SessionPicker,
     /// Task picker overlay is open.
     TaskPicker,
+    /// Model picker overlay is open.
+    ModelPicker,
 }
 
 /// Which task-picker action is waiting for y/n confirmation.
@@ -314,6 +316,13 @@ pub struct App {
     /// `Action::SendChat` so they ride along with the user's message.
     /// Cleared explicitly by `/clear-attach`.
     pub pending_attachments: Vec<PendingAttachment>,
+
+    /// Available models for the model picker overlay.
+    pub model_picker_models: Vec<ModelInfo>,
+    /// Cursor position in the model picker.
+    pub model_picker_cursor: usize,
+    /// Mode to restore when the model picker is closed.
+    pub model_picker_previous_mode: AppMode,
 }
 
 /// One pending image attachment in the TUI.
@@ -469,6 +478,9 @@ impl App {
             all_tools_expanded: false,
             input_history: Vec::new(),
             pending_attachments: Vec::new(),
+            model_picker_models: Vec::new(),
+            model_picker_cursor: 0,
+            model_picker_previous_mode: AppMode::Input,
         }
     }
 
@@ -717,6 +729,7 @@ impl App {
             AppMode::Streaming => self.handle_streaming_key(key),
             AppMode::SessionPicker => self.handle_picker_key(key),
             AppMode::TaskPicker => self.handle_task_picker_key(key),
+            AppMode::ModelPicker => self.handle_model_picker_key(key),
         }
     }
 
@@ -1582,6 +1595,65 @@ impl App {
         }
     }
 
+    fn handle_model_picker_key(&mut self, key: &KeyEvent) -> Option<Action> {
+        let count = self.model_picker_models.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = self.model_picker_previous_mode;
+                None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if count > 0 {
+                    self.model_picker_cursor =
+                        self.model_picker_cursor.checked_sub(1).unwrap_or(count - 1);
+                }
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if count > 0 {
+                    self.model_picker_cursor = (self.model_picker_cursor + 1) % count;
+                }
+                None
+            }
+            KeyCode::Home => {
+                self.model_picker_cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                if count > 0 {
+                    self.model_picker_cursor = count - 1;
+                }
+                None
+            }
+            KeyCode::Enter => {
+                if let Some(m) = self.model_picker_models.get(self.model_picker_cursor) {
+                    let model_id = m.id.clone();
+                    self.mode = self.model_picker_previous_mode;
+                    Some(Action::SetModel(model_id))
+                } else {
+                    self.mode = self.model_picker_previous_mode;
+                    None
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(m) = self.model_picker_models.get(self.model_picker_cursor) {
+                    let model_id = m.id.clone();
+                    self.mode = self.model_picker_previous_mode;
+                    let mut s = crate::settings::load();
+                    s.tui.model = Some(model_id.clone());
+                    crate::settings::save(&s);
+                    self.messages.push(MessageItem::Status {
+                        text: format!("default model set: {}", model_id),
+                    });
+                    Some(Action::SetModel(model_id))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn handle_task_picker_key(&mut self, key: &KeyEvent) -> Option<Action> {
         // Priority 1: Task detail view
         if let Some(ref mut detail) = self.task_picker_detail {
@@ -2258,18 +2330,21 @@ impl App {
             "/status" => Some(Action::GetStatus),
             "/theme" | "/themes" => {
                 if args.is_empty() {
-                    // List available themes
                     let themes = crate::theme::list_themes();
-                    for name in &themes {
-                        let marker = if self.theme.name.as_deref() == Some(name.as_str()) {
-                            " *"
-                        } else {
-                            ""
-                        };
-                        self.messages.push(MessageItem::Status {
-                            text: format!("  {}{}", name, marker),
-                        });
-                    }
+                    let listing: Vec<String> = themes
+                        .iter()
+                        .map(|name| {
+                            let marker = if self.theme.name.as_deref() == Some(name.as_str()) {
+                                " *"
+                            } else {
+                                ""
+                            };
+                            format!("  {}{}", name, marker)
+                        })
+                        .collect();
+                    self.messages.push(MessageItem::Status {
+                        text: listing.join("\n"),
+                    });
                 } else {
                     // Switch theme and persist
                     match crate::theme::load_by_name(args) {
@@ -2796,24 +2871,20 @@ impl App {
             });
             return;
         }
-        self.messages.push(MessageItem::Status {
-            text: format!(
-                "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
-                "ID", "STATE", "PRIORITY", "SESSION"
-            ),
-        });
+        let mut lines = vec![format!(
+            "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
+            "ID", "STATE", "PRIORITY", "SESSION"
+        )];
         for t in tasks {
             let session = t.session_id.as_deref().unwrap_or("-");
-            let text = format!(
+            lines.push(format!(
                 "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
                 t.id, t.state, t.priority, session, t.title
-            );
-            if t.state == "failed" {
-                self.messages.push(MessageItem::Error { text });
-            } else {
-                self.messages.push(MessageItem::Status { text });
-            }
+            ));
         }
+        self.messages.push(MessageItem::Status {
+            text: lines.join("\n"),
+        });
     }
 
     /// Render task detail (task get response).
@@ -2985,21 +3056,20 @@ impl App {
             });
             return;
         }
-        self.messages.push(MessageItem::Status {
-            text: "  MERGE QUEUE".into(),
-        });
-        self.messages.push(MessageItem::Status {
-            text: format!("  {:>4}  {:<12}  {:<14}  TITLE", "ID", "STATE", "BRANCH"),
-        });
+        let mut lines = vec![
+            "  MERGE QUEUE".to_string(),
+            format!("  {:>4}  {:<12}  {:<14}  TITLE", "ID", "STATE", "BRANCH"),
+        ];
         for t in tasks {
             let branch = t.branch.as_deref().unwrap_or("-");
-            self.messages.push(MessageItem::Status {
-                text: format!(
-                    "  {:>4}  {:<12}  {:<14}  {}",
-                    t.id, t.state, branch, t.title
-                ),
-            });
+            lines.push(format!(
+                "  {:>4}  {:<12}  {:<14}  {}",
+                t.id, t.state, branch, t.title
+            ));
         }
+        self.messages.push(MessageItem::Status {
+            text: lines.join("\n"),
+        });
     }
 
     /// Remove empty AssistantStreaming placeholder if present.
@@ -3275,18 +3345,14 @@ impl App {
                 // Don't reset scroll if user has scrolled up to read history
             }
             Response::Models { models } => {
-                for m in &models {
-                    let marker = if m.id == self.model { " *" } else { "" };
-                    self.messages.push(MessageItem::Status {
-                        text: format!(
-                            "  {}{}\t{}\t{}K ctx",
-                            m.id,
-                            marker,
-                            m.provider,
-                            m.context_window / 1000
-                        ),
-                    });
-                }
+                let current_idx = models
+                    .iter()
+                    .position(|m| m.id == self.model)
+                    .unwrap_or(0);
+                self.model_picker_models = models;
+                self.model_picker_cursor = current_idx;
+                self.model_picker_previous_mode = self.mode;
+                self.mode = AppMode::ModelPicker;
             }
             Response::ModelChanged { model } => {
                 self.model = model.id.clone();
@@ -3348,18 +3414,17 @@ impl App {
                         text: "no child sessions".into(),
                     });
                 } else {
-                    self.messages.push(MessageItem::Status {
-                        text: format!("{} child session(s):", children.len()),
-                    });
+                    let mut lines = vec![format!("{} child session(s):", children.len())];
                     for s in &children {
                         let stats = tau_agent_lib::protocol::format_stats(&s.stats);
-                        self.messages.push(MessageItem::Status {
-                            text: format!(
-                                "  {}  {}/{}  {} msgs  {}",
-                                s.id, s.provider, s.model, s.message_count, stats
-                            ),
-                        });
+                        lines.push(format!(
+                            "  {}  {}/{}  {} msgs  {}",
+                            s.id, s.provider, s.model, s.message_count, stats
+                        ));
                     }
+                    self.messages.push(MessageItem::Status {
+                        text: lines.join("\n"),
+                    });
                 }
                 if let Some(pid) = &self.parent_id {
                     self.messages.push(MessageItem::Status {
@@ -3588,15 +3653,14 @@ impl App {
                         text: "No MCP prompts available".into(),
                     });
                 } else {
-                    self.messages.push(MessageItem::Status {
-                        text: "MCP prompts:".into(),
-                    });
+                    let mut lines = vec!["MCP prompts:".to_string()];
                     for p in &prompts {
                         let desc = p.description.as_deref().unwrap_or("");
-                        self.messages.push(MessageItem::Status {
-                            text: format!("  {} ({})\t{}", p.name, p.server, desc),
-                        });
+                        lines.push(format!("  {} ({})  {}", p.name, p.server, desc));
                     }
+                    self.messages.push(MessageItem::Status {
+                        text: lines.join("\n"),
+                    });
                 }
             }
             Response::McpPromptContent { text } => {

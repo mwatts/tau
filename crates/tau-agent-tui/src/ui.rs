@@ -51,6 +51,11 @@ pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
             draw_task_picker(frame, app, theme, area);
         }
     }
+
+    // Model picker overlay
+    if app.mode == AppMode::ModelPicker {
+        draw_model_picker(frame, app, theme, area);
+    }
 }
 
 /// Height of the input area: visual lines (accounting for wrap) + 2 borders.
@@ -1005,6 +1010,108 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
         };
         let scroll_end = (scroll_start + session_lines).min(num_sessions);
 
+        let mut visible: Vec<Line<'static>> = lines[scroll_start..scroll_end].to_vec();
+        visible.push(hint_line);
+        lines = visible;
+    }
+
+    let text = Text::from(lines);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Model Picker overlay
+// ---------------------------------------------------------------------------
+
+fn draw_model_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let models = &app.model_picker_models;
+    let count = models.len();
+
+    let picker_width: u16 = (area.width * 3 / 4).max(40).min(area.width.saturating_sub(2));
+    let content_lines = count.max(1) as u16 + 1; // +1 for hint
+    let picker_height = (content_lines + 2).min(area.height.saturating_sub(2)); // +2 for border
+
+    let x = (area.width.saturating_sub(picker_width)) / 2;
+    let y = (area.height.saturating_sub(picker_height)) / 2;
+    let picker_area = Rect::new(x, y, picker_width, picker_height);
+
+    frame.render_widget(Clear, picker_area);
+
+    let border_style = Style::default().fg(theme.accent.to_ratatui());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(border_style)
+        .title(Span::styled(
+            " Models ",
+            Style::default()
+                .fg(theme.accent.to_ratatui())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let w = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if models.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (loading...)",
+            theme.fg(theme.muted),
+        )));
+    } else {
+        for (i, m) in models.iter().enumerate() {
+            let is_current = m.id == app.model;
+            let is_selected = i == app.model_picker_cursor;
+
+            let marker = if is_current { "* " } else { "  " };
+            let label = format!(
+                "{}{} ({}, {}K)",
+                marker, m.id, m.provider, m.context_window / 1000
+            );
+            let label = if label.len() > w {
+                format!("{}…", &label[..w.saturating_sub(1)])
+            } else {
+                label
+            };
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(theme.accent.to_ratatui())
+                    .bg(theme.selected_bg.to_ratatui())
+            } else if is_current {
+                theme.bold_fg(theme.accent)
+            } else {
+                theme.fg(theme.text)
+            };
+
+            lines.push(Line::from(Span::styled(label, style)));
+        }
+    }
+
+    // Footer hint
+    lines.push(Line::from(Span::styled(
+        " ↑↓:nav  Enter:switch  d:set default  Esc:close",
+        theme.fg(theme.muted),
+    )));
+
+    // Scroll if needed
+    let available = inner.height as usize;
+    let body_lines = available.saturating_sub(1); // reserve 1 for hint
+    if lines.len() > available {
+        let hint_line = lines.pop().expect("non-empty");
+        let scroll_start = if app.model_picker_cursor >= body_lines {
+            app.model_picker_cursor - body_lines + 1
+        } else {
+            0
+        };
+        let scroll_end = (scroll_start + body_lines).min(count);
         let mut visible: Vec<Line<'static>> = lines[scroll_start..scroll_end].to_vec();
         visible.push(hint_line);
         lines = visible;
