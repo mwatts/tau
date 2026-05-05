@@ -173,9 +173,28 @@ fn restore_terminal() {
     let _ = stdout.write_all(b"\x1b[>4;0m");
     let _ = stdout.flush();
     let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+    // Drain any Kitty-encoded bytes left in stdin before leaving raw mode.
+    // Without this, the shell reads them as literal garbage after we exit.
+    drain_stdin();
     let _ = disable_raw_mode();
     let _ = stdout.write_all(b"\x1b[0m\x1b[?25h");
     let _ = stdout.flush();
+}
+
+fn drain_stdin() {
+    use std::time::Duration;
+    // Poll+discard in a tight loop while raw mode is still active.
+    // 50ms total budget — enough to catch buffered bytes, short enough
+    // to feel instant.
+    let deadline = std::time::Instant::now() + Duration::from_millis(50);
+    while std::time::Instant::now() < deadline {
+        match crossterm::event::poll(Duration::from_millis(5)) {
+            Ok(true) => {
+                let _ = crossterm::event::read();
+            }
+            _ => break,
+        }
+    }
 }
 
 /// Drop guard that ensures terminal restoration on panic or early return.
