@@ -10,6 +10,7 @@ pub mod theme;
 mod ui;
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
@@ -20,6 +21,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+
+static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -91,14 +94,17 @@ async fn run_tui(
     // Kitty protocol works on Ghostty, Kitty, WezTerm etc.
     // Only send if terminal supports it — otherwise the escape leaks on exit.
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-        execute!(
+        if execute!(
             stdout,
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
             )
         )
-        .ok();
+        .is_ok()
+        {
+            KITTY_PUSHED.store(true, Ordering::Relaxed);
+        }
     }
     {
         // xterm modifyOtherKeys mode 2
@@ -161,18 +167,14 @@ async fn run_tui(
 fn restore_terminal() {
     use io::Write;
     let mut stdout = io::stdout();
-    // Pop Kitty keyboard protocol — only send if terminal supports it,
-    // otherwise the raw escape leaks into the shell after exit.
-    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+    if KITTY_PUSHED.swap(false, Ordering::Relaxed) {
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
     }
-    // Reset xterm modifyOtherKeys
     let _ = stdout.write_all(b"\x1b[>4;0m");
     let _ = stdout.flush();
     let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
     let _ = disable_raw_mode();
-    // Reset all terminal attributes — catches any leftover SGR/mode state
-    let _ = stdout.write_all(b"\x1bc");
+    let _ = stdout.write_all(b"\x1b[0m\x1b[?25h");
     let _ = stdout.flush();
 }
 
