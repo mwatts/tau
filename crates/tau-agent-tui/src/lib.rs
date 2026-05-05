@@ -88,18 +88,18 @@ async fn run_tui(
     enable_raw_mode().map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
     let mut stdout = io::stdout();
     // Enable keyboard enhancement for Shift+Enter etc.
-    // Send both Kitty protocol AND xterm modifyOtherKeys:
-    // - Kitty protocol works on Ghostty, Kitty, WezTerm etc.
-    // - modifyOtherKeys mode 2 works in tmux with extended-keys
-    // Terminals ignore sequences they don't understand.
-    execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+    // Kitty protocol works on Ghostty, Kitty, WezTerm etc.
+    // Only send if terminal supports it — otherwise the escape leaks on exit.
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
         )
-    )
-    .ok();
+        .ok();
+    }
     {
         // xterm modifyOtherKeys mode 2
         use io::Write;
@@ -126,6 +126,9 @@ async fn run_tui(
     // current turn without quitting) keeps working.
     install_tui_signal_handler();
 
+    // Guard ensures restore_terminal runs even on panic
+    let _guard = TerminalGuard;
+
     let result = run_inner(
         &mut terminal,
         session_id,
@@ -137,8 +140,9 @@ async fn run_tui(
     )
     .await;
 
-    // Restore terminal — pop keyboard enhancement before leaving alternate screen
+    // Explicit restore before show_cursor (guard is backup for panics)
     restore_terminal();
+    std::mem::forget(_guard); // already restored, don't run twice
     terminal.show_cursor().ok();
 
     // Print exit message with session resume hint
@@ -157,11 +161,28 @@ async fn run_tui(
 fn restore_terminal() {
     use io::Write;
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    // Pop Kitty keyboard protocol — only send if terminal supports it,
+    // otherwise the raw escape leaks into the shell after exit.
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    // Reset xterm modifyOtherKeys
     let _ = stdout.write_all(b"\x1b[>4;0m");
     let _ = stdout.flush();
     let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
     let _ = disable_raw_mode();
+    // Reset all terminal attributes — catches any leftover SGR/mode state
+    let _ = stdout.write_all(b"\x1bc");
+    let _ = stdout.flush();
+}
+
+/// Drop guard that ensures terminal restoration on panic or early return.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
 }
 
 /// Install a TUI-aware shutdown handler for SIGTERM / SIGHUP.

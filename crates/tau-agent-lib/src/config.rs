@@ -28,8 +28,12 @@ pub struct Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
-    /// API type: "anthropic" or "openai"
+    /// API type: "anthropic" or "openai". Defaults to "openai" if omitted —
+    /// allows minimal config entries that only set api_key.
+    #[serde(default = "default_api")]
     pub api: String,
+    /// Provider base URL. Defaults to empty string (built-in models supply their own).
+    #[serde(default)]
     pub base_url: String,
     /// Inline API key (or "$ENV_VAR" for env expansion). Optional — can also
     /// come from auth.json or environment.
@@ -37,6 +41,10 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+}
+
+fn default_api() -> String {
+    "openai".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
