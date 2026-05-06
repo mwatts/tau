@@ -2678,6 +2678,37 @@ fn cmd_project_stats(project: Option<String>) -> tau_agent_lib::Result<()> {
     let db = tau_agent_lib::db::Db::open_default()?;
     let stats = db.project_stats(&name)?;
     print_project_stats_block(&name, &stats);
+
+    // Agent costs
+    if let Ok(agents) = db.list_agents() {
+        let agents: Vec<_> = agents
+            .iter()
+            .filter(|a| {
+                a.project_name.as_deref() == Some(name.as_str()) || a.project_name.is_none()
+            })
+            .collect();
+        if !agents.is_empty() {
+            println!();
+            println!("Agents:");
+            for a in &agents {
+                let budget_str = a
+                    .budget_usd
+                    .map(|b| format!(" / ${:.2}", b))
+                    .unwrap_or_default();
+                let pct = a
+                    .budget_usd
+                    .filter(|&b| b > 0.0)
+                    .map(|b| format!(" ({}%)", (a.spent_usd / b * 100.0) as u32))
+                    .unwrap_or_default();
+                let status = if a.enabled { "active" } else { "paused" };
+                println!(
+                    "  #{} '{}' [{}]: ${:.4}{}{}  ({})",
+                    a.id, a.name, a.trigger_type, a.spent_usd, budget_str, pct, status,
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
