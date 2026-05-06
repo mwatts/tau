@@ -2572,6 +2572,72 @@ pub(super) async fn handle_client(
                 };
                 send(&mut writer, &resp).await?;
             }
+            crate::protocol::Request::CreateAgent {
+                name, prompt, model, trigger_type, trigger_config,
+                system_prompt, project_name, budget_usd,
+            } => {
+                let resp = {
+                    let st = lock_state(&state);
+                    match st.db.create_agent(
+                        &name, &prompt, model.as_deref(), &trigger_type,
+                        trigger_config.as_deref(), system_prompt.as_deref(),
+                        project_name.as_deref(), budget_usd,
+                    ) {
+                        Ok(id) => Response::AgentCreated { id },
+                        Err(e) => Response::Error { message: format!("{}", e) },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::ListAgents => {
+                let resp = {
+                    let st = lock_state(&state);
+                    match st.db.list_agents() {
+                        Ok(agents) => Response::Agents { agents },
+                        Err(e) => Response::Error { message: format!("{}", e) },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::DeleteAgent { id } => {
+                let resp = {
+                    let st = lock_state(&state);
+                    match st.db.delete_agent(id) {
+                        Ok(true) => Response::AgentDeleted,
+                        Ok(false) => Response::Error {
+                            message: format!("agent {} not found", id),
+                        },
+                        Err(e) => Response::Error { message: format!("{}", e) },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::PauseAgent { id } => {
+                let resp = {
+                    let st = lock_state(&state);
+                    match st.db.set_agent_enabled(id, false) {
+                        Ok(true) => Response::AgentPaused,
+                        Ok(false) => Response::Error {
+                            message: format!("agent {} not found", id),
+                        },
+                        Err(e) => Response::Error { message: format!("{}", e) },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::ResumeAgent { id } => {
+                let resp = {
+                    let st = lock_state(&state);
+                    match st.db.set_agent_enabled(id, true) {
+                        Ok(true) => Response::AgentResumed,
+                        Ok(false) => Response::Error {
+                            message: format!("agent {} not found", id),
+                        },
+                        Err(e) => Response::Error { message: format!("{}", e) },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
         }
     }
 
