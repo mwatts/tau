@@ -128,6 +128,16 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         strategy: String,
     },
+    /// Start the web UI server
+    #[command(alias = "web")]
+    Serve {
+        /// Bind address
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Port
+        #[arg(long, default_value = "8080")]
+        port: u16,
+    },
     /// Run tau as an MCP server (stdio transport)
     #[command(name = "mcp-server", hide = true)]
     McpServer {
@@ -848,6 +858,23 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
             model,
             strategy,
         } => cmd_supervise(&spec, project, model, &strategy).await?,
+        Commands::Serve { bind, port } => {
+            let status = std::process::Command::new("tau-web")
+                .arg("--bind")
+                .arg(&bind)
+                .arg("--port")
+                .arg(port.to_string())
+                .status()
+                .map_err(|e| {
+                    tau_agent_lib::Error::Io(format!(
+                        "failed to start tau-web: {} (is tau-agent-web installed?)",
+                        e
+                    ))
+                })?;
+            if !status.success() {
+                eprintln!("tau-web exited with: {}", status);
+            }
+        }
         Commands::McpServer { cwd } => {
             let cwd = if cwd == "." {
                 std::env::current_dir()
