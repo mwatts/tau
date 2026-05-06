@@ -113,6 +113,11 @@ impl Client {
                 | Response::ScheduleCreated { .. }
                 | Response::Schedules { .. }
                 | Response::ScheduleDeleted
+                | Response::AgentCreated { .. }
+                | Response::Agents { .. }
+                | Response::AgentDeleted
+                | Response::AgentPaused
+                | Response::AgentResumed
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);

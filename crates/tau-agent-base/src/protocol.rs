@@ -361,6 +361,30 @@ pub enum Request {
     ListSchedules,
     /// Delete a schedule by id.
     DeleteSchedule { id: i64 },
+    /// Create a background agent.
+    CreateAgent {
+        name: String,
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        trigger_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger_config: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        budget_usd: Option<f64>,
+    },
+    /// List all background agents.
+    ListAgents,
+    /// Delete a background agent by ID.
+    DeleteAgent { id: i64 },
+    /// Pause a background agent.
+    PauseAgent { id: i64 },
+    /// Resume a paused background agent.
+    ResumeAgent { id: i64 },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -559,6 +583,16 @@ pub enum Response {
     Schedules { schedules: Vec<ScheduleInfo> },
     /// Schedule deleted (response to DeleteSchedule).
     ScheduleDeleted,
+    /// Agent created (response to CreateAgent).
+    AgentCreated { id: i64 },
+    /// List of agents (response to ListAgents).
+    Agents { agents: Vec<AgentInfo> },
+    /// Agent deleted (response to DeleteAgent).
+    AgentDeleted,
+    /// Agent paused (response to PauseAgent).
+    AgentPaused,
+    /// Agent resumed (response to ResumeAgent).
+    AgentResumed,
     /// Error.
     Error { message: String },
 }
@@ -946,6 +980,29 @@ pub struct ScheduleInfo {
     pub last_run_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub id: i64,
+    pub name: String,
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub trigger_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_config: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+    pub spent_usd: f64,
+    pub created_at: i64,
 }
 
 /// Format a token count for display: 1234 → "1.2K", 1234567 → "1.2M".
