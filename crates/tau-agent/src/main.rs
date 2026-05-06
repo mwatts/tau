@@ -113,6 +113,21 @@ enum Commands {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Create a supervisor session that decomposes a spec and monitors task execution
+    #[command(alias = "sup")]
+    Supervise {
+        /// Specification file or inline text
+        spec: String,
+        /// Target project name
+        #[arg(long)]
+        project: Option<String>,
+        /// Model ID (optional)
+        #[arg(long)]
+        model: Option<String>,
+        /// Decomposition strategy: sequential, parallel, auto
+        #[arg(long, default_value = "auto")]
+        strategy: String,
+    },
     /// Run tau as an MCP server (stdio transport)
     #[command(name = "mcp-server", hide = true)]
     McpServer {
@@ -827,6 +842,12 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
             AgentAction::Pause { id } => cmd_agent_pause(id).await?,
             AgentAction::Resume { id } => cmd_agent_resume(id).await?,
         },
+        Commands::Supervise {
+            spec,
+            project,
+            model,
+            strategy,
+        } => cmd_supervise(&spec, project, model, &strategy).await?,
         Commands::McpServer { cwd } => {
             let cwd = if cwd == "." {
                 std::env::current_dir()
@@ -3446,6 +3467,125 @@ async fn cmd_agent_resume(id: i64) -> tau_agent_lib::Result<()> {
             _ => {}
         })
         .await?;
+    Ok(())
+}
+
+async fn cmd_supervise(
+    spec: &str,
+    project: Option<String>,
+    model: Option<String>,
+    strategy: &str,
+) -> tau_agent_lib::Result<()> {
+    let spec_text = if std::path::Path::new(spec).exists() {
+        std::fs::read_to_string(spec).map_err(|e| {
+            tau_agent_lib::Error::Io(format!("read spec file: {}", e))
+        })?
+    } else {
+        spec.to_string()
+    };
+
+    let project_name = project.unwrap_or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "default".into())
+    });
+
+    let system_prompt = format!(
+        "You are a project supervisor. Your workflow:\n\
+         1. Use task_decompose to break the spec into sub-tasks with dependencies\n\
+         2. Use session_join to wait for the decomposition to complete\n\
+         3. Use task_list to monitor progress\n\
+         4. Review completed tasks and approve or request revisions\n\
+         5. Manage merge ordering to respect DAG dependencies\n\n\
+         Strategy: {strategy}\n\
+         Project: {project_name}\n\n\
+         Break large specs into small reviewable tasks. Set appropriate priorities. \
+         Prefer parallel work where files don't conflict.",
+    );
+
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::CreateSession {
+            model,
+            provider: None,
+            system_prompt: Some(system_prompt),
+            cwd: Some(
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            parent_id: None,
+            child_budget: 32,
+            tagline: Some("supervisor".into()),
+            auto_archive: false,
+            notify_parent: false,
+            project_name: Some(project_name.clone()),
+            sandbox_profile: None,
+        })
+        .await?;
+
+    let mut session_id = String::new();
+    client
+        .recv_streaming(|resp| {
+            if let tau_agent_lib::protocol::Response::SessionCreated {
+                session_id: sid,
+            } = resp
+            {
+                session_id = sid.clone();
+                eprintln!("supervisor session: {}", sid);
+            }
+        })
+        .await?;
+
+    if session_id.is_empty() {
+        eprintln!("error: failed to create supervisor session");
+        return Ok(());
+    }
+
+    client
+        .send(&tau_agent_lib::protocol::Request::Chat {
+            session_id: session_id.clone(),
+            text: format!(
+                "Supervise this project. Start by decomposing this specification into tasks:\n\n{}",
+                spec_text
+            ),
+            attachments: Vec::new(),
+        })
+        .await?;
+
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::Stream { event } => {
+                match event.as_ref() {
+                    tau_agent_lib::StreamEvent::TextDelta { delta, .. } => {
+                        print!("{}", delta);
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    }
+                    tau_agent_lib::StreamEvent::ToolcallEnd { tool_call, .. } => {
+                        let args_str = tool_call.arguments.to_string();
+                        let preview = if args_str.len() > 100 {
+                            format!("{}...", &args_str[..100])
+                        } else {
+                            args_str
+                        };
+                        eprintln!("[tool: {} {}]", tool_call.name, preview);
+                    }
+                    _ => {}
+                }
+            }
+            tau_agent_lib::protocol::Response::AgentDone => {
+                eprintln!("\n--- supervisor session complete ---");
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+
     Ok(())
 }
 
