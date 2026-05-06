@@ -260,6 +260,11 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "items": { "type": "string" },
                         "description": "Files this task is expected to touch. Used by the scheduler to run disjoint tasks in parallel. Pass `[\"*\"]` to mark a task whose file set is genuinely unpredictable (e.g. a codebase-wide survey) — the scheduler will serialise it. If `initial_state='ready'` is set without this list (and without the `[\"*\"]` marker), the task is auto-routed through planning so the file set can be populated."
                     },
+                    "depends_on": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Task IDs that this task depends on. The task will not be scheduled until all dependencies reach merged or closed state. Cycle detection prevents circular dependencies."
+                    },
                     "project": {
                         "type": "string",
                         "description": "Project name to file the task in. Defaults to the calling session's project. Use this when filing cross-repo tasks from an orchestrator session — file one task per repo and link them with `task_relate` / `depends_on`. The named project must be registered (run `tau project init` inside its repo first)."
@@ -843,6 +848,23 @@ fn handle_task_create(
                 Ok(Some(t)) => t,
                 _ => task,
             };
+
+            // Wire depends_on relations if specified
+            if let Some(deps) = args.get("depends_on").and_then(|v| v.as_array()) {
+                for dep_val in deps {
+                    if let Some(dep_id) = dep_val.as_i64() {
+                        if let Err(e) = db.add_relation(task.id, dep_id, "depends_on") {
+                            return tool_err(
+                                tool_call_id,
+                                &format!(
+                                    "task {} created but failed to add dependency on {}: {}",
+                                    task.id, dep_id, e
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
 
             // Task #778: record the *original creator* in `task_sessions`
             // for every task — including non-interactive (`ready` /
