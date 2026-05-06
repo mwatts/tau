@@ -221,6 +221,7 @@ pub(super) async fn handle_server_request(
             *auto_archive,
             *notify_parent,
             project_name,
+            false,
         ),
         Request::GetSessionInfo { session_id } => get_session_info_impl(state, session_id),
         Request::GetSessionAncestors { session_id } => {

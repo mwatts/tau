@@ -41,6 +41,7 @@ pub(super) fn create_session_impl(
     auto_archive: bool,
     notify_parent: bool,
     project_name: &Option<String>,
+    is_agent: bool,
 ) -> crate::protocol::Response {
     use crate::protocol::Response;
     let st = lock_state(state);
@@ -227,6 +228,7 @@ pub(super) fn create_session_impl(
         auto_archive,
         notify_parent,
         project_name,
+        is_agent,
     };
     tracing::debug!(
         session_id = %id,
@@ -580,6 +582,7 @@ pub(super) async fn handle_client(
                     auto_archive,
                     notify_parent,
                     &project_name,
+                    false,
                 );
 
                 // If created and no explicit system prompt, set up plugins
@@ -2847,6 +2850,7 @@ mod tests {
             false,
             true,
             &None, // <-- explicit project_name is None: discovery must populate
+            false,
         );
         let id = match resp {
             crate::protocol::Response::SessionCreated { session_id } => session_id,
@@ -2898,6 +2902,7 @@ mod tests {
             false,
             true,
             &None,
+            false,
         );
         let id = match resp {
             crate::protocol::Response::SessionCreated { session_id } => session_id,

@@ -797,6 +797,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: project.map(|s| s.to_string()),
+            is_agent: false,
         };
         db.create_session(&s).expect("create session");
     }
@@ -843,6 +844,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         };
         db.create_session(&s).expect("create session");
     }

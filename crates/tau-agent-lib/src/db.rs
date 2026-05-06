@@ -82,6 +82,9 @@ pub struct StoredSession {
     /// When true, notify parent session on child completion.
     pub notify_parent: bool,
     pub project_name: Option<String>,
+    /// True when this session was created by an agent (tool call), not
+    /// directly by a human user.
+    pub is_agent: bool,
 }
 
 /// Project-wide aggregate stats (totals across every session, archived
@@ -148,7 +151,7 @@ pub struct OptimizationRow {
 }
 
 /// SELECT column list shared across all queries that return `StoredSession` rows.
-const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name";
+const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name, is_agent";
 
 /// Map a `rusqlite::Row` (selected with [`SESSION_COLUMNS`]) into a [`StoredSession`].
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<StoredSession> {
@@ -172,6 +175,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<StoredSession> {
         auto_archive: row.get::<_, i32>(12)? != 0,
         notify_parent: row.get::<_, i32>(13)? != 0,
         project_name: row.get(14)?,
+        is_agent: row.get::<_, i32>(15)? != 0,
     })
 }
 
@@ -209,7 +213,8 @@ impl Db {
                 parent_id      TEXT,
                 child_budget   INTEGER NOT NULL DEFAULT 16,
                 tagline        TEXT,
-                archived       INTEGER NOT NULL DEFAULT 0
+                archived       INTEGER NOT NULL DEFAULT 0,
+                is_agent       INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY,
@@ -264,6 +269,8 @@ impl Db {
         let _ = conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN resume_on_restart INTEGER NOT NULL DEFAULT 1;",
         );
+        let _ = conn
+            .execute_batch("ALTER TABLE sessions ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0;");
 
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
@@ -532,8 +539,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name, is_agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     session.id,
                     model_json,
@@ -550,6 +557,7 @@ impl Db {
                     session.auto_archive as i32,
                     session.notify_parent as i32,
                     session.project_name,
+                    session.is_agent as i32,
                 ],
             )
             .map_err(db_err("insert session"))?;
@@ -2125,6 +2133,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         };
         db.create_session(&session).unwrap();
 
@@ -2154,6 +2163,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         };
         db.create_session(&session).unwrap();
 
@@ -2193,6 +2203,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -2223,6 +2234,7 @@ mod tests {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                is_agent: false,
             })
             .unwrap();
         }
@@ -2252,6 +2264,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
@@ -2278,6 +2291,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2302,6 +2316,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2325,6 +2340,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2358,6 +2374,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2377,6 +2394,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2397,6 +2415,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2427,6 +2446,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2446,6 +2466,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2478,6 +2499,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("top", &Message::User(UserMessage::text("hello")))
@@ -2500,6 +2522,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("child1", &Message::User(UserMessage::text("work")))
@@ -2522,6 +2545,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message(
@@ -2547,6 +2571,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message(
@@ -2585,6 +2610,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2617,6 +2643,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("completed", &Message::User(UserMessage::text("hi")))
@@ -2639,6 +2666,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("archived", &Message::User(UserMessage::text("hi")))
@@ -2661,6 +2689,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("live", &Message::User(UserMessage::text("hi")))
@@ -2692,6 +2721,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("opt_out", &Message::User(UserMessage::text("hi")))
@@ -2715,6 +2745,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         // The message is persisted with "now" as created_at so we also
@@ -2737,6 +2768,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("fresh", &Message::User(UserMessage::text("hi")))
@@ -2771,6 +2803,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         let mut asst = AssistantMessage::empty("test", "test", "test-model");
@@ -2796,6 +2829,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         let mut asst = AssistantMessage::empty("test", "test", "test-model");
@@ -2820,6 +2854,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message(
@@ -2852,6 +2887,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2885,6 +2921,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2939,6 +2976,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -2966,6 +3004,7 @@ mod tests {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                is_agent: false,
             })
             .unwrap();
         }
@@ -3001,6 +3040,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -3031,6 +3071,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -3057,6 +3098,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -3137,6 +3179,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -3177,6 +3220,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: project.map(|p| p.to_string()),
+            is_agent: false,
         }
     }
 
@@ -3403,6 +3447,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
         db.append_message("old_archived", &Message::User(UserMessage::text("hello")))
@@ -3426,6 +3471,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -3446,6 +3492,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
 
@@ -3483,6 +3530,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         }
     }
 
@@ -3643,6 +3691,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: Some("myproject".into()),
+            is_agent: false,
         };
         db.create_session(&session).unwrap();
 

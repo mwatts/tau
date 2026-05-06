@@ -106,6 +106,7 @@ async fn tick(
             true,  // auto_archive
             false, // notify_parent
             &sched_info.project_name,
+            false, // is_agent
         );
 
         let session_id = match resp {

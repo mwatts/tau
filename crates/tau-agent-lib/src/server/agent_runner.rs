@@ -1499,6 +1499,7 @@ mod compaction_tests {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                is_agent: false,
             })
             .expect("create session");
 
@@ -1664,6 +1665,7 @@ mod compaction_tests {
                         auto_archive: false,
                         notify_parent: true,
                         project_name: None,
+                        is_agent: false,
                     })
                     .expect("create session");
                 st.db

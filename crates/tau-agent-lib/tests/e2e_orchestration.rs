@@ -35,6 +35,7 @@ fn session_tree_budget_enforcement() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        is_agent: false,
     };
     db.create_session(&root).unwrap();
 
@@ -55,6 +56,7 @@ fn session_tree_budget_enforcement() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        is_agent: false,
     };
     db.create_session(&c1).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 1);
@@ -76,6 +78,7 @@ fn session_tree_budget_enforcement() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        is_agent: false,
     };
     db.create_session(&c2).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 3); // 1 + (1+1) = 3
@@ -107,6 +110,7 @@ fn session_tree_budget_enforcement() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        is_agent: false,
     };
     db.create_session(&gc1).unwrap();
     assert_eq!(db.budget_used("c2").unwrap(), 1);
@@ -150,6 +154,7 @@ fn session_tree_recursive_delete() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            is_agent: false,
         })
         .unwrap();
     }
@@ -200,6 +205,7 @@ fn session_model_inheritance() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        is_agent: false,
     })
     .unwrap();
 
@@ -242,6 +248,7 @@ fn session_info_includes_tree_fields() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        is_agent: false,
     })
     .unwrap();
 
@@ -261,6 +268,7 @@ fn session_info_includes_tree_fields() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        is_agent: false,
     })
     .unwrap();
 
