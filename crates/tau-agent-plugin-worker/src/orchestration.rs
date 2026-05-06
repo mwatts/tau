@@ -380,6 +380,48 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 "Results include session_id — use session_read to get full context if needed.".into(),
             ],
         },
+        PluginToolDef {
+            name: "schedule".into(),
+            description: "Manage recurring scheduled tasks. Create, list, or delete cron schedules that automatically run prompts on a schedule.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "list", "delete"],
+                        "description": "Action to perform"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Schedule name (required for create, optional for delete by name)"
+                    },
+                    "when": {
+                        "type": "string",
+                        "description": "Cron expression in 5-field format (minute hour day month weekday). Translate natural language to cron BEFORE calling."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Message sent each time the schedule fires"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model ID to use when the schedule fires (optional)"
+                    },
+                    "id": {
+                        "type": "integer",
+                        "description": "Schedule ID (for delete by ID)"
+                    }
+                },
+                "required": ["action"]
+            }),
+            prompt_snippet: Some("Use schedule to create recurring cron schedules that run a prompt automatically. Translate natural language timing (e.g. 'every weekday at 9am') into a 5-field cron expression before calling.".into()),
+            prompt_guidelines: vec![
+                "Convert natural language timing to a 5-field cron expression (minute hour day month weekday) before calling — pass the result in the 'when' field.".into(),
+                "Always confirm the interpreted cron expression with the user and show the next 3 fire times before creating.".into(),
+                "Warn the user if the interval is less than 5 minutes, as very frequent schedules consume significant resources.".into(),
+                "Use 'list' before creating a new schedule to check for existing schedules with the same name or purpose and avoid duplicates.".into(),
+            ],
+        },
     ]
 }
 
@@ -456,6 +498,51 @@ mod tests {
                 .any(|g| g.contains("auto_archive")),
             "session_archive guidelines should mention auto_archive, got {:?}",
             archive.prompt_guidelines,
+        );
+    }
+
+    #[test]
+    fn schedule_tool_has_required_actions() {
+        let tools = orchestration_tools();
+        let schedule = find_tool(&tools, "schedule");
+
+        let action_enum = schedule.parameters["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action should have an enum array");
+        let action_values: Vec<&str> = action_enum
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            action_values.contains(&"create"),
+            "schedule action enum should contain 'create', got {:?}",
+            action_values,
+        );
+        assert!(
+            action_values.contains(&"list"),
+            "schedule action enum should contain 'list', got {:?}",
+            action_values,
+        );
+        assert!(
+            action_values.contains(&"delete"),
+            "schedule action enum should contain 'delete', got {:?}",
+            action_values,
+        );
+
+        assert!(
+            schedule.prompt_snippet.is_some(),
+            "schedule should have a prompt_snippet",
+        );
+
+        assert!(
+            !schedule.prompt_guidelines.is_empty(),
+            "schedule should have non-empty prompt_guidelines",
+        );
+        assert_eq!(
+            schedule.prompt_guidelines.len(),
+            4,
+            "schedule should have exactly 4 prompt_guidelines, got {:?}",
+            schedule.prompt_guidelines,
         );
     }
 
