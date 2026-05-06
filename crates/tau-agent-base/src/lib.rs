@@ -4,6 +4,7 @@
 //! Dependencies are kept minimal: serde, serde_json, thiserror, and futures
 //! (for async JSON-line I/O helpers used by the client and plugin crates).
 
+pub mod agent_config;
 pub mod config_chain;
 pub mod skills;
 pub mod mcp_config;
