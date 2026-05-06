@@ -263,10 +263,20 @@ pub struct ScheduledTask {
     pub worktree_path: String,
 }
 
-/// Maximum number of tasks that can be in-flight simultaneously per project.
+/// Default maximum number of tasks that can be in-flight simultaneously per project.
 /// Counted states: active, review, merging, refining (always), and planning
 /// (only when a session is assigned, i.e. a planner is actively running).
-pub(crate) const MAX_CONCURRENT_TASKS: usize = 8;
+pub(crate) const DEFAULT_MAX_CONCURRENT_TASKS: usize = 8;
+
+/// Returns the maximum number of tasks that can be in-flight simultaneously.
+/// Reads from `TAU_MAX_PARALLEL_TASKS` environment variable, falling back to
+/// `DEFAULT_MAX_CONCURRENT_TASKS` if unset or unparseable.
+pub(crate) fn max_concurrent_tasks() -> usize {
+    std::env::var("TAU_MAX_PARALLEL_TASKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_TASKS)
+}
 
 /// Run a scheduling pass: find ready/planning tasks, pick a non-conflicting
 /// batch, create branches and worktrees (for ready tasks), update task state.
@@ -274,7 +284,7 @@ pub(crate) const MAX_CONCURRENT_TASKS: usize = 8;
 /// Ready tasks get branches/worktrees and transition to `active`.
 /// Planning tasks are dispatched without worktrees (read-only sessions).
 ///
-/// Respects `MAX_CONCURRENT_TASKS` — will not schedule more tasks than the
+/// Respects `max_concurrent_tasks()` — will not schedule more tasks than the
 /// remaining capacity allows.
 ///
 /// Returns the list of tasks that were prepared for dispatch.
@@ -285,14 +295,15 @@ pub fn schedule(
 ) -> tau_agent_plugin::Result<Vec<ScheduledTask>> {
     // Check how many tasks are already in-flight.
     let inflight = db.count_inflight_tasks(project_name)?;
-    if inflight >= MAX_CONCURRENT_TASKS {
+    let max_tasks = max_concurrent_tasks();
+    if inflight >= max_tasks {
         eprintln!(
             "tasks scheduler: schedule pass for project '{}' — in-flight budget exhausted ({} / {}), skipping",
-            project_name, inflight, MAX_CONCURRENT_TASKS
+            project_name, inflight, max_tasks
         );
         return Ok(Vec::new());
     }
-    let remaining_capacity = MAX_CONCURRENT_TASKS - inflight;
+    let remaining_capacity = max_tasks - inflight;
 
     let schedulable_tasks = db.get_schedulable_tasks(project_name)?;
 
@@ -300,7 +311,7 @@ pub fn schedule(
         "tasks scheduler: schedule pass for project '{}' — in-flight={} / {}, schedulable candidates={}",
         project_name,
         inflight,
-        MAX_CONCURRENT_TASKS,
+        max_tasks,
         schedulable_tasks.len(),
     );
 
@@ -2352,7 +2363,7 @@ pub fn get_status(
     project_path: Option<&str>,
 ) -> tau_agent_plugin::Result<SchedulerStatus> {
     let inflight_count = db.count_inflight_tasks(project_name)?;
-    let max_concurrent = MAX_CONCURRENT_TASKS;
+    let max_concurrent = max_concurrent_tasks();
 
     // Get all non-terminal tasks for this project.
     let all_tasks = db.list_tasks(project_name, None, None, None, None)?;
@@ -4853,7 +4864,7 @@ mod tests {
         assert!(status.held.is_empty());
         assert!(status.blocked.is_empty());
         assert_eq!(status.inflight_count, 0);
-        assert_eq!(status.max_concurrent, MAX_CONCURRENT_TASKS);
+        assert_eq!(status.max_concurrent, max_concurrent_tasks());
     }
 
     #[test]
