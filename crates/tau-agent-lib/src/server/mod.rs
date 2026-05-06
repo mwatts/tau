@@ -8,6 +8,7 @@ mod dispatch;
 mod notifications;
 mod post_idle;
 pub(crate) mod registry;
+mod agent_manager;
 mod schedule_runner;
 pub(crate) mod state;
 pub(crate) mod task_handlers;
@@ -390,6 +391,15 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         throttle.clone(),
     )
     .await;
+    agent_manager::register(
+        &bg,
+        plugins.clone(),
+        shutdown.clone(),
+        session_locks.clone(),
+        throttle.clone(),
+        &state,
+    )
+    .await;
     crate::prompt_optimizer::register(&bg).await;
     crate::prompt_promoter::register(&bg).await;
     bg.run_startup().await;
@@ -603,6 +613,15 @@ pub async fn run() -> crate::Result<()> {
         shutdown.clone(),
         session_locks.clone(),
         throttle.clone(),
+    )
+    .await;
+    agent_manager::register(
+        &bg,
+        plugins.clone(),
+        shutdown.clone(),
+        session_locks.clone(),
+        throttle.clone(),
+        &state,
     )
     .await;
     crate::prompt_optimizer::register(&bg).await;
