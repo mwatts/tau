@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tau</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <nav id="sidebar">
+    <h2>tau</h2>
+    <div id="nav-links">
+      <button class="nav-btn active" data-view="sessions">Sessions</button>
+      <button class="nav-btn" data-view="tasks">Tasks</button>
+      <button class="nav-btn" data-view="schedules">Schedules</button>
+      <button class="nav-btn" data-view="agents">Agents</button>
+    </div>
+    <div id="session-list"></div>
+  </nav>
+  <main id="main">
+    <div id="chat-view">
+      <div id="messages"></div>
+      <div class="input-area">
+        <textarea id="input" rows="3" placeholder="Send a message..."></textarea>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

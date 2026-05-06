@@ -1,0 +1,30 @@
+[package]
+name = "tau-agent-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Web UI server for tau agent"
+
+[[bin]]
+name = "tau-web"
+path = "src/main.rs"
+
+[dependencies]
+tau-agent-base.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+rust-embed = { version = "8" }
+clap = { version = "4", features = ["derive"] }
+rand = "0.10"
+hex = "0.4"
+mime_guess = "2"
+futures-util = "0.3"

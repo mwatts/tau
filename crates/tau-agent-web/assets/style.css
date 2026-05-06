@@ -1,0 +1,31 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #1a1b26; --bg-alt: #24283b; --fg: #c0caf5;
+  --accent: #7aa2f7; --border: #3b4261; --error: #f7768e;
+  --success: #9ece6a; --warning: #e0af68;
+}
+body { background: var(--bg); color: var(--fg); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; font-size: 14px; }
+#app { display: flex; height: 100vh; }
+#sidebar { width: 260px; background: var(--bg-alt); border-right: 1px solid var(--border); padding: 16px; overflow-y: auto; flex-shrink: 0; }
+#sidebar h2 { color: var(--accent); margin-bottom: 16px; font-size: 18px; }
+#nav-links { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 16px; }
+.nav-btn { background: transparent; color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; cursor: pointer; font-family: inherit; font-size: 12px; }
+.nav-btn:hover { border-color: var(--accent); }
+.nav-btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#chat-view { flex: 1; display: flex; flex-direction: column; }
+#messages { flex: 1; overflow-y: auto; padding: 16px; }
+.message { margin-bottom: 16px; padding: 12px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; }
+.message.user { background: var(--bg-alt); border: 1px solid var(--border); }
+.message.assistant { background: transparent; }
+.message.system { color: var(--border); font-style: italic; }
+.input-area { padding: 16px; border-top: 1px solid var(--border); }
+.input-area textarea { width: 100%; background: var(--bg-alt); color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: inherit; font-size: 14px; resize: none; }
+.input-area textarea:focus { outline: none; border-color: var(--accent); }
+.session-item { padding: 8px 12px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; font-size: 13px; }
+.session-item:hover { background: var(--bg); }
+.session-item.active { background: var(--accent); color: var(--bg); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+.badge.running { background: var(--accent); color: var(--bg); }
+.badge.idle { background: var(--border); }
+.badge.error { background: var(--error); color: var(--bg); }
