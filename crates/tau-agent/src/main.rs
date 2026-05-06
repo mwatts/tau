@@ -107,6 +107,12 @@ enum Commands {
         #[command(subcommand)]
         action: ScheduleAction,
     },
+    /// Manage background agents
+    #[command(alias = "ag")]
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
     /// Run tau as an MCP server (stdio transport)
     #[command(name = "mcp-server", hide = true)]
     McpServer {
@@ -228,6 +234,56 @@ enum ScheduleAction {
     #[command(alias = "d")]
     Delete {
         /// Schedule ID
+        id: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// List all background agents
+    #[command(alias = "l")]
+    List,
+    /// Create a new background agent
+    #[command(alias = "c")]
+    Create {
+        /// Agent name (must be unique)
+        name: String,
+        /// Prompt text for the agent
+        #[arg(long)]
+        prompt: String,
+        /// Trigger type (periodic, event, persistent)
+        #[arg(long, default_value = "periodic")]
+        trigger: String,
+        /// Trigger config (e.g. cron expression for periodic)
+        #[arg(long)]
+        trigger_config: Option<String>,
+        /// Model ID (optional)
+        #[arg(long)]
+        model: Option<String>,
+        /// System prompt override
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Project name to associate with
+        #[arg(long)]
+        project: Option<String>,
+        /// Budget in USD (optional cap)
+        #[arg(long)]
+        budget: Option<f64>,
+    },
+    /// Delete an agent by ID
+    #[command(alias = "d")]
+    Delete {
+        /// Agent ID
+        id: i64,
+    },
+    /// Pause an agent
+    Pause {
+        /// Agent ID
+        id: i64,
+    },
+    /// Resume a paused agent
+    Resume {
+        /// Agent ID
         id: i64,
     },
 }
@@ -748,6 +804,28 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
                     .await?
             }
             ScheduleAction::Delete { id } => cmd_schedule_delete(id).await?,
+        },
+        Commands::Agent { action } => match action {
+            AgentAction::List => cmd_agent_list().await?,
+            AgentAction::Create {
+                name,
+                prompt,
+                trigger,
+                trigger_config,
+                model,
+                system_prompt,
+                project,
+                budget,
+            } => {
+                cmd_agent_create(
+                    &name, &prompt, &trigger, trigger_config, model,
+                    system_prompt, project, budget,
+                )
+                .await?
+            }
+            AgentAction::Delete { id } => cmd_agent_delete(id).await?,
+            AgentAction::Pause { id } => cmd_agent_pause(id).await?,
+            AgentAction::Resume { id } => cmd_agent_resume(id).await?,
         },
         Commands::McpServer { cwd } => {
             let cwd = if cwd == "." {
@@ -3228,6 +3306,139 @@ async fn cmd_schedule_delete(id: i64) -> tau_agent_lib::Result<()> {
         .recv_streaming(|resp| match resp {
             tau_agent_lib::protocol::Response::ScheduleDeleted => {
                 eprintln!("deleted schedule #{}", id);
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+    Ok(())
+}
+
+async fn cmd_agent_list() -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::ListAgents)
+        .await?;
+    client
+        .recv_streaming(|resp| {
+            if let tau_agent_lib::protocol::Response::Agents { agents } = resp {
+                if agents.is_empty() {
+                    println!("no agents");
+                } else {
+                    for a in agents {
+                        let enabled = if a.enabled { "" } else { " [paused]" };
+                        let budget = a
+                            .budget_usd
+                            .map(|b| format!(" budget=${:.2}", b))
+                            .unwrap_or_default();
+                        let session = a
+                            .session_id
+                            .as_deref()
+                            .map(|s| format!(" session={}", s))
+                            .unwrap_or_default();
+                        println!(
+                            "#{} '{}' ({}){}{}{}",
+                            a.id, a.name, a.trigger_type, enabled, budget, session,
+                        );
+                        println!("   prompt: {}", a.prompt);
+                        if a.spent_usd > 0.0 {
+                            println!("   spent: ${:.4}", a.spent_usd);
+                        }
+                    }
+                }
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_agent_create(
+    name: &str,
+    prompt: &str,
+    trigger_type: &str,
+    trigger_config: Option<String>,
+    model: Option<String>,
+    system_prompt: Option<String>,
+    project: Option<String>,
+    budget: Option<f64>,
+) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::CreateAgent {
+            name: name.to_string(),
+            prompt: prompt.to_string(),
+            model,
+            trigger_type: trigger_type.to_string(),
+            trigger_config,
+            system_prompt,
+            project_name: project,
+            budget_usd: budget,
+        })
+        .await?;
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::AgentCreated { id } => {
+                eprintln!("created agent #{} '{}'", id, name);
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+    Ok(())
+}
+
+async fn cmd_agent_delete(id: i64) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::DeleteAgent { id })
+        .await?;
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::AgentDeleted => {
+                eprintln!("deleted agent #{}", id);
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+    Ok(())
+}
+
+async fn cmd_agent_pause(id: i64) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::PauseAgent { id })
+        .await?;
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::AgentPaused => {
+                eprintln!("paused agent #{}", id);
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+    Ok(())
+}
+
+async fn cmd_agent_resume(id: i64) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::ResumeAgent { id })
+        .await?;
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::AgentResumed => {
+                eprintln!("resumed agent #{}", id);
             }
             tau_agent_lib::protocol::Response::Error { message } => {
                 eprintln!("error: {}", message);
