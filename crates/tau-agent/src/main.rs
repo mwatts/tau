@@ -101,6 +101,12 @@ enum Commands {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Manage schedules
+    #[command(alias = "sched")]
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
     /// Run tau as an MCP server (stdio transport)
     #[command(name = "mcp-server", hide = true)]
     McpServer {
@@ -186,6 +192,43 @@ enum ProfileAction {
         /// are contextually informative when investigating one session.
         #[arg(long)]
         exclude_other: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// List all schedules
+    #[command(alias = "l")]
+    List,
+    /// Create a new schedule
+    #[command(alias = "c")]
+    Create {
+        /// Schedule name
+        name: String,
+        /// Cron expression (5-field: min hour dom month dow)
+        #[arg(long)]
+        cron: String,
+        /// Prompt text sent each time the schedule fires
+        #[arg(long)]
+        prompt: String,
+        /// Model ID (optional, defaults to server default)
+        #[arg(long)]
+        model: Option<String>,
+        /// Working directory for the scheduled session
+        #[arg(long)]
+        cwd: Option<String>,
+        /// System prompt override
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Project name to associate the schedule with
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Delete a schedule by ID
+    #[command(alias = "d")]
+    Delete {
+        /// Schedule ID
+        id: i64,
     },
 }
 
@@ -690,6 +733,22 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
         Commands::Profile { action } => {
             cmd_profile(action)?;
         }
+        Commands::Schedule { action } => match action {
+            ScheduleAction::List => cmd_schedule_list().await?,
+            ScheduleAction::Create {
+                name,
+                cron,
+                prompt,
+                model,
+                cwd,
+                system_prompt,
+                project,
+            } => {
+                cmd_schedule_create(&name, &cron, &prompt, model, cwd, system_prompt, project)
+                    .await?
+            }
+            ScheduleAction::Delete { id } => cmd_schedule_delete(id).await?,
+        },
         Commands::McpServer { cwd } => {
             let cwd = if cwd == "." {
                 std::env::current_dir()
@@ -3088,6 +3147,95 @@ fn aggregate_session_cost(
     session_id: &str,
 ) -> tau_agent_lib::Result<f64> {
     tau_agent_lib::profile::session_cost_total(db, session_id)
+}
+
+async fn cmd_schedule_list() -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::ListSchedules)
+        .await?;
+    client
+        .recv_streaming(|resp| {
+            if let tau_agent_lib::protocol::Response::Schedules { schedules } = resp {
+                if schedules.is_empty() {
+                    println!("no schedules");
+                } else {
+                    for s in schedules {
+                        let enabled = if s.enabled { "" } else { " [disabled]" };
+                        let next = s
+                            .next_run_at
+                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                            .unwrap_or_else(|| "\u{2014}".to_string());
+                        let last = s
+                            .last_run_at
+                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                            .unwrap_or_else(|| "never".to_string());
+                        println!(
+                            "#{} '{}' \u{2014} {}{}\n   prompt: {}\n   next: {}  last: {}",
+                            s.id, s.name, s.cron_expr, enabled, s.prompt, next, last,
+                        );
+                    }
+                }
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+async fn cmd_schedule_create(
+    name: &str,
+    cron: &str,
+    prompt: &str,
+    model: Option<String>,
+    cwd: Option<String>,
+    system_prompt: Option<String>,
+    project: Option<String>,
+) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::CreateSchedule {
+            name: name.to_string(),
+            cron_expr: cron.to_string(),
+            prompt: prompt.to_string(),
+            model,
+            cwd,
+            system_prompt,
+            project_name: project,
+        })
+        .await?;
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::ScheduleCreated { id } => {
+                eprintln!("created schedule #{} '{}'", id, name);
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+    Ok(())
+}
+
+async fn cmd_schedule_delete(id: i64) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::DeleteSchedule { id })
+        .await?;
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::ScheduleDeleted => {
+                eprintln!("deleted schedule #{}", id);
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
