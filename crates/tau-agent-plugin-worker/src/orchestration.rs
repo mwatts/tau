@@ -422,6 +422,35 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 "Use 'list' before creating a new schedule to check for existing schedules with the same name or purpose and avoid duplicates.".into(),
             ],
         },
+        PluginToolDef {
+            name: "task_decompose".into(),
+            description: "Decompose a specification into a DAG of sub-tasks. Spawns a child session that reads the spec, breaks it into tasks with dependencies, and creates them via task_create.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "string",
+                        "description": "Specification text or file path to decompose into tasks"
+                    },
+                    "project_name": {
+                        "type": "string",
+                        "description": "Target project for the created tasks"
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["sequential", "parallel", "auto"],
+                        "description": "Decomposition strategy: sequential (linear chain), parallel (independent tasks), auto (LLM decides). Default: auto"
+                    }
+                },
+                "required": ["spec", "project_name"]
+            }),
+            prompt_snippet: Some("Use task_decompose to break a specification or feature request into a structured DAG of sub-tasks. Each sub-task gets title, description, affected_files, priority, and dependency edges.".into()),
+            prompt_guidelines: vec![
+                "Prefer task_decompose over manually creating many tasks — it ensures consistent structure and proper dependency edges.".into(),
+                "The spec can be inline text or a file path (the child session will read the file if needed).".into(),
+                "After decomposition, review the created tasks with task_list to verify the structure makes sense.".into(),
+            ],
+        },
     ]
 }
 

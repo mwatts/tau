@@ -225,6 +225,15 @@ async fn async_main() -> crate::Result<()> {
                                 &pending,
                             )
                             .await
+                        } else if name == "task_decompose" {
+                            handle_task_decompose(
+                                &arguments,
+                                session_id.as_deref(),
+                                &msg_tx,
+                                &pending,
+                                &unjoined,
+                            )
+                            .await
                         } else if name == "bash" {
                             execute_bash_async(
                                 &tool_call_id,
@@ -990,6 +999,125 @@ async fn handle_schedule_tool(
             ),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task decomposition tool (async)
+// ---------------------------------------------------------------------------
+
+async fn handle_task_decompose(
+    args: &serde_json::Value,
+    session_id: Option<&str>,
+    msg_tx: &smol::channel::Sender<tau_agent_plugin::PluginMessage>,
+    pending: &std::sync::Arc<smol::lock::Mutex<std::collections::HashMap<String, smol::channel::Sender<crate::protocol::Response>>>>,
+    unjoined: &std::sync::Arc<smol::lock::Mutex<std::collections::HashSet<String>>>,
+) -> tau_agent_plugin::ToolResultMessage {
+    let tcid = "".to_string();
+    let spec = match args.get("spec").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return tau_agent_plugin::ToolResultMessage::error(
+                tcid, "", "missing required parameter: spec",
+            );
+        }
+    };
+    let project_name = match args.get("project_name").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return tau_agent_plugin::ToolResultMessage::error(
+                tcid, "", "missing required parameter: project_name",
+            );
+        }
+    };
+    let strategy = args
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+
+    let system_prompt = format!(
+        "You are a task decomposition agent. Your job is to break a specification into \
+         sub-tasks using the task_create tool.\n\n\
+         Rules:\n\
+         - Create each sub-task with task_create, setting title, description, affected_files, \
+           and priority.\n\
+         - Use the depends_on parameter to wire dependency edges between tasks.\n\
+         - Strategy: {strategy}\n\
+           - sequential: create a linear chain where each task depends on the previous\n\
+           - parallel: create independent tasks that can run concurrently\n\
+           - auto: analyze the spec and choose the best mix of sequential and parallel\n\
+         - Target project: {project_name}\n\
+         - Keep tasks small and focused — each should be completable in one session.\n\
+         - After creating all tasks, output a summary: task count, dependency graph shape, \
+           and estimated parallel depth.",
+    );
+
+    let create_req = crate::protocol::Request::CreateSession {
+        model: None,
+        provider: None,
+        system_prompt: Some(system_prompt),
+        cwd: None,
+        parent_id: session_id.map(String::from),
+        child_budget: 4,
+        tagline: Some("task-decompose".into()),
+        auto_archive: true,
+        notify_parent: false,
+        project_name: Some(project_name.to_string()),
+        sandbox_profile: None,
+    };
+    let resp = match server_request(msg_tx, pending, create_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            return tau_agent_plugin::ToolResultMessage::error(
+                tcid, "", &format!("server request failed: {}", e),
+            );
+        }
+    };
+    let child_id = match resp {
+        crate::protocol::Response::SessionCreated { session_id } => session_id,
+        crate::protocol::Response::Error { message } => {
+            return tau_agent_plugin::ToolResultMessage::error(
+                tcid, "", &format!("spawn failed: {}", message),
+            );
+        }
+        other => {
+            return tau_agent_plugin::ToolResultMessage::error(
+                tcid, "", &format!("unexpected response: {:?}", other),
+            );
+        }
+    };
+
+    let chat_req = crate::protocol::Request::Chat {
+        session_id: child_id.clone(),
+        text: format!(
+            "Decompose this specification into sub-tasks for project '{project_name}':\n\n{spec}"
+        ),
+        attachments: Vec::new(),
+    };
+    match server_request(msg_tx, pending, chat_req).await {
+        Ok(crate::protocol::Response::Ok) => {}
+        Ok(crate::protocol::Response::Error { message }) => {
+            return tau_agent_plugin::ToolResultMessage::error(
+                tcid, "",
+                &format!("session {} created but chat failed: {}", child_id, message),
+            );
+        }
+        Ok(_) | Err(_) => {
+            return tau_agent_plugin::ToolResultMessage::error(
+                tcid, "",
+                &format!("session {} created but chat failed", child_id),
+            );
+        }
+    }
+
+    unjoined.lock().await.insert(child_id.clone());
+
+    tau_agent_plugin::ToolResultMessage::success(
+        tcid, "",
+        &format!(
+            "Spawned decomposition session {}. Use session_join to wait for results.",
+            child_id
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
