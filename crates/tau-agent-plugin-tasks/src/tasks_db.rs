@@ -69,6 +69,8 @@ pub struct Task {
     ///
     /// Write-once at create time; see [`Task::filed_by_project`].
     pub filed_by_session_id: Option<String>,
+    pub budget_usd: Option<f64>,
+    pub spent_usd: f64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -179,7 +181,7 @@ const TASK_COLUMNS: &str = "id, project_name, title, state, priority, \
     parent_id, tags, affected_files, branch, merge_target, worktree_path, \
     session_id, skip_review, require_approval, sandbox_profile, held, \
     placeholder_session_id, auto_downgraded_from_ready, \
-    filed_by_project, filed_by_session_id, created_at, \
+    filed_by_project, filed_by_session_id, budget_usd, spent_usd, created_at, \
     updated_at";
 
 // The canonical valid-state set and transition predicates now live in
@@ -272,6 +274,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     auto_downgraded_from_ready INTEGER NOT NULL DEFAULT 0,
     filed_by_project TEXT,
     filed_by_session_id TEXT,
+    budget_usd REAL,
+    spent_usd REAL NOT NULL DEFAULT 0.0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -571,6 +575,20 @@ impl TasksDb {
                 UPDATE tasks SET state = 'closed' WHERE state = 'done';",
             )
             .map_err(plugin_io_err("migrate done to merged/closed"))?;
+        }
+
+        let has_budget_usd: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'budget_usd'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_budget_usd {
+            conn.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN budget_usd REAL; \
+                 ALTER TABLE tasks ADD COLUMN spent_usd REAL NOT NULL DEFAULT 0.0;",
+            )
+            .map_err(plugin_io_err("migrate budget columns"))?;
         }
 
         Ok(())
@@ -2189,6 +2207,16 @@ impl TasksDb {
         }
         Ok(())
     }
+
+    pub fn update_task_spent(&self, task_id: i64, spent_usd: f64) -> tau_agent_plugin::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tasks SET spent_usd = ?1 WHERE id = ?2",
+                params![spent_usd, task_id],
+            )
+            .map_err(plugin_io_err("update task spent_usd"))?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2223,8 +2251,10 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         auto_downgraded_from_ready: row.get::<_, i32>(17)? != 0,
         filed_by_project: row.get(18)?,
         filed_by_session_id: row.get(19)?,
-        created_at: row.get(20)?,
-        updated_at: row.get(21)?,
+        budget_usd: row.get(20)?,
+        spent_usd: row.get::<_, f64>(21).unwrap_or(0.0),
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
     })
 }
 
