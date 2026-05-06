@@ -83,6 +83,7 @@ pub(crate) trait BgJob: Send + Sync + 'static {
 #[allow(dead_code)] // OnShutdown / AfterDelay / WhenAllSessionsIdle are not
 // wired up yet; the variants exist on the public surface
 // so the first consumer doesn't have to widen the enum.
+// Persistent is wired up and in use.
 pub(crate) enum BgTrigger {
     /// Run once after the next time `session_id`'s agent loop exits.
     /// Inline-runs immediately if the session is not currently live.
@@ -97,6 +98,12 @@ pub(crate) enum BgTrigger {
     OnShutdown,
     /// Run when no session is live (not yet implemented).
     WhenAllSessionsIdle,
+    /// Long-lived job that restarts on failure with exponential backoff.
+    Persistent {
+        initial_delay: Duration,
+        restart_delay: Duration,
+        max_backoff: Duration,
+    },
 }
 
 /// Owns per-session deferred and periodic background work.
@@ -170,6 +177,23 @@ impl BgTaskScheduler {
                     .lock()
                     .expect("bg_tasks startup mutex poisoned")
                     .push(job);
+            }
+            BgTrigger::Persistent {
+                initial_delay,
+                restart_delay,
+                max_backoff,
+            } => {
+                tracing::info!(
+                    job = job.name(),
+                    "registered persistent bg job"
+                );
+                let sched = self.clone();
+                smol::spawn(async move {
+                    sched
+                        .run_persistent(job, initial_delay, restart_delay, max_backoff)
+                        .await;
+                })
+                .detach();
             }
             BgTrigger::AfterDelay { .. }
             | BgTrigger::OnShutdown
@@ -302,6 +326,51 @@ impl BgTaskScheduler {
                 );
             }
             smol::Timer::after(interval).await;
+        }
+    }
+
+    /// Persistent loop body: wait `initial_delay`, then run the job in a
+    /// loop.  On success the restart delay resets to `restart_delay`; on
+    /// failure (panic or error) the delay doubles up to `max_backoff`.
+    /// Exits cleanly when the shutdown flag is set.
+    async fn run_persistent(
+        self: Arc<Self>,
+        job: Arc<dyn BgJob>,
+        initial_delay: Duration,
+        restart_delay: Duration,
+        max_backoff: Duration,
+    ) {
+        smol::Timer::after(initial_delay).await;
+        let mut current_delay = restart_delay;
+        loop {
+            if self.shutdown.is_shutting_down() {
+                tracing::debug!(job = job.name(), "persistent bg job exiting (shutdown)");
+                return;
+            }
+            let name = job.name();
+            tracing::debug!(job = name, "persistent bg job starting");
+            let result = AssertUnwindSafe(job.run(&self.state))
+                .catch_unwind()
+                .await;
+            if self.shutdown.is_shutting_down() {
+                tracing::debug!(job = name, "persistent bg job exiting (shutdown)");
+                return;
+            }
+            match result {
+                Ok(()) => {
+                    tracing::info!(job = name, "persistent bg job completed; restarting");
+                    current_delay = restart_delay;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        job = name,
+                        delay_ms = current_delay.as_millis() as u64,
+                        "persistent bg job panicked; restarting with backoff"
+                    );
+                    current_delay = (current_delay * 2).min(max_backoff);
+                }
+            }
+            smol::Timer::after(current_delay).await;
         }
     }
 
