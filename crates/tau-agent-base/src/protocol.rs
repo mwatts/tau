@@ -385,6 +385,8 @@ pub enum Request {
     PauseAgent { id: i64 },
     /// Resume a paused background agent.
     ResumeAgent { id: i64 },
+    /// Start an agent on demand (creates a session and runs it).
+    StartAgent { id: i64 },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -593,6 +595,8 @@ pub enum Response {
     AgentPaused,
     /// Agent resumed (response to ResumeAgent).
     AgentResumed,
+    /// Agent started on demand (response to StartAgent).
+    AgentStarted { session_id: String },
     /// Error.
     Error { message: String },
 }

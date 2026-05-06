@@ -2641,6 +2641,130 @@ pub(super) async fn handle_client(
                 };
                 send(&mut writer, &resp).await?;
             }
+            crate::protocol::Request::StartAgent { id } => {
+                // Look up the agent
+                let list_result = {
+                    let st = lock_state(&state);
+                    st.db.list_agents()
+                };
+                let agent = match list_result {
+                    Ok(agents) => agents.into_iter().find(|a| a.id == id),
+                    Err(e) => {
+                        send(&mut writer, &Response::Error { message: format!("{}", e) })
+                            .await?;
+                        continue;
+                    }
+                };
+                let agent = match agent {
+                    Some(a) => a,
+                    None => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("agent {} not found", id),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+                if !agent.enabled {
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("agent {} is paused", id),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // Create session
+                let resp = create_session_impl(
+                    &state,
+                    &agent.model,
+                    &None,
+                    &agent.system_prompt,
+                    &None, // cwd
+                    &None, // parent_id
+                    0,     // child_budget
+                    &Some(format!("[agent] {}", agent.name)),
+                    true,  // auto_archive
+                    false, // notify_parent
+                    &agent.project_name,
+                    true,  // is_agent
+                );
+
+                let session_id = match resp {
+                    Response::SessionCreated { ref session_id } => session_id.clone(),
+                    Response::Error { message } => {
+                        send(&mut writer, &Response::Error { message }).await?;
+                        continue;
+                    }
+                    _ => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: "unexpected response from session creation".to_string(),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+
+                // Record session_id in agents table
+                {
+                    let st = lock_state(&state);
+                    let _ = st.db.set_agent_session_id(id, Some(&session_id));
+                }
+
+                send(
+                    &mut writer,
+                    &Response::AgentStarted {
+                        session_id: session_id.clone(),
+                    },
+                )
+                .await?;
+
+                // Spawn the agent chat (fire-and-forget)
+                let s = state.clone();
+                let p = plugins.clone();
+                let sh = shutdown.clone();
+                let sl = session_locks.clone();
+                let th = throttle.clone();
+                let sid = session_id.clone();
+                let name = agent.name.clone();
+                let prompt = agent.prompt.clone();
+                let state_for_cleanup = state.clone();
+                let agent_id_for_cleanup = agent.id;
+                smol::spawn(async move {
+                    if let Err(e) = super::agent_runner::run_child_chat(
+                        s,
+                        p,
+                        sh,
+                        sl,
+                        th,
+                        sid.clone(),
+                        prompt,
+                        Vec::new(),
+                        super::SharedTestOverrides::default(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            agent = %name,
+                            session_id = %sid,
+                            %e,
+                            "start-agent: child chat error"
+                        );
+                    }
+                    // Clear session_id when done
+                    let st = lock_state(&state_for_cleanup);
+                    let _ = st.db.set_agent_session_id(agent_id_for_cleanup, None);
+                })
+                .detach();
+            }
         }
     }
 

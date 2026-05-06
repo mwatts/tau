@@ -118,6 +118,7 @@ impl Client {
                 | Response::AgentDeleted
                 | Response::AgentPaused
                 | Response::AgentResumed
+                | Response::AgentStarted { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);

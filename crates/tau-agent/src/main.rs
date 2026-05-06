@@ -311,6 +311,12 @@ enum AgentAction {
         /// Agent ID
         id: i64,
     },
+    /// Start an agent on demand
+    #[command(alias = "s")]
+    Start {
+        /// Agent ID to start
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -851,6 +857,7 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
             AgentAction::Delete { id } => cmd_agent_delete(id).await?,
             AgentAction::Pause { id } => cmd_agent_pause(id).await?,
             AgentAction::Resume { id } => cmd_agent_resume(id).await?,
+            AgentAction::Start { id } => cmd_agent_start(id).await?,
         },
         Commands::Supervise {
             spec,
@@ -3518,6 +3525,25 @@ async fn cmd_agent_resume(id: i64) -> tau_agent_lib::Result<()> {
         .recv_streaming(|resp| match resp {
             tau_agent_lib::protocol::Response::AgentResumed => {
                 eprintln!("resumed agent #{}", id);
+            }
+            tau_agent_lib::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
+    Ok(())
+}
+
+async fn cmd_agent_start(id: i64) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::StartAgent { id })
+        .await?;
+    client
+        .recv_streaming(|resp| match resp {
+            tau_agent_lib::protocol::Response::AgentStarted { session_id } => {
+                eprintln!("started agent #{} → session {}", id, session_id);
             }
             tau_agent_lib::protocol::Response::Error { message } => {
                 eprintln!("error: {}", message);
