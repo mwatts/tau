@@ -218,6 +218,13 @@ async fn async_main() -> crate::Result<()> {
                                 &unjoined,
                             )
                             .await
+                        } else if name == "schedule" {
+                            handle_schedule_tool(
+                                &arguments,
+                                &msg_tx,
+                                &pending,
+                            )
+                            .await
                         } else if name == "bash" {
                             execute_bash_async(
                                 &tool_call_id,
@@ -814,6 +821,174 @@ fn format_bash_output(
         ToolResultMessage::success(tool_call_id, "", &text)
     } else {
         ToolResultMessage::error(tool_call_id, "", &text)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schedule management tool (async)
+// ---------------------------------------------------------------------------
+
+async fn handle_schedule_tool(
+    args: &serde_json::Value,
+    msg_tx: &Sender<PluginMessage>,
+    pending: &Arc<Mutex<HashMap<String, Sender<crate::protocol::Response>>>>,
+) -> ToolResultMessage {
+    let tcid = "";
+
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match action {
+        "create" => {
+            let name = match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n.to_string(),
+                None => {
+                    return ToolResultMessage::error(tcid, "", "name is required");
+                }
+            };
+            let cron_expr = match args.get("when").and_then(|v| v.as_str()) {
+                Some(w) => w.to_string(),
+                None => {
+                    return ToolResultMessage::error(tcid, "", "when (cron expression) is required");
+                }
+            };
+            let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => {
+                    return ToolResultMessage::error(tcid, "", "prompt is required");
+                }
+            };
+            let model = args.get("model").and_then(|v| v.as_str()).map(String::from);
+
+            let req = crate::protocol::Request::CreateSchedule {
+                name,
+                cron_expr,
+                prompt,
+                model,
+                cwd: None,
+                system_prompt: None,
+                project_name: None,
+            };
+            match server_request(msg_tx, pending, req).await {
+                Ok(crate::protocol::Response::ScheduleCreated { id }) => {
+                    ToolResultMessage::success(tcid, "", &format!("Schedule created with id {}", id))
+                }
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &format!("create failed: {}", message))
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &format!("server request failed: {}", e)),
+            }
+        }
+
+        "list" => {
+            let req = crate::protocol::Request::ListSchedules;
+            match server_request(msg_tx, pending, req).await {
+                Ok(crate::protocol::Response::Schedules { schedules }) => {
+                    if schedules.is_empty() {
+                        return ToolResultMessage::success(tcid, "", "No schedules configured.");
+                    }
+                    let mut text = String::new();
+                    for s in &schedules {
+                        text.push_str(&format!(
+                            "id={} name={} cron={} enabled={}\n  prompt: {}\n",
+                            s.id, s.name, s.cron_expr, s.enabled, s.prompt
+                        ));
+                        if let Some(ts) = s.next_run_at {
+                            if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {
+                                text.push_str(&format!("  next_run: {}\n", dt));
+                            }
+                        }
+                        if let Some(ts) = s.last_run_at {
+                            if let Some(dt) = chrono::DateTime::from_timestamp(ts, 0) {
+                                text.push_str(&format!("  last_run: {}\n", dt));
+                            }
+                        }
+                    }
+                    ToolResultMessage::success(tcid, "", text.trim_end())
+                }
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &format!("list failed: {}", message))
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &format!("server request failed: {}", e)),
+            }
+        }
+
+        "delete" => {
+            // Resolve id: use explicit id if given, otherwise look up by name.
+            let id: i64 = if let Some(id_val) = args.get("id").and_then(|v| v.as_i64()) {
+                id_val
+            } else if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+                // Look up the schedule by name.
+                let list_req = crate::protocol::Request::ListSchedules;
+                let schedules = match server_request(msg_tx, pending, list_req).await {
+                    Ok(crate::protocol::Response::Schedules { schedules }) => schedules,
+                    Ok(crate::protocol::Response::Error { message }) => {
+                        return ToolResultMessage::error(
+                            tcid,
+                            "",
+                            &format!("list failed during name lookup: {}", message),
+                        );
+                    }
+                    Ok(other) => {
+                        return ToolResultMessage::error(
+                            tcid,
+                            "",
+                            &format!("unexpected response during list: {:?}", other),
+                        );
+                    }
+                    Err(e) => {
+                        return ToolResultMessage::error(
+                            tcid,
+                            "",
+                            &format!("server request failed: {}", e),
+                        );
+                    }
+                };
+                match schedules.iter().find(|s| s.name == name) {
+                    Some(s) => s.id,
+                    None => {
+                        return ToolResultMessage::error(
+                            tcid,
+                            "",
+                            &format!("no schedule found with name '{}'", name),
+                        );
+                    }
+                }
+            } else {
+                return ToolResultMessage::error(tcid, "", "id or name is required for delete");
+            };
+
+            let req = crate::protocol::Request::DeleteSchedule { id };
+            match server_request(msg_tx, pending, req).await {
+                Ok(crate::protocol::Response::ScheduleDeleted) => {
+                    ToolResultMessage::success(tcid, "", &format!("Schedule {} deleted", id))
+                }
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &format!("delete failed: {}", message))
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &format!("server request failed: {}", e)),
+            }
+        }
+
+        _ => ToolResultMessage::error(
+            tcid,
+            "",
+            &format!(
+                "unknown action '{}'; valid options: create, list, delete",
+                action
+            ),
+        ),
     }
 }
 
