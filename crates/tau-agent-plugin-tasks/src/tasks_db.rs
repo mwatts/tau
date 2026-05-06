@@ -6523,6 +6523,8 @@ mod tests {
             auto_downgraded_from_ready: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            budget_usd: None,
+            spent_usd: 0.0,
             created_at: 0,
             updated_at: 0,
         }
