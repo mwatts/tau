@@ -2217,6 +2217,16 @@ impl TasksDb {
             .map_err(plugin_io_err("update task spent_usd"))?;
         Ok(())
     }
+
+    pub fn set_task_budget(&self, task_id: i64, budget_usd: f64) -> tau_agent_plugin::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE tasks SET budget_usd = ?1 WHERE id = ?2",
+                params![budget_usd, task_id],
+            )
+            .map_err(plugin_io_err("set task budget_usd"))?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

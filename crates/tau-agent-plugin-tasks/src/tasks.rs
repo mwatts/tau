@@ -265,6 +265,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "items": { "type": "integer" },
                         "description": "Task IDs that this task depends on. The task will not be scheduled until all dependencies reach merged or closed state. Cycle detection prevents circular dependencies."
                     },
+                    "budget_usd": {
+                        "type": "number",
+                        "description": "Optional budget cap in USD. When set, worker sessions for this task will track cost against this limit."
+                    },
                     "project": {
                         "type": "string",
                         "description": "Project name to file the task in. Defaults to the calling session's project. Use this when filing cross-repo tasks from an orchestrator session — file one task per repo and link them with `task_relate` / `depends_on`. The named project must be registered (run `tau project init` inside its repo first)."
@@ -863,6 +867,19 @@ fn handle_task_create(
                             );
                         }
                     }
+                }
+            }
+
+            // Set budget if specified
+            if let Some(budget) = args.get("budget_usd").and_then(|v| v.as_f64()) {
+                if let Err(e) = db.set_task_budget(task.id, budget) {
+                    return tool_err(
+                        tool_call_id,
+                        &format!(
+                            "task {} created but failed to set budget: {}",
+                            task.id, e
+                        ),
+                    );
                 }
             }
 
