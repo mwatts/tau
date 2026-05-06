@@ -312,6 +312,25 @@ impl Db {
             );",
         );
 
+        // Background agents: long-running or periodic agent sessions.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agents (
+                id             INTEGER PRIMARY KEY,
+                name           TEXT NOT NULL UNIQUE,
+                prompt         TEXT NOT NULL,
+                model          TEXT,
+                trigger_type   TEXT NOT NULL DEFAULT 'periodic',
+                trigger_config TEXT,
+                system_prompt  TEXT,
+                project_name   TEXT,
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                session_id     TEXT,
+                budget_usd     REAL,
+                spent_usd      REAL NOT NULL DEFAULT 0.0,
+                created_at     INTEGER NOT NULL
+            );",
+        );
+
         // Prompt quality metrics and optimization tracking.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS prompt_metrics (
@@ -1793,6 +1812,99 @@ impl Db {
                 rusqlite::params![last_run_at, next_run_at, id],
             )
             .map_err(db_err("update schedule run"))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Agents
+    // -----------------------------------------------------------------------
+
+    pub fn create_agent(
+        &self,
+        name: &str,
+        prompt: &str,
+        model: Option<&str>,
+        trigger_type: &str,
+        trigger_config: Option<&str>,
+        system_prompt: Option<&str>,
+        project_name: Option<&str>,
+        budget_usd: Option<f64>,
+    ) -> crate::Result<i64> {
+        let now = (crate::types::timestamp_ms() / 1000) as i64;
+        self.conn
+            .execute(
+                "INSERT INTO agents (name, prompt, model, trigger_type, trigger_config, \
+                 system_prompt, project_name, budget_usd, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![name, prompt, model, trigger_type, trigger_config,
+                                  system_prompt, project_name, budget_usd, now],
+            )
+            .map_err(db_err("insert agent"))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_agents(&self) -> crate::Result<Vec<tau_agent_base::protocol::AgentInfo>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, prompt, model, trigger_type, trigger_config, \
+                 system_prompt, project_name, enabled, session_id, budget_usd, \
+                 spent_usd, created_at \
+                 FROM agents ORDER BY id",
+            )
+            .map_err(db_err("prepare list agents"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(tau_agent_base::protocol::AgentInfo {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    model: row.get(3)?,
+                    trigger_type: row.get(4)?,
+                    trigger_config: row.get(5)?,
+                    system_prompt: row.get(6)?,
+                    project_name: row.get(7)?,
+                    enabled: row.get::<_, i64>(8)? != 0,
+                    session_id: row.get(9)?,
+                    budget_usd: row.get(10)?,
+                    spent_usd: row.get::<_, f64>(11)?,
+                    created_at: row.get(12)?,
+                })
+            })
+            .map_err(db_err("query agents"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(db_err("read agent row"))?);
+        }
+        Ok(result)
+    }
+
+    pub fn delete_agent(&self, id: i64) -> crate::Result<bool> {
+        let count = self
+            .conn
+            .execute("DELETE FROM agents WHERE id = ?1", [id])
+            .map_err(db_err("delete agent"))?;
+        Ok(count > 0)
+    }
+
+    pub fn set_agent_enabled(&self, id: i64, enabled: bool) -> crate::Result<bool> {
+        let count = self
+            .conn
+            .execute(
+                "UPDATE agents SET enabled = ?1 WHERE id = ?2",
+                rusqlite::params![enabled, id],
+            )
+            .map_err(db_err("set agent enabled"))?;
+        Ok(count > 0)
+    }
+
+    pub fn set_agent_session_id(&self, id: i64, session_id: Option<&str>) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE agents SET session_id = ?1 WHERE id = ?2",
+                rusqlite::params![session_id, id],
+            )
+            .map_err(db_err("set agent session_id"))?;
         Ok(())
     }
 
