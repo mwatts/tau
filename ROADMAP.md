@@ -161,6 +161,42 @@ its own skills autonomously over time without GPU training.
 
 ---
 
+## Phase 7 — Durable Streams
+
+Native Rust implementation of the [durable streams protocol](https://durablestreams.com/) as
+the foundational data primitive for agent loops.
+
+**Approach A** (current): new `tau-streams` crate + gradual migration.
+**Approach B** (future target): streams replace storage wholesale.
+
+### Phases 1-4 (implemented)
+
+- [x] `tau-streams` crate: core types, SQLite store, offset generation, idempotent producer dedup, epoch fencing
+- [x] `tau-streams` crate: LiveDeliveryHub with broadcast fan-out
+- [x] `tau-streams` crate: DurableStream combined API (store + hub)
+- [x] `tau-streams` crate: StreamConsumer with catch-up → live transition
+- [x] HTTP protocol: REST endpoints (create/append/read/head/delete/list)
+- [x] HTTP protocol: SSE handler with 60s reconnect cycle
+- [x] HTTP protocol: long-poll handler with 30s timeout
+- [x] SessionEvent enum with versioned envelope (StreamEnvelope)
+- [x] session_index table and migration helper
+- [x] Stream protocol variants in UDS wire protocol (Request + Response)
+- [x] Dispatch stream requests in UDS server
+- [x] Bridge notification utility for LiveDeliveryHub
+
+### Phases 5-7 (future)
+
+- [ ] Task & system streams (TaskEvent, SystemEvent, singleton system stream)
+- [ ] Multiplayer: multi-writer with epoch fencing, coordination streams
+- [ ] Branch operation (fork stream at any offset)
+- [ ] Stream-native UDS (replace existing Subscribe with StreamSubscribe)
+- [ ] Approach B: streams replace storage wholesale (see design spec)
+
+**Spec:** `docs/superpowers/specs/2026-05-06-durable-streams-design.md`
+**Plan:** `docs/superpowers/plans/2026-05-06-durable-streams.md`
+
+---
+
 ## Non-Goals
 
 - **Terminal emulation** — tau runs inside a terminal, it doesn't replace one
