@@ -184,16 +184,25 @@ the foundational data primitive for agent loops.
 - [x] Dispatch stream requests in UDS server
 - [x] Bridge notification utility for LiveDeliveryHub
 
-### Phases 5-7 (future)
+### Phases 5-7 (implemented)
 
-- [ ] Task & system streams (TaskEvent, SystemEvent, singleton system stream)
-- [ ] Multiplayer: multi-writer with epoch fencing, coordination streams
-- [ ] Branch operation (fork stream at any offset)
-- [ ] Stream-native UDS (replace existing Subscribe with StreamSubscribe)
+- [x] TaskEvent enum with versioned envelope, task_index table
+- [x] SystemEvent enum with daemon start/shutdown emission
+- [x] CoordinationEvent enum for multiplayer coordination streams
+- [x] Daemon streams store initialization (streams.db)
+- [x] TaskEvent production hooks (task create/update/assign)
+- [x] Branch operation (fork stream at any offset)
+- [x] StreamFork protocol variant + HTTP endpoint
+- [x] StreamSubscribe live delivery over UDS (catch-up + broadcast bridge)
+- [x] Bridge existing Subscribe to durable stream hub
+
+### Future
+
+- [ ] Multiplayer: multi-writer coordination protocol (epoch-fenced multi-producer on same stream)
 - [ ] Approach B: streams replace storage wholesale (see design spec)
 
 **Spec:** `docs/superpowers/specs/2026-05-06-durable-streams-design.md`
-**Plan:** `docs/superpowers/plans/2026-05-06-durable-streams.md`
+**Plans:** `docs/superpowers/plans/2026-05-06-durable-streams.md`, `docs/superpowers/plans/2026-05-07-durable-streams-phases-5-7.md`
 
 ---
 
