@@ -4220,6 +4220,7 @@ dependencies = [
  "tau-agent-plugin",
  "tau-agent-plugin-tasks",
  "tau-agent-plugin-worker",
+ "tau-streams",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
