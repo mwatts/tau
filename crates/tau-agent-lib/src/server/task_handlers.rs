@@ -227,6 +227,7 @@ pub(super) fn handle_task_get(state: &SharedState, id: i64) -> Response {
 }
 
 pub fn handle_task_create(
+    state: &SharedState,
     project: &str,
     title: &str,
     parent_id: Option<i64>,
@@ -264,9 +265,24 @@ pub fn handle_task_create(
         false,
         crate::tasks_db::FiledBy::default(),
     ) {
-        Ok(task) => Response::TaskUpdated {
-            task: task_to_info(task),
-        },
+        Ok(task) => {
+            let tags_vec: Vec<String> = task.tags.as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            super::notifications::emit_task_event(
+                state,
+                task.id,
+                crate::stream_events::TaskEvent::Created {
+                    title: task.title.clone(),
+                    project: Some(task.project_name.clone()),
+                    priority: task.priority,
+                    tags: tags_vec,
+                },
+            );
+            Response::TaskUpdated {
+                task: task_to_info(task),
+            }
+        }
         Err(e) => Response::Error {
             message: e.to_string(),
         },
@@ -275,6 +291,7 @@ pub fn handle_task_create(
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_task_update(
+    state: &SharedState,
     id: i64,
     new_state: Option<String>,
     title: Option<String>,
@@ -315,9 +332,22 @@ pub fn handle_task_update(
         no_merge: None,
     };
     match db.update_task(id, &update, None) {
-        Ok(task) => Response::TaskUpdated {
-            task: task_to_info(task),
-        },
+        Ok(task) => {
+            super::notifications::emit_task_event(
+                state,
+                task.id,
+                crate::stream_events::TaskEvent::Updated {
+                    fields: serde_json::json!({
+                        "state": task.state.as_str(),
+                        "title": &task.title,
+                        "priority": task.priority,
+                    }),
+                },
+            );
+            Response::TaskUpdated {
+                task: task_to_info(task),
+            }
+        }
         Err(e) => Response::Error {
             message: e.to_string(),
         },
@@ -412,9 +442,21 @@ pub fn handle_task_assign(
         Err(resp) => return resp,
     };
     match db.assign_task(id, &resolved_session_id) {
-        Ok(result) => Response::TaskUpdated {
-            task: task_to_info(result.task),
-        },
+        Ok(result) => {
+            if let Some(state) = state {
+                super::notifications::emit_task_event(
+                    state,
+                    result.task.id,
+                    crate::stream_events::TaskEvent::Assigned {
+                        session_id: result.task.session_id.clone().unwrap_or_default(),
+                        agent_name: agent_name.map(String::from),
+                    },
+                );
+            }
+            Response::TaskUpdated {
+                task: task_to_info(result.task),
+            }
+        }
         Err(e) => Response::Error {
             message: e.to_string(),
         },

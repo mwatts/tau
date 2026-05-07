@@ -120,6 +120,36 @@ pub(super) fn emit_system_event(state: &SharedState, event: crate::stream_events
     }
 }
 
+/// Emit a task-level event to the task's durable stream.
+///
+/// Creates the task stream on first call (idempotent). No-op if streams
+/// are not configured.
+pub(super) fn emit_task_event(
+    state: &SharedState,
+    task_id: i64,
+    event: crate::stream_events::TaskEvent,
+) {
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else { return };
+    let stream_id = tau_streams::StreamId(format!("task-{task_id}"));
+    let _ = ds.create(&stream_id, {
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("type".to_string(), "task".to_string());
+        tags.insert("task_id".to_string(), task_id.to_string());
+        Some(tags)
+    });
+    let data = event.to_ndjson_bytes("server");
+    let req = tau_streams::AppendRequest {
+        data,
+        producer_id: None,
+        epoch: None,
+        seq: None,
+    };
+    if let Err(e) = ds.append(&stream_id, req) {
+        tracing::warn!(task_id, %e, "failed to emit task event");
+    }
+}
+
 /// Queue a message for delivery to a target session.
 /// Persists immediately and sets the has_queued flag for in-flight agent loops.
 ///

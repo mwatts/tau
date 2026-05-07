@@ -2888,6 +2888,7 @@ pub(super) async fn handle_client(
                 sandbox_profile,
             } => {
                 let resp = super::task_handlers::handle_task_create(
+                    &state,
                     &project,
                     &title,
                     parent_id,
@@ -2909,6 +2910,7 @@ pub(super) async fn handle_client(
                 sandbox_profile,
             } => {
                 let resp = super::task_handlers::handle_task_update(
+                    &state,
                     id,
                     new_state,
                     title,

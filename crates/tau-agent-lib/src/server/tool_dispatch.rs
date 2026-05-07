@@ -744,6 +744,7 @@ pub(super) async fn handle_server_request(
             tags,
             sandbox_profile,
         } => super::task_handlers::handle_task_create(
+            state,
             project,
             title,
             *parent_id,
@@ -762,6 +763,7 @@ pub(super) async fn handle_server_request(
             require_approval,
             sandbox_profile,
         } => super::task_handlers::handle_task_update(
+            state,
             *id,
             new_state.clone(),
             title.clone(),
