@@ -128,6 +128,106 @@ impl SessionEvent {
 }
 
 // ---------------------------------------------------------------------------
+// TaskEvent
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskEvent {
+    Created { title: String, project: Option<String>, priority: i64, tags: Vec<String> },
+    Updated { fields: serde_json::Value },
+    Assigned { session_id: String, agent_name: Option<String> },
+    Dispatched { session_id: String },
+    ProgressNote { note: String },
+    Completed { result: Option<String> },
+    Failed { error: String },
+    Blocked { reason: String },
+    Unblocked,
+    Cancelled { reason: Option<String> },
+}
+
+// ---------------------------------------------------------------------------
+// TaskEnvelope type alias
+// ---------------------------------------------------------------------------
+
+pub type TaskEnvelope = StreamEnvelope<TaskEvent>;
+
+// ---------------------------------------------------------------------------
+// TaskEvent helpers
+// ---------------------------------------------------------------------------
+
+impl TaskEvent {
+    #[must_use]
+    pub fn wrap(self, source: impl Into<String>) -> TaskEnvelope {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        StreamEnvelope {
+            v: 1,
+            ts,
+            source: source.into(),
+            event: self,
+        }
+    }
+
+    #[must_use]
+    pub fn to_ndjson_bytes(&self, source: impl Into<String>) -> Vec<u8> {
+        let envelope = self.clone().wrap(source);
+        serde_json::to_vec(&envelope).expect("TaskEnvelope serialization is infallible")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SystemEvent
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SystemEvent {
+    DaemonStarted { version: String, pid: u32 },
+    DaemonShutdown { reason: String },
+    AgentStarted { agent_name: String, session_id: String },
+    AgentStopped { agent_name: String, reason: String },
+    ScheduleFired { schedule_id: String, session_id: String },
+    SessionCreated { session_id: String, stream_id: String },
+    SessionClosed { session_id: String, reason: String },
+    Error { context: String, message: String },
+}
+
+// ---------------------------------------------------------------------------
+// SystemEnvelope type alias
+// ---------------------------------------------------------------------------
+
+pub type SystemEnvelope = StreamEnvelope<SystemEvent>;
+
+// ---------------------------------------------------------------------------
+// SystemEvent helpers
+// ---------------------------------------------------------------------------
+
+impl SystemEvent {
+    #[must_use]
+    pub fn wrap(self, source: impl Into<String>) -> SystemEnvelope {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        StreamEnvelope {
+            v: 1,
+            ts,
+            source: source.into(),
+            event: self,
+        }
+    }
+
+    #[must_use]
+    pub fn to_ndjson_bytes(&self, source: impl Into<String>) -> Vec<u8> {
+        let envelope = self.clone().wrap(source);
+        serde_json::to_vec(&envelope).expect("SystemEnvelope serialization is infallible")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -245,6 +345,97 @@ mod tests {
                 assert!(is_error);
             }
             other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Round-trip all `TaskEvent` variants through JSON.
+    #[test]
+    fn task_events_roundtrip() {
+        let events: Vec<TaskEvent> = vec![
+            TaskEvent::Created {
+                title: "Fix bug".to_string(),
+                project: Some("tau".to_string()),
+                priority: 1,
+                tags: vec!["bug".to_string()],
+            },
+            TaskEvent::Updated {
+                fields: serde_json::json!({"priority": 2}),
+            },
+            TaskEvent::Assigned {
+                session_id: "sess_001".to_string(),
+                agent_name: Some("worker".to_string()),
+            },
+            TaskEvent::Dispatched {
+                session_id: "sess_001".to_string(),
+            },
+            TaskEvent::ProgressNote {
+                note: "halfway done".to_string(),
+            },
+            TaskEvent::Completed {
+                result: Some("success".to_string()),
+            },
+            TaskEvent::Failed {
+                error: "timeout".to_string(),
+            },
+            TaskEvent::Blocked {
+                reason: "waiting on upstream".to_string(),
+            },
+            TaskEvent::Unblocked,
+            TaskEvent::Cancelled {
+                reason: Some("no longer needed".to_string()),
+            },
+        ];
+
+        for event in &events {
+            let json = serde_json::to_string(event).expect("serialize");
+            let decoded: TaskEvent = serde_json::from_str(&json).expect("deserialize");
+            let rejson = serde_json::to_string(&decoded).expect("re-serialize");
+            assert_eq!(json, rejson, "task event did not round-trip cleanly");
+        }
+    }
+
+    /// Round-trip all `SystemEvent` variants through JSON.
+    #[test]
+    fn system_events_roundtrip() {
+        let events: Vec<SystemEvent> = vec![
+            SystemEvent::DaemonStarted {
+                version: "0.1.0".to_string(),
+                pid: 12345,
+            },
+            SystemEvent::DaemonShutdown {
+                reason: "SIGTERM".to_string(),
+            },
+            SystemEvent::AgentStarted {
+                agent_name: "worker".to_string(),
+                session_id: "sess_001".to_string(),
+            },
+            SystemEvent::AgentStopped {
+                agent_name: "worker".to_string(),
+                reason: "completed".to_string(),
+            },
+            SystemEvent::ScheduleFired {
+                schedule_id: "sched_001".to_string(),
+                session_id: "sess_002".to_string(),
+            },
+            SystemEvent::SessionCreated {
+                session_id: "sess_003".to_string(),
+                stream_id: "stream_abc".to_string(),
+            },
+            SystemEvent::SessionClosed {
+                session_id: "sess_003".to_string(),
+                reason: "user disconnected".to_string(),
+            },
+            SystemEvent::Error {
+                context: "agent_manager".to_string(),
+                message: "spawn failed".to_string(),
+            },
+        ];
+
+        for event in &events {
+            let json = serde_json::to_string(event).expect("serialize");
+            let decoded: SystemEvent = serde_json::from_str(&json).expect("deserialize");
+            let rejson = serde_json::to_string(&decoded).expect("re-serialize");
+            assert_eq!(json, rejson, "system event did not round-trip cleanly");
         }
     }
 }
