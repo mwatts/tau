@@ -698,6 +698,13 @@ pub async fn run() -> crate::Result<()> {
     crate::prompt_optimizer::register(&bg).await;
     crate::prompt_promoter::register(&bg).await;
     bg.run_startup().await;
+    notifications::emit_system_event(
+        &state,
+        crate::stream_events::SystemEvent::DaemonStarted {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+        },
+    );
 
     // Install signal-driven graceful shutdown.  SIGTERM (e.g. systemd
     // stop) and SIGHUP (parent shell closed) request the same drain path
@@ -837,6 +844,13 @@ pub async fn run() -> crate::Result<()> {
             "shutdown timeout: requests still in flight, exiting anyway"
         );
     }
+
+    notifications::emit_system_event(
+        &state,
+        crate::stream_events::SystemEvent::DaemonShutdown {
+            reason: "server stopping".to_string(),
+        },
+    );
 
     // Persist idle phase for all sessions so a clean shutdown starts from
     // a clean slate.  Only crashes leave non-idle persisted phases.

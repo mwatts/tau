@@ -93,6 +93,33 @@ pub(super) fn notify_stream_hub(state: &SharedState, session_id: &str, data: &[u
     }
 }
 
+/// Emit a system-level event to the daemon's system stream.
+///
+/// Creates the system stream on first call (idempotent). No-op if streams
+/// are not configured.
+pub(super) fn emit_system_event(state: &SharedState, event: crate::stream_events::SystemEvent) {
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else { return };
+    let daemon_id = format!("daemon-{}", std::process::id());
+    let stream_id = tau_streams::StreamId(format!("system-{daemon_id}"));
+    let _ = ds.create(&stream_id, {
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("type".to_string(), "system".to_string());
+        tags.insert("daemon_id".to_string(), daemon_id.clone());
+        Some(tags)
+    });
+    let data = event.to_ndjson_bytes(&daemon_id);
+    let req = tau_streams::AppendRequest {
+        data,
+        producer_id: Some(tau_streams::ProducerId(daemon_id)),
+        epoch: None,
+        seq: None,
+    };
+    if let Err(e) = ds.append(&stream_id, req) {
+        tracing::warn!(%e, "failed to emit system event");
+    }
+}
+
 /// Queue a message for delivery to a target session.
 /// Persists immediately and sets the has_queued flag for in-flight agent loops.
 ///
