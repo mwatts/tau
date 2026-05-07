@@ -3,6 +3,7 @@ use axum::response::IntoResponse;
 use axum::{Router, http};
 use rust_embed::Embed;
 use std::sync::Arc;
+use tau_streams::{DurableStream, SqliteStore};
 
 #[derive(Embed)]
 #[folder = "assets/"]
@@ -11,6 +12,7 @@ struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     pub token: String,
+    pub streams: Option<Arc<DurableStream<SqliteStore>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -18,13 +20,15 @@ pub struct TokenQuery {
     token: Option<String>,
 }
 
-pub fn build_router(token: String) -> Router {
-    let state = Arc::new(AppState { token });
-    Router::new()
+pub fn build_router(token: String, streams: Option<Arc<DurableStream<SqliteStore>>>) -> Router {
+    let state = Arc::new(AppState { token, streams });
+    let mut router = Router::new()
         .route("/health", axum::routing::get(health))
         .route("/ws", axum::routing::get(ws_handler))
-        .fallback(static_handler)
-        .with_state(state)
+        .fallback(static_handler);
+
+    router = router.merge(crate::streams::stream_routes());
+    router.with_state(state)
 }
 
 async fn health() -> &'static str {

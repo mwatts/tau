@@ -1,7 +1,7 @@
-mod routes;
-mod ws_bridge;
+use tau_agent_web::routes;
 
 use clap::Parser;
+use std::sync::Arc;
 use std::net::SocketAddr;
 
 #[derive(Parser)]
@@ -11,6 +11,9 @@ struct Args {
     bind: String,
     #[arg(long, default_value = "8080")]
     port: u16,
+    /// Path to SQLite database for durable streams. If omitted, streams are disabled.
+    #[arg(long)]
+    streams_db: Option<String>,
 }
 
 fn generate_token() -> String {
@@ -37,11 +40,28 @@ async fn main() {
         eprintln!("warning: could not write auth token: {}", e);
     }
 
+    let streams = if let Some(ref path) = args.streams_db {
+        match tau_streams::SqliteStore::open(path) {
+            Ok(store) => {
+                let hub = Arc::new(tau_streams::LiveDeliveryHub::default());
+                let ds = Arc::new(tau_streams::DurableStream::new(store, hub));
+                eprintln!("streams db: {}", path);
+                Some(ds)
+            }
+            Err(e) => {
+                eprintln!("warning: could not open streams db '{}': {}", path, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port)
         .parse()
         .expect("invalid bind address");
 
-    let app = routes::build_router(token.clone());
+    let app = routes::build_router(token.clone(), streams);
 
     eprintln!("tau web UI: http://{}:{}", args.bind, args.port);
     eprintln!("auth token: {}", token);
