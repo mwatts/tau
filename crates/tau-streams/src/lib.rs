@@ -5,14 +5,21 @@
 //! - Exactly-once producer semantics (dedup + epoch fencing)
 //! - Stream lifecycle management (open → closed → deleted)
 //! - Tag-based stream discovery
+//! - Real-time live delivery via [`LiveDeliveryHub`]
+//! - Catch-up + live consumer via [`consumer::StreamConsumer`]
 
+pub mod consumer;
+pub mod durable_stream;
 pub mod error;
+pub mod hub;
 pub mod offset;
 pub mod sqlite_store;
 pub mod store;
 pub mod types;
 
+pub use durable_stream::DurableStream;
 pub use error::{Result, StreamError};
+pub use hub::{LiveDeliveryHub, LiveEvent};
 pub use offset::OffsetGenerator;
 pub use sqlite_store::SqliteStore;
 pub use store::StreamStore;
