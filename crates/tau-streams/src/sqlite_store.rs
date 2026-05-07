@@ -81,6 +81,8 @@ impl SqliteStore {
                 state        TEXT NOT NULL DEFAULT 'open',
                 created_at   INTEGER NOT NULL,
                 closed_at    INTEGER,
+                ttl_seconds  INTEGER,
+                expires_at   INTEGER,
                 tags_json    TEXT NOT NULL DEFAULT '{}'
             );
 
@@ -129,6 +131,8 @@ fn row_to_meta(
     state_str: &str,
     created_at: i64,
     closed_at: Option<i64>,
+    ttl_seconds: Option<i64>,
+    expires_at: Option<i64>,
     tags_json: &str,
 ) -> rusqlite::Result<StreamMeta> {
     let content_type = ContentType::from_mime(content_type_str);
@@ -150,8 +154,11 @@ fn row_to_meta(
         state,
         created_at,
         closed_at,
-        ttl: None,
-        expires_at: None,
+        ttl: ttl_seconds.map(|s| {
+            #[expect(clippy::cast_sign_loss, reason = "TTL is always positive")]
+            std::time::Duration::from_secs(s as u64)
+        }),
+        expires_at,
         tags,
     })
 }
@@ -180,8 +187,8 @@ impl StreamStore for SqliteStore {
         drop(conn);
 
         if rows_changed == 0 {
-            // Row already existed.
-            return Err(StreamError::AlreadyExists(id.clone()));
+            // Idempotent: return existing metadata.
+            return self.head(id);
         }
 
         Ok(StreamMeta {
@@ -408,20 +415,20 @@ impl StreamStore for SqliteStore {
     fn head(&self, id: &StreamId) -> Result<StreamMeta> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
-        let row: Option<(String, String, String, i64, Option<i64>, String)> = conn
+        let row: Option<(String, String, String, i64, Option<i64>, Option<i64>, Option<i64>, String)> = conn
             .query_row(
-                "SELECT id, content_type, state, created_at, closed_at, tags_json
+                "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json
                  FROM streams WHERE id = ?1",
                 params![id.0],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
             )
             .optional()?;
         drop(conn);
 
-        let (sid, ct, state, created, closed, tags_json) =
+        let (sid, ct, state, created, closed, ttl_secs, expires, tags_json) =
             row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
 
-        row_to_meta(sid, &ct, &state, created, closed, &tags_json).map_err(StreamError::Storage)
+        row_to_meta(sid, &ct, &state, created, closed, ttl_secs, expires, &tags_json).map_err(StreamError::Storage)
     }
 
     fn close(&self, id: &StreamId) -> Result<StreamMeta> {
@@ -449,15 +456,15 @@ impl StreamStore for SqliteStore {
             params![now, id.0],
         )?;
 
-        let row: (String, String, String, i64, Option<i64>, String) = conn.query_row(
-            "SELECT id, content_type, state, created_at, closed_at, tags_json
+        let row: (String, String, String, i64, Option<i64>, Option<i64>, Option<i64>, String) = conn.query_row(
+            "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json
              FROM streams WHERE id = ?1",
             params![id.0],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         )?;
         drop(conn);
 
-        row_to_meta(row.0, &row.1, &row.2, row.3, row.4, &row.5).map_err(StreamError::Storage)
+        row_to_meta(row.0, &row.1, &row.2, row.3, row.4, row.5, row.6, &row.7).map_err(StreamError::Storage)
     }
 
     fn delete(&self, id: &StreamId) -> Result<()> {
@@ -491,30 +498,28 @@ impl StreamStore for SqliteStore {
     }
 
     fn list(&self, tag_filter: Option<(&str, &str)>) -> Result<Vec<StreamMeta>> {
-        type Row = (String, String, String, i64, Option<i64>, String);
+        type Row = (String, String, String, i64, Option<i64>, Option<i64>, Option<i64>, String);
 
         let conn = self.conn.lock().expect("mutex poisoned");
 
         let metas: Vec<Row> = if let Some((key, value)) = tag_filter {
-            // Use a LIKE filter on the JSON column.  This is a simple substring
-            // search; for exact semantics use json_extract in SQLite ≥ 3.38.
             let pattern = format!("%\"{key}\":\"{value}\"%");
             let mut stmt = conn.prepare(
-                "SELECT id, content_type, state, created_at, closed_at, tags_json
+                "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json
                  FROM streams
                  WHERE state != 'deleted' AND tags_json LIKE ?1",
             )?;
             stmt.query_map(params![pattern], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, content_type, state, created_at, closed_at, tags_json
+                "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json
                  FROM streams WHERE state != 'deleted'",
             )?;
             stmt.query_map(params![], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
             })?
             .collect::<rusqlite::Result<Vec<Row>>>()?
         };
@@ -522,8 +527,8 @@ impl StreamStore for SqliteStore {
 
         metas
             .into_iter()
-            .map(|(sid, ct, state, created, closed, tags_json)| {
-                row_to_meta(sid, &ct, &state, created, closed, &tags_json)
+            .map(|(sid, ct, state, created, closed, ttl_secs, expires, tags_json)| {
+                row_to_meta(sid, &ct, &state, created, closed, ttl_secs, expires, &tags_json)
                     .map_err(StreamError::Storage)
             })
             .collect()
@@ -576,15 +581,13 @@ mod tests {
     }
 
     #[test]
-    fn create_is_idempotent_returns_error() {
+    fn create_is_idempotent() {
         let s = store();
         let id = stream_id("dup");
-        s.create(&id, None).expect("first create");
-        let err = s.create(&id, None).expect_err("second create should fail");
-        assert!(
-            matches!(err, StreamError::AlreadyExists(_)),
-            "unexpected error: {err}"
-        );
+        let meta1 = s.create(&id, None).expect("first create");
+        let meta2 = s.create(&id, None).expect("second create should succeed");
+        assert_eq!(meta1.id, meta2.id);
+        assert_eq!(meta2.state, StreamState::Open);
     }
 
     #[test]

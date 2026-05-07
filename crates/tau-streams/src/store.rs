@@ -14,10 +14,8 @@ use crate::{
 pub trait StreamStore {
     /// Creates a new stream with the given id and optional metadata tags.
     ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::StreamError::AlreadyExists`] if a stream with
-    /// the same id already exists.
+    /// Idempotent: if a stream with the same id already exists, returns its
+    /// current metadata without error.
     fn create(
         &self,
         id: &StreamId,
