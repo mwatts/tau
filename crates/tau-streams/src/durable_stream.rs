@@ -125,6 +125,23 @@ impl<S: StreamStore> DurableStream<S> {
     pub fn list(&self, tag_filter: Option<(&str, &str)>) -> Result<Vec<StreamMeta>> {
         self.store.list(tag_filter)
     }
+
+    /// Creates a new stream by copying events from `source` up to and
+    /// including `up_to` offset into `dest`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from the underlying store, including
+    /// [`crate::error::StreamError::NotFound`] if the source stream does not exist.
+    pub fn fork(
+        &self,
+        source: &StreamId,
+        up_to: &Offset,
+        dest: &StreamId,
+        tags: Option<HashMap<String, String>>,
+    ) -> Result<StreamMeta> {
+        self.store.fork(source, up_to, dest, tags)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -75,4 +75,21 @@ pub trait StreamStore {
     ///
     /// Returns a storage error if the underlying query fails.
     fn list(&self, tag_filter: Option<(&str, &str)>) -> Result<Vec<StreamMeta>>;
+
+    /// Creates a new stream by copying events from `source` up to and
+    /// including `up_to` offset into `dest`.
+    ///
+    /// The destination stream is created with `tags` if provided.
+    /// Events are re-appended with fresh offsets in the destination.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::StreamError::NotFound`] — source stream does not exist.
+    fn fork(
+        &self,
+        source: &StreamId,
+        up_to: &Offset,
+        dest: &StreamId,
+        tags: Option<HashMap<String, String>>,
+    ) -> Result<StreamMeta>;
 }

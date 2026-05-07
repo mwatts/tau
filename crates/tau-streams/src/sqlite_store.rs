@@ -533,6 +533,34 @@ impl StreamStore for SqliteStore {
             })
             .collect()
     }
+
+    fn fork(
+        &self,
+        source: &StreamId,
+        up_to: &Offset,
+        dest: &StreamId,
+        tags: Option<HashMap<String, String>>,
+    ) -> Result<StreamMeta> {
+        // Verify the source exists by calling head — returns NotFound if absent.
+        self.head(source)?;
+        self.create(dest, tags)?;
+        let read = self.read(source, &Offset::beginning(), usize::MAX)?;
+        for event in read.events {
+            if event.offset > *up_to {
+                break;
+            }
+            self.append(
+                dest,
+                AppendRequest {
+                    data: event.data,
+                    producer_id: None,
+                    epoch: None,
+                    seq: None,
+                },
+            )?;
+        }
+        self.head(dest)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -797,5 +825,55 @@ mod tests {
         let all = s.list(None).expect("list");
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, stream_id("keep"));
+    }
+
+    #[test]
+    fn fork_copies_events_up_to_offset() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let src = StreamId("src".to_owned());
+        store.create(&src, None).expect("create src");
+
+        let r1 = store.append(&src, AppendRequest {
+            data: b"event-1".to_vec(), producer_id: None, epoch: None, seq: None,
+        }).expect("append 1");
+        let r2 = store.append(&src, AppendRequest {
+            data: b"event-2".to_vec(), producer_id: None, epoch: None, seq: None,
+        }).expect("append 2");
+        let _r3 = store.append(&src, AppendRequest {
+            data: b"event-3".to_vec(), producer_id: None, epoch: None, seq: None,
+        }).expect("append 3");
+
+        let dest = StreamId("fork-dest".to_owned());
+        let meta = store.fork(&src, &r2.offset, &dest, None).expect("fork");
+        assert_eq!(meta.id.0, "fork-dest");
+
+        let read = store.read(&dest, &Offset::beginning(), 100).expect("read fork");
+        assert_eq!(read.events.len(), 2, "fork should have 2 events (up to r2)");
+        assert_eq!(read.events[0].data, b"event-1");
+        assert_eq!(read.events[1].data, b"event-2");
+
+        // Suppress unused warning
+        let _ = r1;
+    }
+
+    #[test]
+    fn fork_nonexistent_source_errors() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let src = StreamId("nope".to_owned());
+        let dest = StreamId("fork-dest".to_owned());
+        let result = store.fork(&src, &Offset::beginning(), &dest, None);
+        assert!(result.is_err(), "fork of nonexistent source should fail");
+    }
+
+    #[test]
+    fn fork_empty_source_creates_empty_dest() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let src = StreamId("empty-src".to_owned());
+        store.create(&src, None).expect("create");
+        let dest = StreamId("fork-empty".to_owned());
+        let meta = store.fork(&src, &Offset::now(), &dest, None).expect("fork");
+        assert_eq!(meta.id.0, "fork-empty");
+        let read = store.read(&dest, &Offset::beginning(), 100).expect("read");
+        assert_eq!(read.events.len(), 0);
     }
 }
