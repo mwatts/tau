@@ -228,6 +228,53 @@ impl SystemEvent {
 }
 
 // ---------------------------------------------------------------------------
+// CoordinationEvent
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CoordinationEvent {
+    MemberJoined { session_id: String, role: Option<String> },
+    MemberLeft { session_id: String },
+    Proposal { proposal_id: String, content: serde_json::Value },
+    Vote { proposal_id: String, session_id: String, approved: bool },
+    Decision { proposal_id: String, outcome: String },
+    Broadcast { content: String, sender: String },
+}
+
+// ---------------------------------------------------------------------------
+// CoordinationEnvelope type alias
+// ---------------------------------------------------------------------------
+
+pub type CoordinationEnvelope = StreamEnvelope<CoordinationEvent>;
+
+// ---------------------------------------------------------------------------
+// CoordinationEvent helpers
+// ---------------------------------------------------------------------------
+
+impl CoordinationEvent {
+    #[must_use]
+    pub fn wrap(self, source: impl Into<String>) -> CoordinationEnvelope {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        StreamEnvelope {
+            v: 1,
+            ts,
+            source: source.into(),
+            event: self,
+        }
+    }
+
+    #[must_use]
+    pub fn to_ndjson_bytes(&self, source: impl Into<String>) -> Vec<u8> {
+        let envelope = self.clone().wrap(source);
+        serde_json::to_vec(&envelope).expect("CoordinationEnvelope serialization is infallible")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -436,6 +483,24 @@ mod tests {
             let decoded: SystemEvent = serde_json::from_str(&json).expect("deserialize");
             let rejson = serde_json::to_string(&decoded).expect("re-serialize");
             assert_eq!(json, rejson, "system event did not round-trip cleanly");
+        }
+    }
+
+    #[test]
+    fn coordination_events_roundtrip() {
+        let events: Vec<CoordinationEvent> = vec![
+            CoordinationEvent::MemberJoined { session_id: "s1".into(), role: Some("worker".into()) },
+            CoordinationEvent::MemberLeft { session_id: "s1".into() },
+            CoordinationEvent::Proposal { proposal_id: "p1".into(), content: serde_json::json!({"action": "merge"}) },
+            CoordinationEvent::Vote { proposal_id: "p1".into(), session_id: "s1".into(), approved: true },
+            CoordinationEvent::Decision { proposal_id: "p1".into(), outcome: "approved".into() },
+            CoordinationEvent::Broadcast { content: "sync point".into(), sender: "supervisor".into() },
+        ];
+        for event in &events {
+            let json = serde_json::to_string(event).expect("serialize");
+            let decoded: CoordinationEvent = serde_json::from_str(&json).expect("deserialize");
+            let rejson = serde_json::to_string(&decoded).expect("re-serialize");
+            assert_eq!(json, rejson);
         }
     }
 }
