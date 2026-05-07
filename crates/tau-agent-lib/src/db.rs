@@ -395,6 +395,28 @@ impl Db {
             );",
         );
 
+        // Session index: fast lookup + cross-session discovery for durable streams.
+        // session_id is a FK-equivalent to sessions.id; stream_id follows the
+        // convention "session-{id}" used by the stream migration layer.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_index (
+                session_id    TEXT PRIMARY KEY,
+                stream_id     TEXT NOT NULL,
+                parent_id     TEXT,
+                successor_id  TEXT,
+                agent_id      TEXT,
+                is_agent      INTEGER NOT NULL DEFAULT 0,
+                model         TEXT,
+                system_prompt TEXT,
+                cwd           TEXT,
+                project_name  TEXT,
+                tagline       TEXT,
+                archived      INTEGER NOT NULL DEFAULT 0,
+                created_at    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_index_stream ON session_index(stream_id);",
+        );
+
         Ok(Self { conn })
     }
 
@@ -2258,6 +2280,48 @@ impl Db {
             )
             .map_err(db_err("revert optimization"))?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // session_index helpers
+    // -----------------------------------------------------------------------
+
+    /// Backfill the `session_index` table from the `sessions` table.
+    ///
+    /// Each session that does not yet have a row in `session_index` gets one
+    /// inserted.  Rows that already exist are left untouched (`INSERT OR IGNORE`).
+    ///
+    /// The `stream_id` for each session is derived as `"session-" || id`,
+    /// matching the naming convention used by the stream migration layer.
+    ///
+    /// Returns the number of rows that were inserted.
+    pub fn migrate_sessions_to_index(&self) -> crate::Result<usize> {
+        let rows_inserted = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO session_index (
+                    session_id, stream_id, parent_id, successor_id,
+                    is_agent, model, system_prompt, cwd,
+                    project_name, tagline, archived, created_at
+                )
+                SELECT
+                    id,
+                    'session-' || id,
+                    parent_id,
+                    successor_id,
+                    COALESCE(is_agent, 0),
+                    json_extract(model_json, '$.id'),
+                    system_prompt,
+                    cwd,
+                    project_name,
+                    tagline,
+                    COALESCE(archived, 0),
+                    created_at
+                FROM sessions",
+                [],
+            )
+            .map_err(db_err("migrate_sessions_to_index"))?;
+        Ok(rows_inserted)
     }
 }
 
