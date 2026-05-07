@@ -14,6 +14,7 @@ readme = "README.md"
 
 [dependencies]
 tau-agent-base.workspace = true
+tau-streams.workspace = true
 tau-agent-client.workspace = true
 tau-agent-engine.workspace = true
 tau-agent-plugin.workspace = true
