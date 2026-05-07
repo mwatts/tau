@@ -69,7 +69,7 @@ Gemini CLI) as an alternative to tau's built-in worker.
 - [ ] Claude Code integration (subprocess, stdin/stdout protocol)
 - [ ] Codex CLI integration
 - [ ] Gemini CLI integration
-- [ ] Task assignment: manual (`/task assign --agent claude-code`) or rule-based
+- [x] Task assignment: manual (`/task assign --agent <name>`) with agent lookup/start, plus rule-based auto-assignment via `assignment_rules` on agents
 - [ ] Output capture: external agent results flow back into tau's session history
 - [ ] Merge queue integration: external agent work in worktrees, same merge flow
 
@@ -78,12 +78,12 @@ Gemini CLI) as an alternative to tau's built-in worker.
 Evolve the task system to support ambient/background agents and parallel
 orchestration beyond the current serial dispatch model.
 
-- [ ] Background agents: long-running agents that monitor and react (CI watcher, PR reviewer, dependency updater)
-- [ ] Agent-to-agent messaging: sessions can send structured messages to other sessions (already partially implemented via `QueueMessage`)
-- [ ] Parallel task execution: dispatch N tasks simultaneously across N worktrees with resource-aware scheduling
-- [ ] Task dependencies: DAG-based task ordering (task B blocked on task A)
-- [ ] Budget and cost tracking: per-task and per-session token/cost accounting with configurable limits
-- [ ] Supervisor agent: meta-agent that breaks specs into tasks, assigns to workers, reviews results, manages the merge queue
+- [x] Background agents (partial): persistent agent manager (`agent_manager.rs`), agents table with CRUD, CLI `tau agent list/create/delete/pause/resume/start`, `BgJob`-based lifecycle. Reactive/event-driven triggers not yet implemented.
+- [x] Agent-to-agent messaging: `QueueMessage` protocol with `target_session_id`, `content`, `await_reply` + blocking await with timeout
+- [x] Parallel task execution (partial): file-conflict-aware scheduler dispatches disjoint tasks concurrently via independent worktrees. No explicit N-way fan-out.
+- [x] Task dependencies: DAG-based ordering with `depends_on`/`blocks`/`related` relation types, BFS cycle detection, dependency_status enrichment on task responses
+- [x] Budget and cost tracking: per-session `cost`/`child_budget`, per-task `budget_usd`/`spent_usd`, recursive budget computation, budget enforcement in scheduler
+- [x] Supervisor agent (partial): `tau supervise` CLI command with hardcoded supervisor prompt, `task_decompose` tool for spec decomposition into DAG. No autonomous review/merge-queue management.
 
 ### Phase 6: Developer Experience (ongoing)
 
@@ -91,7 +91,7 @@ orchestration beyond the current serial dispatch model.
 - [ ] Remote mode: `tau serve --ssh` (tau as an SSH-accessible agent server)
 - [ ] Session templates: pre-configured system prompts + tool sets for common workflows
 - [ ] Conversation export: markdown/JSON export of session transcripts
-- [ ] Web UI: optional browser-based client alongside the TUI (via WebSocket to the existing daemon)
+- [x] Web UI (scaffold): `tau-agent-web` crate with axum, `tau serve` CLI command, WebSocket-to-Unix-socket bridge, static assets. Not feature-complete.
 - [ ] Computer-use tool: screenshot + click automation for GUI testing workflows
 - [ ] Windows support: replace Unix socket with named pipes, gate nix-specific code
 
@@ -124,7 +124,7 @@ its own skills autonomously over time without GPU training.
 | Sandbox backends | 7 backends (local, Docker, SSH, Modal, Daytona, Vercel, Singularity) | `sandbox.toml` prefix (Docker, SSH) |
 | Platform adapters | 21 messaging platforms (Telegram, Discord, Slack, WhatsApp, etc.) | TUI + Unix socket only |
 | Smart approval | LLM-assessed risk: auto-approve low-risk, escalate uncertain, deny dangerous | ~~User permission mode only~~ Done — static risk gate blocks dangerous ops |
-| Web UI | Ships with web mode | Planned (Phase 6) |
+| Web UI | Ships with web mode | Scaffold only (Phase 6) — `tau serve` + WS bridge, not feature-complete |
 | Provider breadth | 200+ via OpenRouter + custom endpoints | ~~Anthropic native + OpenAI-compat~~ Done — OpenRouter + Bedrock + OpenAI-compat |
 
 ### Now Comparable (previously Hermes-only)

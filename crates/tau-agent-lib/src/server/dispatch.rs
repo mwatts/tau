@@ -2933,8 +2933,13 @@ pub(super) async fn handle_client(
                 );
                 send(&mut writer, &resp).await?;
             }
-            crate::protocol::Request::TaskAssign { id, session_id } => {
-                let resp = super::task_handlers::handle_task_assign(id, &session_id);
+            crate::protocol::Request::TaskAssign {
+                id,
+                session_id,
+                agent_name,
+            } => {
+                let resp =
+                    super::task_handlers::handle_task_assign(id, session_id.as_deref(), agent_name.as_deref(), Some(&state));
                 send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::TaskStatus { project } => {
@@ -3008,6 +3013,7 @@ pub(super) async fn handle_client(
             crate::protocol::Request::CreateAgent {
                 name, prompt, model, trigger_type, trigger_config,
                 system_prompt, project_name, budget_usd,
+                assignment_rules, max_concurrent_tasks,
             } => {
                 let resp = {
                     let st = lock_state(&state);
@@ -3015,6 +3021,7 @@ pub(super) async fn handle_client(
                         &name, &prompt, model.as_deref(), &trigger_type,
                         trigger_config.as_deref(), system_prompt.as_deref(),
                         project_name.as_deref(), budget_usd,
+                        assignment_rules.as_deref(), max_concurrent_tasks,
                     ) {
                         Ok(id) => Response::AgentCreated { id },
                         Err(e) => Response::Error { message: format!("{}", e) },
@@ -3544,6 +3551,7 @@ mod tests {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: project.map(str::to_string),
+                is_agent: false,
                 successor_id: None,
             })
             .expect("create session");

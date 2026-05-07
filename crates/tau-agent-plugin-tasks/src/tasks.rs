@@ -352,7 +352,11 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Session ID to assign to (defaults to current session)"
+                        "description": "Session ID to assign to (defaults to current session). Mutually exclusive with agent_name."
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "description": "Name of an agent to assign the task to (looks up or starts the agent's session). Mutually exclusive with session_id."
                     }
                 },
                 "required": ["id"]
@@ -361,6 +365,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Task must be in 'ready' or 'interactive' state to be assigned".into(),
                 "If session_id is omitted, the current session is used".into(),
+                "Use agent_name to assign to a named background agent instead of a session".into(),
             ],
         },
         PluginToolDef {
@@ -1339,6 +1344,55 @@ fn create_interactive_session(
     Some(new_sid)
 }
 
+fn resolve_agent_session(
+    name: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Result<String, String> {
+    let resp = crate::tasks_scheduler::server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::ListAgents,
+    )
+    .map_err(|e| format!("list agents: {}", e))?;
+
+    let agents = match resp {
+        tau_agent_plugin::Response::Agents { agents } => agents,
+        tau_agent_plugin::Response::Error { message } => {
+            return Err(format!("list agents: {}", message));
+        }
+        _ => return Err("unexpected response to ListAgents".into()),
+    };
+
+    let agent = agents
+        .iter()
+        .find(|a| a.name == name)
+        .ok_or_else(|| format!("agent '{}' not found", name))?;
+
+    if !agent.enabled {
+        return Err(format!("agent '{}' is paused", name));
+    }
+
+    if let Some(ref sid) = agent.session_id {
+        return Ok(sid.clone());
+    }
+
+    let start_resp = crate::tasks_scheduler::server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::StartAgent { id: agent.id },
+    )
+    .map_err(|e| format!("start agent: {}", e))?;
+
+    match start_resp {
+        tau_agent_plugin::Response::AgentStarted { session_id } => Ok(session_id),
+        tau_agent_plugin::Response::Error { message } => {
+            Err(format!("start agent '{}': {}", name, message))
+        }
+        _ => Err("unexpected response to StartAgent".into()),
+    }
+}
+
 fn handle_task_assign(
     db: &TasksDb,
     args: &serde_json::Value,
@@ -1352,10 +1406,26 @@ fn handle_task_assign(
         None => return tool_err(tool_call_id, "id is required"),
     };
 
-    // Use explicit session_id from args, or fall back to context session_id
-    let sid = args
-        .get("session_id")
-        .and_then(|v| v.as_str())
+    let agent_name = args.get("agent_name").and_then(|v| v.as_str());
+    let explicit_sid = args.get("session_id").and_then(|v| v.as_str());
+
+    if agent_name.is_some() && explicit_sid.is_some() {
+        return tool_err(tool_call_id, "session_id and agent_name are mutually exclusive");
+    }
+
+    let resolved_agent_sid: Option<String>;
+    if let Some(name) = agent_name {
+        match resolve_agent_session(name, writer, reader) {
+            Ok(sid) => resolved_agent_sid = Some(sid),
+            Err(msg) => return tool_err(tool_call_id, &msg),
+        }
+    } else {
+        resolved_agent_sid = None;
+    }
+
+    let sid = resolved_agent_sid
+        .as_deref()
+        .or(explicit_sid)
         .or(session_id);
     let sid = match sid {
         Some(s) => s,

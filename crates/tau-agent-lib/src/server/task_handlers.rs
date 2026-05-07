@@ -339,12 +339,79 @@ pub fn handle_task_search(project: &str, query: &str, state_filter: Option<&str>
     }
 }
 
-pub fn handle_task_assign(id: i64, session_id: &str) -> Response {
+pub fn handle_task_assign(
+    id: i64,
+    session_id: Option<&str>,
+    agent_name: Option<&str>,
+    state: Option<&SharedState>,
+) -> Response {
+    if session_id.is_some() && agent_name.is_some() {
+        return Response::Error {
+            message: "session_id and agent_name are mutually exclusive".to_string(),
+        };
+    }
+
+    let resolved_session_id: String;
+    if let Some(name) = agent_name {
+        let st = match state {
+            Some(s) => s,
+            None => {
+                return Response::Error {
+                    message: "agent-based assignment requires server state".to_string(),
+                };
+            }
+        };
+        let locked = lock_state(st);
+        let agents = match locked.db.list_agents() {
+            Ok(a) => a,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("list agents: {}", e),
+                };
+            }
+        };
+        let agent = match agents.iter().find(|a| a.name == name) {
+            Some(a) => a.clone(),
+            None => {
+                return Response::Error {
+                    message: format!("agent '{}' not found", name),
+                };
+            }
+        };
+        if !agent.enabled {
+            return Response::Error {
+                message: format!("agent '{}' is paused", name),
+            };
+        }
+        match agent.session_id {
+            Some(ref sid) => {
+                resolved_session_id = sid.clone();
+            }
+            None => {
+                return Response::Error {
+                    message: format!(
+                        "agent '{}' has no active session — start it first with `tau agent start {}`",
+                        name, agent.id
+                    ),
+                };
+            }
+        }
+    } else {
+        match session_id {
+            Some(s) => resolved_session_id = s.to_string(),
+            None => {
+                return Response::Error {
+                    message: "session_id or agent_name is required".to_string(),
+                };
+            }
+        }
+    }
+
     let db = match open_tasks_db() {
         Ok(db) => db,
         Err(resp) => return resp,
     };
-    match db.assign_task(id, session_id) {
+    match db.assign_task(id, &resolved_session_id) {
         Ok(result) => Response::TaskUpdated {
             task: task_to_info(result.task),
         },

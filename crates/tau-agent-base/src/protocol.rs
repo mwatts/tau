@@ -354,8 +354,18 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         state: Option<String>,
     },
-    /// Assign a task to a session.
-    TaskAssign { id: i64, session_id: String },
+    /// Assign a task to a session or agent.
+    TaskAssign {
+        id: i64,
+        /// Session ID to assign to. Mutually exclusive with `agent_name`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Name of a background agent whose session should be used.
+        /// Looks up (or starts) the agent's session. Mutually exclusive
+        /// with `session_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
+    },
     /// Get scheduler status.
     TaskStatus { project: String },
     /// Structured task overview for interactive rendering.
@@ -427,6 +437,11 @@ pub enum Request {
         project_name: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         budget_usd: Option<f64>,
+        /// JSON array of match rules for task assignment; `None` means accept all tasks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assignment_rules: Option<String>,
+        #[serde(default = "default_max_concurrent_tasks")]
+        max_concurrent_tasks: i32,
     },
     /// List all background agents.
     ListAgents,
@@ -802,6 +817,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_concurrent_tasks() -> i32 {
+    1
+}
+
 fn default_state() -> String {
     "idle".into()
 }
@@ -1099,6 +1118,11 @@ pub struct AgentInfo {
     pub budget_usd: Option<f64>,
     pub spent_usd: f64,
     pub created_at: i64,
+    /// JSON array of match rules for task assignment; `None` means accept all tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignment_rules: Option<String>,
+    /// Maximum number of tasks this agent may run concurrently.
+    pub max_concurrent_tasks: i32,
 }
 
 /// Format a token count for display: 1234 → "1.2K", 1234567 → "1.2M".
@@ -1487,7 +1511,8 @@ mod tests {
             },
             Request::TaskAssign {
                 id: 42,
-                session_id: "s1".into(),
+                session_id: Some("s1".into()),
+                agent_name: None,
             },
             Request::TaskStatus {
                 project: "/tmp".into(),

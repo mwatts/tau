@@ -43,6 +43,11 @@ pub struct AgentDef {
     pub enabled: bool,
     #[serde(default)]
     pub budget_usd: Option<f64>,
+    /// JSON array of match rules for task assignment; `None` means accept all tasks.
+    #[serde(default)]
+    pub assignment_rules: Option<String>,
+    #[serde(default = "default_max_concurrent_tasks")]
+    pub max_concurrent_tasks: i32,
 }
 
 fn default_trigger_type() -> String {
@@ -51,6 +56,10 @@ fn default_trigger_type() -> String {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_max_concurrent_tasks() -> i32 {
+    1
 }
 
 /// Load `agents.toml` from the highest-priority config tier available.

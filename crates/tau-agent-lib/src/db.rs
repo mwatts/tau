@@ -332,19 +332,21 @@ impl Db {
         // Background agents: long-running or periodic agent sessions.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agents (
-                id             INTEGER PRIMARY KEY,
-                name           TEXT NOT NULL UNIQUE,
-                prompt         TEXT NOT NULL,
-                model          TEXT,
-                trigger_type   TEXT NOT NULL DEFAULT 'periodic',
-                trigger_config TEXT,
-                system_prompt  TEXT,
-                project_name   TEXT,
-                enabled        INTEGER NOT NULL DEFAULT 1,
-                session_id     TEXT,
-                budget_usd     REAL,
-                spent_usd      REAL NOT NULL DEFAULT 0.0,
-                created_at     INTEGER NOT NULL
+                id                    INTEGER PRIMARY KEY,
+                name                  TEXT NOT NULL UNIQUE,
+                prompt                TEXT NOT NULL,
+                model                 TEXT,
+                trigger_type          TEXT NOT NULL DEFAULT 'periodic',
+                trigger_config        TEXT,
+                system_prompt         TEXT,
+                project_name          TEXT,
+                enabled               INTEGER NOT NULL DEFAULT 1,
+                session_id            TEXT,
+                budget_usd            REAL,
+                spent_usd             REAL NOT NULL DEFAULT 0.0,
+                created_at            INTEGER NOT NULL,
+                assignment_rules      TEXT,
+                max_concurrent_tasks  INTEGER NOT NULL DEFAULT 1
             );",
         );
 
@@ -486,19 +488,21 @@ impl Db {
 
         conn.execute_batch(
             "CREATE TABLE agents (
-                id             INTEGER PRIMARY KEY,
-                name           TEXT NOT NULL UNIQUE,
-                prompt         TEXT NOT NULL,
-                model          TEXT,
-                trigger_type   TEXT NOT NULL DEFAULT 'periodic',
-                trigger_config TEXT,
-                system_prompt  TEXT,
-                project_name   TEXT,
-                enabled        INTEGER NOT NULL DEFAULT 1,
-                session_id     TEXT,
-                budget_usd     REAL,
-                spent_usd      REAL NOT NULL DEFAULT 0.0,
-                created_at     INTEGER NOT NULL
+                id                    INTEGER PRIMARY KEY,
+                name                  TEXT NOT NULL UNIQUE,
+                prompt                TEXT NOT NULL,
+                model                 TEXT,
+                trigger_type          TEXT NOT NULL DEFAULT 'periodic',
+                trigger_config        TEXT,
+                system_prompt         TEXT,
+                project_name          TEXT,
+                enabled               INTEGER NOT NULL DEFAULT 1,
+                session_id            TEXT,
+                budget_usd            REAL,
+                spent_usd             REAL NOT NULL DEFAULT 0.0,
+                created_at            INTEGER NOT NULL,
+                assignment_rules      TEXT,
+                max_concurrent_tasks  INTEGER NOT NULL DEFAULT 1
             );",
         )
         .map_err(db_err("create agents table"))?;
@@ -2003,15 +2007,19 @@ impl Db {
         system_prompt: Option<&str>,
         project_name: Option<&str>,
         budget_usd: Option<f64>,
+        assignment_rules: Option<&str>,
+        max_concurrent_tasks: i32,
     ) -> crate::Result<i64> {
         let now = (crate::types::timestamp_ms() / 1000) as i64;
         self.conn
             .execute(
                 "INSERT INTO agents (name, prompt, model, trigger_type, trigger_config, \
-                 system_prompt, project_name, budget_usd, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 system_prompt, project_name, budget_usd, created_at, \
+                 assignment_rules, max_concurrent_tasks) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![name, prompt, model, trigger_type, trigger_config,
-                                  system_prompt, project_name, budget_usd, now],
+                                  system_prompt, project_name, budget_usd, now,
+                                  assignment_rules, max_concurrent_tasks],
             )
             .map_err(db_err("insert agent"))?;
         Ok(self.conn.last_insert_rowid())
@@ -2023,7 +2031,7 @@ impl Db {
             .prepare(
                 "SELECT id, name, prompt, model, trigger_type, trigger_config, \
                  system_prompt, project_name, enabled, session_id, budget_usd, \
-                 spent_usd, created_at \
+                 spent_usd, created_at, assignment_rules, max_concurrent_tasks \
                  FROM agents ORDER BY id",
             )
             .map_err(db_err("prepare list agents"))?;
@@ -2043,6 +2051,8 @@ impl Db {
                     budget_usd: row.get(10)?,
                     spent_usd: row.get::<_, f64>(11)?,
                     created_at: row.get(12)?,
+                    assignment_rules: row.get(13)?,
+                    max_concurrent_tasks: row.get(14)?,
                 })
             })
             .map_err(db_err("query agents"))?;

@@ -27,6 +27,174 @@ use crate::tasks_state::TaskState;
 use tau_agent_plugin::PluginMessage;
 
 // ---------------------------------------------------------------------------
+// Rule-based agent assignment
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AssignmentRule {
+    #[serde(rename = "match")]
+    match_criteria: MatchCriteria,
+    #[serde(default = "default_weight")]
+    weight: i32,
+}
+
+fn default_weight() -> i32 {
+    10
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct MatchCriteria {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    priority: Option<String>,
+}
+
+fn task_matches_rule(task: &Task, rule: &AssignmentRule) -> bool {
+    let c = &rule.match_criteria;
+    if let Some(ref proj) = c.project {
+        if task.project_name != *proj {
+            return false;
+        }
+    }
+    if !c.tags.is_empty() {
+        let task_tags: Vec<String> = task
+            .tags
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !c.tags.iter().all(|t| task_tags.iter().any(|tt| tt == t)) {
+            return false;
+        }
+    }
+    if let Some(ref pri) = c.priority {
+        if task.priority.to_string() != *pri {
+            return false;
+        }
+    }
+    true
+}
+
+struct AgentCandidate {
+    name: String,
+    id: i64,
+    session_id: Option<String>,
+    weight: i32,
+    active_task_count: usize,
+    max_concurrent: i32,
+}
+
+pub fn find_matching_agent(
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    active_tasks_by_session: &HashMap<String, usize>,
+) -> Option<String> {
+    let resp = server_request(writer, reader, tau_agent_plugin::Request::ListAgents).ok()?;
+    let agents = match resp {
+        tau_agent_plugin::Response::Agents { agents } => agents,
+        _ => return None,
+    };
+
+    let mut candidates: Vec<AgentCandidate> = Vec::new();
+
+    for agent in &agents {
+        if !agent.enabled {
+            continue;
+        }
+        let rules_json = match agent.assignment_rules {
+            Some(ref r) => r,
+            None => continue,
+        };
+        let rules: Vec<AssignmentRule> = match serde_json::from_str(rules_json) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "tasks scheduler: agent '{}' has invalid assignment_rules: {}",
+                    agent.name, e
+                );
+                continue;
+            }
+        };
+
+        let mut best_weight = None;
+        for rule in &rules {
+            if task_matches_rule(task, rule) {
+                let w = rule.weight;
+                if best_weight.is_none() || w > best_weight.unwrap() {
+                    best_weight = Some(w);
+                }
+            }
+        }
+        if let Some(w) = best_weight {
+            let active = agent
+                .session_id
+                .as_ref()
+                .and_then(|sid| active_tasks_by_session.get(sid))
+                .copied()
+                .unwrap_or(0);
+            candidates.push(AgentCandidate {
+                name: agent.name.clone(),
+                id: agent.id,
+                session_id: agent.session_id.clone(),
+                weight: w,
+                active_task_count: active,
+                max_concurrent: agent.max_concurrent_tasks,
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| b.weight.cmp(&a.weight));
+
+    for c in &candidates {
+        if c.active_task_count >= c.max_concurrent as usize {
+            eprintln!(
+                "tasks scheduler: agent '{}' matches task {} but at capacity ({}/{})",
+                c.name, task.id, c.active_task_count, c.max_concurrent
+            );
+            continue;
+        }
+        if c.session_id.is_some() {
+            eprintln!(
+                "tasks scheduler: auto-assigning task {} to agent '{}' (weight={}, session={})",
+                task.id, c.name, c.weight, c.session_id.as_deref().unwrap_or("?")
+            );
+            return c.session_id.clone();
+        }
+        let start_resp = server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::StartAgent { id: c.id },
+        );
+        match start_resp {
+            Ok(tau_agent_plugin::Response::AgentStarted { session_id }) => {
+                eprintln!(
+                    "tasks scheduler: started agent '{}' for task {}, session={}",
+                    c.name, task.id, session_id
+                );
+                return Some(session_id);
+            }
+            Ok(tau_agent_plugin::Response::Error { message }) => {
+                eprintln!(
+                    "tasks scheduler: failed to start agent '{}': {}",
+                    c.name, message
+                );
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Batch selection
 // ---------------------------------------------------------------------------
 
@@ -1196,6 +1364,27 @@ pub fn dispatch(
         "tasks scheduler: dispatch task {} loaded (state={}, session_id={:?}, placeholder={:?})",
         task_id, task.state, task.session_id, task.placeholder_session_id
     );
+
+    // Rule-based auto-assignment: check if any agent matches this task.
+    if task.session_id.is_none() {
+        let inflight = db.get_inflight_tasks(&task.project_name).unwrap_or_default();
+        let mut active_by_session: HashMap<String, usize> = HashMap::new();
+        for t in &inflight {
+            if let Some(ref sid) = t.session_id {
+                *active_by_session.entry(sid.clone()).or_default() += 1;
+            }
+        }
+        if let Some(agent_sid) =
+            find_matching_agent(&task, writer, reader, &active_by_session)
+        {
+            if let Err(e) = db.assign_task(task_id, &agent_sid) {
+                eprintln!(
+                    "tasks scheduler: auto-assign task {} to agent session {} failed: {}",
+                    task_id, agent_sid, e
+                );
+            }
+        }
+    }
 
     // Handle planning-state dispatch (no worktree, read-only session)
     if task.state == TaskState::Planning {

@@ -780,7 +780,13 @@ pub(super) async fn handle_server_request(
         Request::TaskAssign {
             id,
             session_id: assign_session_id,
-        } => super::task_handlers::handle_task_assign(*id, assign_session_id),
+            agent_name,
+        } => super::task_handlers::handle_task_assign(
+            *id,
+            assign_session_id.as_deref(),
+            agent_name.as_deref(),
+            Some(state),
+        ),
         Request::TaskStatus { project } => super::task_handlers::handle_task_status(project),
         Request::TaskOverview {
             project,

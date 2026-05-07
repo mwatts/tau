@@ -1982,6 +1982,7 @@ mod panic_recovery_tests {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                is_agent: false,
                 successor_id: None,
             })
             .expect("create session");

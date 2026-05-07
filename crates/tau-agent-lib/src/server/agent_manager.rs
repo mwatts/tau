@@ -134,6 +134,8 @@ pub(super) async fn register(
                 def.system_prompt.as_deref(),
                 def.project_name.as_deref(),
                 def.budget_usd,
+                def.assignment_rules.as_deref(),
+                def.max_concurrent_tasks,
             ) {
                 tracing::warn!(%e, agent = %def.name, "agent-manager: failed to upsert agent");
             }

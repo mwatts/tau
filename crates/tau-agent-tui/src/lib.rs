@@ -875,7 +875,11 @@ async fn run_inner(
                 }
                 Action::TaskAssign { id, session_id } => {
                     send_request_and_recv(
-                        Request::TaskAssign { id, session_id },
+                        Request::TaskAssign {
+                            id,
+                            session_id: Some(session_id),
+                            agent_name: None,
+                        },
                         server_tx.clone(),
                     )
                     .await?;

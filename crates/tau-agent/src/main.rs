@@ -419,13 +419,16 @@ enum TaskAction {
         /// Task ID
         id: i64,
     },
-    /// Claim a task (assign to current session and activate)
+    /// Claim a task (assign to a session or agent and activate)
     Claim {
         /// Task ID
         id: i64,
-        /// Session ID to assign the task to
+        /// Session ID to assign the task to (mutually exclusive with --agent)
         #[arg(long)]
-        session: String,
+        session: Option<String>,
+        /// Name of the background agent to assign the task to (mutually exclusive with --session)
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Mark a task as ready (shorthand for update --state=ready)
     Ready {
@@ -3064,8 +3067,18 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
             let task = db.update_task(id, &update, None)?;
             println!("approved task #{}: {}", task.id, task.title);
         }
-        TaskAction::Claim { id, session } => {
-            let result = db.assign_task(id, &session)?;
+        TaskAction::Claim { id, session, agent } => {
+            if agent.is_some() {
+                return Err(tau_agent_lib::Error::Io(
+                    "agent-based assignment not yet wired".to_string(),
+                ));
+            }
+            let sid = session.ok_or_else(|| {
+                tau_agent_lib::Error::Io(
+                    "--session is required when --agent is not provided".to_string(),
+                )
+            })?;
+            let result = db.assign_task(id, &sid)?;
             println!("Claimed task #{}: {}", result.task.id, result.task.title);
         }
         TaskAction::Ready { id } => {
@@ -3572,6 +3585,8 @@ async fn cmd_agent_create(
             system_prompt,
             project_name: project,
             budget_usd: budget,
+            assignment_rules: None,
+            max_concurrent_tasks: 1,
         })
         .await?;
     client

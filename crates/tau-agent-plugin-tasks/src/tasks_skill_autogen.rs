@@ -256,6 +256,8 @@ mod tests {
             filed_by_session_id: None,
             budget_usd: None,
             spent_usd: 0.0,
+            no_merge: false,
+            dispatch_failure_count: 0,
             created_at: 0,
             updated_at: 0,
         }
@@ -364,6 +366,7 @@ mod tests {
             is_live: false,
             turn_started_at_ms: None,
             phase_started_at_ms: None,
+            successor_id: None,
         }
     }
 
@@ -447,6 +450,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy { project: None, session_id: Some("s-parent") },
             )
             .unwrap();
@@ -494,6 +498,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy { project: None, session_id: Some("s-parent") },
             )
@@ -569,6 +574,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy { project: None, session_id: Some("s-parent") },
             )
