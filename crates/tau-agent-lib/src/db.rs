@@ -417,6 +417,24 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_session_index_stream ON session_index(stream_id);",
         );
 
+        // Task index: fast lookup + cross-project discovery for durable streams.
+        // task_id is a FK-equivalent to tasks in the tasks DB; stream_id follows
+        // the convention "task-{id}" used by the stream event layer.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_index (
+                task_id    INTEGER PRIMARY KEY,
+                stream_id  TEXT NOT NULL,
+                title      TEXT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'todo',
+                priority   INTEGER NOT NULL DEFAULT 0,
+                project    TEXT,
+                session_id TEXT,
+                tags_json  TEXT,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );",
+        );
+
         Ok(Self { conn })
     }
 
@@ -2322,6 +2340,45 @@ impl Db {
             )
             .map_err(db_err("migrate_sessions_to_index"))?;
         Ok(rows_inserted)
+    }
+
+    // -----------------------------------------------------------------------
+    // task_index helpers
+    // -----------------------------------------------------------------------
+
+    /// Upsert a row into `task_index` for the given task.
+    ///
+    /// On conflict (same `task_id`) the mutable fields are updated and
+    /// `updated_at` is refreshed.  `created_at` is set only on insert.
+    pub fn upsert_task_index(
+        &self,
+        task_id: i64,
+        stream_id: &str,
+        title: &str,
+        status: &str,
+        priority: i64,
+        project: Option<&str>,
+        session_id: Option<&str>,
+        tags_json: Option<&str>,
+    ) -> std::result::Result<(), rusqlite::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT INTO task_index (task_id, stream_id, title, status, priority, project, session_id, tags_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(task_id) DO UPDATE SET
+                title = excluded.title,
+                status = excluded.status,
+                priority = excluded.priority,
+                project = excluded.project,
+                session_id = excluded.session_id,
+                tags_json = excluded.tags_json,
+                updated_at = excluded.updated_at",
+            rusqlite::params![task_id, stream_id, title, status, priority, project, session_id, tags_json, now],
+        )?;
+        Ok(())
     }
 }
 
