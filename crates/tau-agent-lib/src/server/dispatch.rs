@@ -1520,7 +1520,7 @@ pub(super) async fn handle_client(
                     st.subscribers
                         .entry(session_id.clone())
                         .or_default()
-                        .push(tx);
+                        .push(tx.clone());
                 }
 
                 // Send current agent phase so newly connected TUI shows correct state.
@@ -1545,6 +1545,59 @@ pub(super) async fn handle_client(
                     }
                 };
                 send(&mut writer, &phase_resp).await.ok();
+
+                // Bridge durable stream hub events for this session into the
+                // subscriber channel.  The spawned thread exits on its own
+                // when either the broadcast sender is dropped (stream closed)
+                // or the smol `tx` reports that the receiver is gone (loop
+                // exited and tx_for_cleanup was dropped during cleanup).
+                {
+                    let st2 = lock_state(&state);
+                    if let Some(ref ds) = st2.streams {
+                        use tau_streams::LiveEvent;
+                        let stream_id =
+                            tau_streams::StreamId(format!("session-{}", session_id));
+                        let mut broadcast_rx = ds.hub().subscribe(&stream_id);
+                        let sub_tx = tx.clone();
+                        let sid = session_id.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("tokio rt for subscribe bridge");
+                            rt.block_on(async move {
+                                loop {
+                                    match broadcast_rx.recv().await {
+                                        Ok(LiveEvent::Data { offset, data }) => {
+                                            let resp = Response::StreamEventPush {
+                                                stream_id: format!("session-{sid}"),
+                                                offset: offset.0,
+                                                data: String::from_utf8_lossy(&data)
+                                                    .to_string(),
+                                            };
+                                            if sub_tx.try_send(resp).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Ok(LiveEvent::Closed) => break,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            n,
+                                        )) => {
+                                            tracing::warn!(
+                                                session = %sid,
+                                                lagged = n,
+                                                "subscribe hub bridge lagged"
+                                            );
+                                        }
+                                        Err(
+                                            tokio::sync::broadcast::error::RecvError::Closed,
+                                        ) => break,
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
 
                 // Forward events until the channel closes, the client
                 // disconnects, or the server shuts down.
@@ -3233,18 +3286,174 @@ pub(super) async fn handle_client(
                 let resp = dispatch_stream_read(&state, &id, offset.as_deref(), limit);
                 send(&mut writer, &resp).await?;
             }
-            crate::protocol::Request::StreamSubscribe { .. } => {
-                // Live subscription via UDS is not yet implemented.
-                // Clients should use the SSE/HTTP endpoint for live delivery.
-                send(
-                    &mut writer,
-                    &Response::Error {
-                        message: "stream subscribe not yet implemented via UDS; \
-                                  use the SSE/HTTP endpoint for live delivery"
-                            .to_string(),
-                    },
-                )
-                .await?;
+            crate::protocol::Request::StreamSubscribe { id, offset } => {
+                use tau_streams::{LiveEvent, Offset, StreamId};
+
+                let stream_id = StreamId(id.clone());
+
+                // Resolve the start offset from the client-supplied string.
+                let start_offset = match offset.as_deref() {
+                    Some("now") | None => Offset::now(),
+                    Some("-1") => Offset::beginning(),
+                    Some(o) => Offset(o.to_owned()),
+                };
+
+                // ── Catch-up phase ──────────────────────────────────────────
+                // Replay historical events when the client wants history.
+                // All state-locked work is done inside a plain (non-async)
+                // block so the MutexGuard is guaranteed dropped before the
+                // first await point.
+                enum CatchUpOutcome {
+                    /// `"now"` offset — no history needed, but streams
+                    /// were configured (or not).
+                    NoHistory { streams_missing: bool },
+                    /// Historical events to replay.
+                    Events(Vec<tau_streams::StreamEvent>),
+                    /// Read failed.
+                    ReadError(String),
+                }
+
+                let catchup = if start_offset != Offset::now() {
+                    let st = lock_state(&state);
+                    match st.streams {
+                        None => CatchUpOutcome::NoHistory { streams_missing: true },
+                        Some(ref ds) => match ds.read(&stream_id, &start_offset, 10_000) {
+                            Ok(result) => CatchUpOutcome::Events(result.events),
+                            Err(e) => CatchUpOutcome::ReadError(e.to_string()),
+                        },
+                    }
+                } else {
+                    let st = lock_state(&state);
+                    CatchUpOutcome::NoHistory { streams_missing: st.streams.is_none() }
+                };
+
+                match catchup {
+                    CatchUpOutcome::NoHistory { streams_missing: true } => {
+                        send(&mut writer, &stream_not_configured()).await?;
+                        continue;
+                    }
+                    CatchUpOutcome::NoHistory { streams_missing: false } => {}
+                    CatchUpOutcome::Events(events) => {
+                        for event in events {
+                            send(
+                                &mut writer,
+                                &Response::StreamEventPush {
+                                    stream_id: id.clone(),
+                                    offset: event.offset.0,
+                                    data: String::from_utf8_lossy(&event.data).to_string(),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    CatchUpOutcome::ReadError(msg) => {
+                        send(&mut writer, &Response::Error { message: msg }).await?;
+                        continue;
+                    }
+                }
+
+                // ── Live phase ───────────────────────────────────────────────
+                // Bridge the tokio broadcast receiver into a smol channel so
+                // we can `select` over it alongside the shutdown and read
+                // futures (which are smol-native).
+                let (hub_tx, hub_rx) = smol::channel::unbounded::<Response>();
+                {
+                    let st2 = lock_state(&state);
+                    if let Some(ref ds) = st2.streams {
+                        let mut broadcast_rx = ds.hub().subscribe(&stream_id);
+                        let id_for_thread = id.clone();
+                        let tx = hub_tx.clone();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("tokio rt for stream subscribe");
+                            rt.block_on(async move {
+                                loop {
+                                    match broadcast_rx.recv().await {
+                                        Ok(LiveEvent::Data { offset, data }) => {
+                                            let resp = Response::StreamEventPush {
+                                                stream_id: id_for_thread.clone(),
+                                                offset: offset.0,
+                                                data: String::from_utf8_lossy(&data).to_string(),
+                                            };
+                                            if tx.send(resp).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Ok(LiveEvent::Closed) => {
+                                            let _ = tx
+                                                .send(Response::StreamClosed {
+                                                    id: id_for_thread.clone(),
+                                                })
+                                                .await;
+                                            break;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            n,
+                                        )) => {
+                                            tracing::warn!(
+                                                stream = %id_for_thread,
+                                                lagged = n,
+                                                "stream subscriber lagged"
+                                            );
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
+                // Drop our copy so the smol channel closes when the thread exits.
+                drop(hub_tx);
+
+                // ── Forward loop ─────────────────────────────────────────────
+                // Three-way select mirrors the Subscribe pattern: hub events,
+                // shutdown notice, or client disconnect (EOF on read half).
+                loop {
+                    let recv_fut = hub_rx.recv();
+                    let shutdown_fut = shutdown_rx.recv();
+                    let read_fut = lines.next();
+                    let send_now = match futures::future::select(
+                        std::pin::pin!(recv_fut),
+                        futures::future::select(
+                            std::pin::pin!(shutdown_fut),
+                            std::pin::pin!(read_fut),
+                        ),
+                    )
+                    .await
+                    {
+                        futures::future::Either::Left((Ok(resp), _)) => Some(resp),
+                        futures::future::Either::Left((Err(_), _)) => None, // channel closed
+                        futures::future::Either::Right((
+                            futures::future::Either::Left((Ok(msg), _)),
+                            _,
+                        )) => {
+                            send(&mut writer, &msg).await.ok();
+                            None
+                        }
+                        futures::future::Either::Right((
+                            futures::future::Either::Left((Err(_), _)),
+                            _,
+                        )) => None,
+                        futures::future::Either::Right((
+                            futures::future::Either::Right((_read_outcome, _)),
+                            _,
+                        )) => None,
+                    };
+                    match send_now {
+                        Some(resp) => {
+                            if send(&mut writer, &resp).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                break; // StreamSubscribe consumes the connection
             }
             crate::protocol::Request::StreamClose { id } => {
                 let resp = dispatch_stream_close(&state, &id);
