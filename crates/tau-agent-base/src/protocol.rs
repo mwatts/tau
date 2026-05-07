@@ -1,5 +1,7 @@
 //! JSON-lines wire protocol over unix domain socket.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::subscription_usage::{SubscriptionUsage, UsageBucket};
@@ -459,6 +461,81 @@ pub enum Request {
         #[serde(default)]
         restart: bool,
     },
+
+    // -----------------------------------------------------------------------
+    // Durable stream operations (task: durable-streams migration layer)
+    // -----------------------------------------------------------------------
+
+    /// Create a new durable stream with the given id.
+    ///
+    /// The id must be unique; the server returns an error if a stream with
+    /// that id already exists (or [`Response::StreamCreated`] on success).
+    StreamCreate {
+        /// Globally unique stream identifier.
+        id: String,
+        /// Optional MIME content type for the stream payload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+        /// Arbitrary key/value tags for discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<HashMap<String, String>>,
+    },
+    /// Append a single event to an existing open stream.
+    StreamAppend {
+        /// Stream to append to.
+        id: String,
+        /// Event payload (raw bytes encoded as a UTF-8 string; commonly JSON).
+        data: String,
+        /// Optional producer identifier for exactly-once semantics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_id: Option<String>,
+        /// Producer epoch; required when `producer_id` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_epoch: Option<u64>,
+        /// Per-epoch sequence number; required when `producer_id` is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_seq: Option<u64>,
+    },
+    /// Read events from a stream starting after `offset`.
+    ///
+    /// Use `offset = None` (or `"-1"`) to read from the beginning, or
+    /// `"now"` to get only future events.
+    StreamRead {
+        /// Stream to read from.
+        id: String,
+        /// Cursor to resume from; `None` means beginning of stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<String>,
+        /// Maximum number of events to return (default: 100).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    /// Subscribe to live events on a stream.
+    ///
+    /// The connection stays open and receives [`Response::StreamEventPush`]
+    /// messages as new events are appended.  History is delivered first
+    /// (from `offset` to the current tail) then live events follow.
+    ///
+    /// **Note:** Live subscription via the unix domain socket is not yet
+    /// implemented.  Use the SSE/HTTP endpoint for live delivery.
+    StreamSubscribe {
+        /// Stream to subscribe to.
+        id: String,
+        /// Cursor to resume from; `None` means beginning of stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<String>,
+    },
+    /// Close a stream, preventing further appends.
+    StreamClose {
+        /// Stream to close.
+        id: String,
+    },
+    /// List streams, optionally filtered by a type tag.
+    StreamList {
+        /// When set, only streams whose `type` tag matches are returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        type_filter: Option<String>,
+    },
 }
 
 /// Attachments to a `Request::Chat` message.
@@ -680,6 +757,58 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
     },
+
+    // -----------------------------------------------------------------------
+    // Durable stream responses (task: durable-streams migration layer)
+    // -----------------------------------------------------------------------
+
+    /// Stream was created (response to [`Request::StreamCreate`]).
+    StreamCreated {
+        /// The id of the newly created stream.
+        id: String,
+    },
+    /// Event was appended (response to [`Request::StreamAppend`]).
+    StreamAppended {
+        /// Offset assigned to the newly appended event.
+        offset: String,
+        /// Offset to use for the next append.
+        next_offset: String,
+        /// `true` if the event was a duplicate and was not stored again.
+        deduplicated: bool,
+    },
+    /// Events read from a stream (response to [`Request::StreamRead`]).
+    StreamEvents {
+        /// The events returned.
+        events: Vec<StreamEventWire>,
+        /// Offset to resume from on the next read.
+        next_offset: String,
+        /// `true` when the caller is at the current tail of the stream.
+        up_to_date: bool,
+        /// `true` when the stream has been closed and no further events will
+        /// ever appear.
+        closed: bool,
+    },
+    /// A single live event pushed to a subscriber
+    /// (response to [`Request::StreamSubscribe`]).
+    StreamEventPush {
+        /// The stream this event belongs to.
+        stream_id: String,
+        /// Offset of this event.
+        offset: String,
+        /// Raw event data (UTF-8 string; commonly JSON).
+        data: String,
+    },
+    /// Stream was closed (response to [`Request::StreamClose`]).
+    StreamClosed {
+        /// The id of the stream that was closed.
+        id: String,
+    },
+    /// List of streams (response to [`Request::StreamList`]).
+    StreamListing {
+        /// Metadata for each matching stream.
+        streams: Vec<StreamMetaWire>,
+    },
+
     /// Error.
     Error { message: String },
 }
@@ -1123,6 +1252,40 @@ pub struct AgentInfo {
     pub assignment_rules: Option<String>,
     /// Maximum number of tasks this agent may run concurrently.
     pub max_concurrent_tasks: i32,
+}
+
+// ---------------------------------------------------------------------------
+// Durable stream wire types
+// ---------------------------------------------------------------------------
+
+/// A single event read from a stream, as returned over the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamEventWire {
+    /// Offset of this event within the stream.
+    pub offset: String,
+    /// Raw event data (UTF-8 string; commonly a JSON object).
+    pub data: String,
+    /// Unix timestamp (microseconds) when the event was stored.
+    pub created_at: i64,
+}
+
+/// Stream metadata returned by [`Response::StreamListing`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamMetaWire {
+    /// Unique stream identifier.
+    pub id: String,
+    /// MIME content type of the stream payload.
+    pub content_type: String,
+    /// Lifecycle state: `"open"`, `"closed"`, or `"deleted"`.
+    pub state: String,
+    /// Unix timestamp (microseconds) when the stream was created.
+    pub created_at: i64,
+    /// Unix timestamp (microseconds) when the stream was closed, if ever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<i64>,
+    /// Arbitrary key/value tags.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub tags: std::collections::HashMap<String, String>,
 }
 
 /// Format a token count for display: 1234 → "1.2K", 1234567 → "1.2M".

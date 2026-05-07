@@ -125,7 +125,17 @@ impl Client {
                 | Response::AgentStarted { .. }
                 | Response::ResolvedSuccessor { .. }
                 | Response::TaskSessionRole { .. }
-                | Response::ServerShutdown { .. } => true,
+                | Response::ServerShutdown { .. }
+                // Stream responses — all terminal (single-shot request/response).
+                // StreamEventPush is excluded: it's a live-push event that
+                // arrives on long-lived subscribe connections, not here.
+                | Response::StreamCreated { .. }
+                | Response::StreamAppended { .. }
+                | Response::StreamEvents { .. }
+                | Response::StreamClosed { .. }
+                | Response::StreamListing { .. } => true,
+                // Live push from StreamSubscribe — not terminal; more may follow.
+                Response::StreamEventPush { .. } => false,
             };
             on_response(&resp);
             if is_terminal {
