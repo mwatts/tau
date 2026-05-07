@@ -393,6 +393,13 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
     let throttle = crate::throttle::ProviderThrottle::new();
 
+    let streams = {
+        let store = tau_streams::SqliteStore::open_in_memory()
+            .expect("in-memory streams store");
+        let hub = std::sync::Arc::new(tau_streams::LiveDeliveryHub::default());
+        Some(std::sync::Arc::new(tau_streams::DurableStream::new(store, hub)))
+    };
+
     let state: SharedState = Arc::new(Mutex::new(State {
         db,
         registry: config.registry,
@@ -414,7 +421,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         next_msg_id: 0,
         bg_after_idle: HashMap::new(),
         bg_scheduler: None,
-        streams: None,
+        streams,
     }));
 
     log_stale_phases_at_startup(&state);
@@ -604,6 +611,21 @@ pub async fn run() -> crate::Result<()> {
 
     let db = Db::open_default()?;
 
+    let streams = {
+        let streams_path = crate::paths::data_dir().join("streams.db");
+        let streams_path_str = streams_path.to_string_lossy();
+        match tau_streams::SqliteStore::open(&streams_path_str) {
+            Ok(store) => {
+                let hub = std::sync::Arc::new(tau_streams::LiveDeliveryHub::default());
+                Some(std::sync::Arc::new(tau_streams::DurableStream::new(store, hub)))
+            }
+            Err(e) => {
+                tracing::warn!(%e, "failed to open streams store; durable streams disabled");
+                None
+            }
+        }
+    };
+
     // Run one-time project migration if needed
     let tasks_db_path = crate::paths::data_dir().join("tasks.db");
     if let Err(e) = crate::migration::run_project_migration(&db, &tasks_db_path) {
@@ -644,7 +666,7 @@ pub async fn run() -> crate::Result<()> {
         next_msg_id: 0,
         bg_after_idle: HashMap::new(),
         bg_scheduler: None,
-        streams: None,
+        streams,
     }));
 
     log_stale_phases_at_startup(&state);
