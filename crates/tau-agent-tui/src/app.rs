@@ -80,6 +80,7 @@ pub struct PickerGroups {
     pub blocked: Vec<(usize, TaskInfo)>,
     pub held: Vec<(usize, TaskInfo)>,
     pub recently_merged: Vec<TaskInfo>,
+    pub recently_done: Vec<TaskInfo>,
     pub recently_closed: Vec<TaskInfo>,
     pub inflight_count: usize,
     pub max_concurrent: usize,
@@ -1484,7 +1485,12 @@ impl App {
         // Recently completed tail — flat, no tree indent, dim age hint.
         // Only emit the header if at least one row survives filtering.
         let mut recent_tmp: Vec<PickerRow> = Vec::new();
-        for t in g.recently_merged.iter().chain(g.recently_closed.iter()) {
+        for t in g
+            .recently_merged
+            .iter()
+            .chain(g.recently_done.iter())
+            .chain(g.recently_closed.iter())
+        {
             if let Some(n) = needle.as_deref() {
                 if !task_matches_filter(t, n) {
                     continue;
@@ -1504,7 +1510,8 @@ impl App {
             if !first_group {
                 rows.push(PickerRow::Spacer);
             }
-            let recent_total = g.recently_merged.len() + g.recently_closed.len();
+            let recent_total =
+                g.recently_merged.len() + g.recently_done.len() + g.recently_closed.len();
             rows.push(PickerRow::Header(format!(
                 "recently completed ({})",
                 recent_total
@@ -2464,9 +2471,28 @@ impl App {
             }
             "/fork" => Some(Action::ForkSession),
             "/new" => Some(Action::NewSession),
+            "/succeed" | "/handoff" => {
+                // Mid-turn guard: same UX as /compact — reject locally so
+                // the user gets immediate feedback.  Succession during an
+                // in-flight turn would race the agent runner's exit
+                // handling and is not worth the complexity.
+                if matches!(self.mode, AppMode::Streaming) {
+                    self.messages.push(MessageItem::Error {
+                        text: "can't succeed while a turn is running. Cancel it first (Ctrl+C)."
+                            .into(),
+                    });
+                    return None;
+                }
+                let tagline = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
+                Some(Action::SucceedSession { tagline })
+            }
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /compact [keep hint] /task [list|get|create|search|claim|approve|ready|status|mq] /skills /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /compact [keep hint] /task [list|get|create|search|claim|approve|ready|status|mq] /skills /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /succeed [tagline] /help /quit"
                         .into(),
                 });
                 None
@@ -3287,6 +3313,20 @@ impl App {
                 self.set_mode(AppMode::Input);
                 self.pending_steer = None;
             }
+            Response::SessionSucceeded { successor_id } => {
+                // Another client (or the agent itself, via the
+                // session_succeed tool) retired the session we're
+                // attached to.  Surface a status message and ask the
+                // event loop to switch us to the successor.  See task 915.
+                self.messages.push(MessageItem::Status {
+                    text: format!(
+                        "Session succeeded \u{2192} {}",
+                        &successor_id[..successor_id.len().min(8)]
+                    ),
+                });
+                return Some(Action::SwitchSession(successor_id));
+            }
+
             Response::Cancelled => {
                 self.finalize_in_flight();
                 // Replace "cancelling" status with "cancelled"
@@ -3331,6 +3371,18 @@ impl App {
                     self.phase = AgentPhase::Idle;
                     self.set_mode(AppMode::Input);
                     self.pending_steer = None;
+                } else if tau_agent_lib::protocol::is_subscription_usage_error(&message) {
+                    // Defence-in-depth for #940: the subscription-usage
+                    // fetch is an unrelated background poll. A failure
+                    // there must not interrupt an in-flight tool call,
+                    // flip the agent phase, or surface a red error to
+                    // the user. The server already swallows these
+                    // failures (returns a cached/default payload) but
+                    // we guard the TUI explicitly so a future
+                    // regression on either side can't reproduce the
+                    // original bug (active tool rendered as
+                    // `[interrupted]`, session presumed crashed).
+                    let _ = message;
                 } else {
                     self.finalize_in_flight();
                     self.messages.push(MessageItem::Error { text: message });
@@ -3441,6 +3493,7 @@ impl App {
                 blocked,
                 held,
                 recently_merged,
+                recently_done,
                 recently_closed,
                 inflight_count,
                 max_concurrent,
@@ -3478,6 +3531,7 @@ impl App {
                         blocked: compute_group_depths(blocked),
                         held: compute_group_depths(held),
                         recently_merged,
+                        recently_done,
                         recently_closed,
                         inflight_count,
                         max_concurrent,
@@ -3692,8 +3746,30 @@ impl App {
                 // resetting this, but be defensive in case of
                 // event-ordering quirks.
                 self.turn_text_finalized = false;
-                // Clear the steer indicator — the session has acknowledged
-                // the steer by starting a new assistant turn.
+                // Note: pending_steer is NOT cleared here. The agent
+                // loop emits `StreamEvent::SteerMessage` when it drains
+                // a queued user message into context (immediately
+                // before the next LLM call), and that is the correct,
+                // direct signal that the steer has been consumed. See
+                // the `SteerMessage` arm below.
+            }
+            StreamEvent::SteerMessage { message } => {
+                // The agent loop just drained a queued user message into
+                // context (steer / forwarded notification / child
+                // completion notice). Render it in scrollback so the
+                // user can see exactly where it landed in the
+                // conversation history, and clear the pending-steer
+                // indicator now that the LLM is about to consume it.
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.messages.push(MessageItem::Steer { text });
                 self.pending_steer = None;
             }
             StreamEvent::TextDelta { delta, .. } => {
@@ -3995,6 +4071,11 @@ pub enum Action {
     ForkSession,
     /// Create a fresh session with default settings.
     NewSession,
+    /// Retire the current session in favour of a fresh successor and
+    /// switch the TUI to the new session.  See task 915.
+    SucceedSession {
+        tagline: Option<String>,
+    },
     /// Fire a hook on the server (best-effort, e.g. after TUI task state changes).
     FireHook {
         name: String,
@@ -5011,6 +5092,7 @@ mod tests {
             last_exit_status: None,
             is_live: true,
             project_name: None,
+            successor_id: None,
             turn_started_at_ms: Some(started_30s_ago),
             phase_started_at_ms: Some(started_30s_ago),
         };
@@ -5378,6 +5460,7 @@ mod tests {
             has_live_session: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            no_merge: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -5409,6 +5492,7 @@ mod tests {
             blocked: Vec::new(),
             held: Vec::new(),
             recently_merged: Vec::new(),
+            recently_done: Vec::new(),
             recently_closed: Vec::new(),
             inflight_count: 2,
             max_concurrent: 8,
@@ -5824,9 +5908,13 @@ mod tests {
         assert_eq!(app.pending_steer.as_deref(), Some("fix the bug"));
     }
 
-    /// StreamEvent::Start clears pending_steer (session acknowledged the steer).
+    /// StreamEvent::Start does NOT clear pending_steer. The correct
+    /// signal is `StreamEvent::SteerMessage` (see
+    /// `steer_message_event_clears_pending_steer`); `Start` is a
+    /// downstream proxy in the current loop ordering and clearing on
+    /// it tied us to that ordering.
     #[test]
-    fn stream_start_clears_pending_steer() {
+    fn stream_start_does_not_clear_pending_steer() {
         let mut app = make_app();
         app.mode = AppMode::Streaming;
         app.pending_steer = Some("steer text".into());
@@ -5835,9 +5923,50 @@ mod tests {
             partial: assistant_message("", StopReason::Stop, None),
         });
 
+        assert_eq!(
+            app.pending_steer.as_deref(),
+            Some("steer text"),
+            "Start should not clear pending_steer (SteerMessage does)"
+        );
+    }
+
+    /// `StreamEvent::SteerMessage` pushes the drained user message into
+    /// scrollback so the user can see exactly where the steer landed in
+    /// the conversation history.
+    #[test]
+    fn steer_message_event_pushes_to_scrollback() {
+        use tau_agent_lib::types::UserMessage;
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        let len_before = app.messages.len();
+
+        app.handle_stream_event(StreamEvent::SteerMessage {
+            message: UserMessage::text("fix the bug"),
+        });
+
+        assert_eq!(app.messages.len(), len_before + 1);
+        match app.messages.last() {
+            Some(MessageItem::Steer { text }) => assert_eq!(text, "fix the bug"),
+            other => panic!("expected Steer message, got {other:?}"),
+        }
+    }
+
+    /// `StreamEvent::SteerMessage` clears the pending-steer indicator
+    /// — the LLM is about to consume the queued message.
+    #[test]
+    fn steer_message_event_clears_pending_steer() {
+        use tau_agent_lib::types::UserMessage;
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.pending_steer = Some("steer text".into());
+
+        app.handle_stream_event(StreamEvent::SteerMessage {
+            message: UserMessage::text("steer text"),
+        });
+
         assert!(
             app.pending_steer.is_none(),
-            "Start should clear pending_steer"
+            "SteerMessage should clear pending_steer"
         );
     }
 
@@ -6391,6 +6520,7 @@ mod tests {
             last_exit_status: None,
             is_live: true,
             project_name: None,
+            successor_id: None,
             turn_started_at_ms: None,
             phase_started_at_ms: None,
         };
@@ -6701,6 +6831,7 @@ mod tests {
             blocked: blocked.into_iter().map(|t| (0, t)).collect(),
             held: held.into_iter().map(|t| (0, t)).collect(),
             recently_merged,
+            recently_done: Vec::new(),
             recently_closed: Vec::new(),
             inflight_count: 0,
             max_concurrent: 8,
@@ -7046,6 +7177,7 @@ mod tests {
             blocked: Vec::new(),
             held: vec![make_task_info(3, "h", "ready")],
             recently_merged: vec![make_task_info(4, "m", "merged")],
+            recently_done: Vec::new(),
             recently_closed: Vec::new(),
             inflight_count: 1,
             max_concurrent: 8,
@@ -7359,6 +7491,84 @@ mod tests {
         );
     }
 
+    /// `/succeed` with no args parses to a `SucceedSession` action with no tagline.
+    #[test]
+    fn slash_succeed_no_args_emits_succeed_action_with_none() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/succeed");
+        match action {
+            Some(Action::SucceedSession { tagline: None }) => {}
+            other => panic!("expected Action::SucceedSession{{None}}, got {other:?}"),
+        }
+    }
+
+    /// `/handoff` is an alias for `/succeed`.
+    #[test]
+    fn slash_handoff_is_alias_for_succeed() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/handoff");
+        match action {
+            Some(Action::SucceedSession { tagline: None }) => {}
+            other => panic!("expected Action::SucceedSession from /handoff, got {other:?}"),
+        }
+    }
+
+    /// `/succeed <tagline>` preserves the free-form remainder verbatim.
+    #[test]
+    fn slash_succeed_with_args_emits_succeed_action_with_tagline() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/succeed continued: refactor stage 2");
+        match action {
+            Some(Action::SucceedSession { tagline: Some(t) }) => {
+                assert_eq!(t, "continued: refactor stage 2");
+            }
+            other => panic!("expected Action::SucceedSession{{Some(_)}}, got {other:?}"),
+        }
+    }
+
+    /// `/succeed` while a turn is streaming is rejected client-side and
+    /// surfaces a local Error message.  Mirrors the `/compact` guard.
+    #[test]
+    fn slash_succeed_during_streaming_is_rejected() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        let action = app.handle_slash_command("/succeed");
+        assert!(action.is_none(), "no action emitted while streaming");
+        assert!(
+            app.messages.iter().any(|m| matches!(
+                m,
+                MessageItem::Error { text } if text.contains("turn is running")
+            )),
+            "expected an Error message about a running turn"
+        );
+    }
+
+    /// `Response::SessionSucceeded` from a subscribe broadcast emits a
+    /// `SwitchSession` action so the TUI follows the successor.
+    #[test]
+    fn response_session_succeeded_emits_switch_session_action() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_server_response(Response::SessionSucceeded {
+            successor_id: "successor-abc".into(),
+        });
+        match action {
+            Some(Action::SwitchSession(id)) => assert_eq!(id, "successor-abc"),
+            other => panic!("expected SwitchSession action, got {other:?}"),
+        }
+        // A status message records the auto-switch in the predecessor's view.
+        assert!(
+            app.messages.iter().any(|m| matches!(
+                m,
+                MessageItem::Status { text } if text.contains("succeeded")
+            )),
+            "expected a Status message recording the succession"
+        );
+    }
+
     /// `App::has_active_tool` returns true iff there is at least one
     /// `MessageItem::ToolActive` in the message list — completed tools
     /// (`ToolComplete`) and other variants don't count.
@@ -7527,5 +7737,62 @@ mod tests {
         assert!(app.pending_attachments.is_empty());
         let s = app.textarea.lines().join("\n");
         assert!(s.contains("some pasted prose"));
+    }
+
+    /// Regression for #940: a `Response::Error` carrying a
+    /// subscription-usage failure (e.g. an Anthropic 429 from
+    /// `/usage`) is delivered out-of-band by an unrelated request
+    /// connection and must not interrupt an in-flight tool call.
+    /// Before the fix the TUI would (a) finalize the active tool to
+    /// `[interrupted]`, (b) flip the agent phase to Idle, and (c)
+    /// switch the input mode — leading users to believe their session
+    /// had crashed when the agent loop was actually still running.
+    #[test]
+    fn subscription_usage_error_does_not_interrupt_active_tool() {
+        let mut app = make_app();
+        // Simulate an in-flight tool call: phase is ToolExec, mode is
+        // Streaming, and a `MessageItem::ToolActive` is in scrollback.
+        app.phase = AgentPhase::ToolExec;
+        app.set_mode(AppMode::Streaming);
+        let started_at = std::time::Instant::now();
+        app.messages.push(MessageItem::ToolActive {
+            tool_call_id: "toolu_test".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "sleep 60"}),
+            output_lines: Vec::new(),
+            started_at,
+        });
+
+        // Inject the wire-level error the bg poll used to surface.
+        app.handle_server_response(Response::Error {
+            message: "HTTP error: usage API: http status: 429".to_string(),
+        });
+
+        // The active tool must still be active. The previous bug
+        // would have replaced it with a `MessageItem::ToolComplete`
+        // marked `is_error: true` and labelled `[interrupted]`.
+        let still_active = app.messages.iter().any(
+            |m| matches!(m, MessageItem::ToolActive { tool_call_id: id, .. } if id == "toolu_test"),
+        );
+        assert!(
+            still_active,
+            "out-of-band /usage 429 must not finalize an in-flight tool call"
+        );
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::Error { .. })),
+            "out-of-band /usage 429 must not push a red error row"
+        );
+        assert_eq!(
+            app.phase,
+            AgentPhase::ToolExec,
+            "out-of-band /usage 429 must not flip the agent phase"
+        );
+        assert_eq!(
+            app.mode,
+            AppMode::Streaming,
+            "out-of-band /usage 429 must not switch the input mode"
+        );
     }
 }

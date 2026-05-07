@@ -36,6 +36,7 @@ fn session_tree_budget_enforcement() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     };
     db.create_session(&root).unwrap();
 
@@ -57,6 +58,7 @@ fn session_tree_budget_enforcement() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     };
     db.create_session(&c1).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 1);
@@ -79,6 +81,7 @@ fn session_tree_budget_enforcement() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     };
     db.create_session(&c2).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 3); // 1 + (1+1) = 3
@@ -111,6 +114,7 @@ fn session_tree_budget_enforcement() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     };
     db.create_session(&gc1).unwrap();
     assert_eq!(db.budget_used("c2").unwrap(), 1);
@@ -155,6 +159,7 @@ fn session_tree_recursive_delete() {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
     }
@@ -206,6 +211,7 @@ fn session_model_inheritance() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     })
     .unwrap();
 
@@ -249,6 +255,7 @@ fn session_info_includes_tree_fields() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     })
     .unwrap();
 
@@ -269,6 +276,7 @@ fn session_info_includes_tree_fields() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     })
     .unwrap();
 
@@ -302,6 +310,7 @@ fn orchestration_tool_definitions() {
     assert!(names.contains(&"session_message"));
     assert!(names.contains(&"session_reply"));
     assert!(names.contains(&"session_id"));
+    assert!(names.contains(&"session_succeed"));
 
     // session_spawn has prompt snippet
     let spawn = tools.iter().find(|t| t.name == "session_spawn").unwrap();
@@ -401,6 +410,7 @@ fn protocol_session_info_tree_fields() {
         state: "idle".into(),
         context_pct: None,
         project_name: None,
+        successor_id: None,
     };
     let json = serde_json::to_string(&info).unwrap();
     assert!(json.contains("parent_id"));

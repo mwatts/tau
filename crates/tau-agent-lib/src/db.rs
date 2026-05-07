@@ -85,6 +85,12 @@ pub struct StoredSession {
     /// True when this session was created by an agent (tool call), not
     /// directly by a human user.
     pub is_agent: bool,
+    /// Optional successor session id. When set, every notification /
+    /// queued-message / new-child-parent-anchor that targets this session
+    /// is forwarded to the successor (resolved transitively, with cycle
+    /// protection — see [`Db::resolve_successor`]).  The session itself
+    /// stays in the DB (history readable) but is effectively retired.
+    pub successor_id: Option<String>,
 }
 
 /// Project-wide aggregate stats (totals across every session, archived
@@ -151,7 +157,7 @@ pub struct OptimizationRow {
 }
 
 /// SELECT column list shared across all queries that return `StoredSession` rows.
-const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name, is_agent";
+const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name, is_agent, successor_id";
 
 /// Map a `rusqlite::Row` (selected with [`SESSION_COLUMNS`]) into a [`StoredSession`].
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<StoredSession> {
@@ -176,6 +182,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<StoredSession> {
         notify_parent: row.get::<_, i32>(13)? != 0,
         project_name: row.get(14)?,
         is_agent: row.get::<_, i32>(15)? != 0,
+        successor_id: row.get(16)?,
     })
 }
 
@@ -262,6 +269,9 @@ impl Db {
             "ALTER TABLE sessions ADD COLUMN notify_parent INTEGER NOT NULL DEFAULT 1;",
         );
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN project_name TEXT;");
+        // Task 914: optional pointer to a "successor" session that takes over
+        // the predecessor's notification target / new-child-parent-anchor role.
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN successor_id TEXT;");
         // Phase 1 seamless-restart: per-session opt-out for auto-resume.
         // When a session is explicitly marked `resume_on_restart = 0`, the
         // startup scan will skip it. Defaults to 1 so existing sessions
@@ -412,6 +422,8 @@ impl Db {
                 auto_archive   INTEGER NOT NULL DEFAULT 0,
                 notify_parent  INTEGER NOT NULL DEFAULT 1,
                 project_name   TEXT,
+                is_agent       INTEGER NOT NULL DEFAULT 0,
+                successor_id   TEXT,
                 resume_on_restart INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE messages (
@@ -471,6 +483,25 @@ impl Db {
             );",
         )
         .map_err(db_err("create schedules table"))?;
+
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                id             INTEGER PRIMARY KEY,
+                name           TEXT NOT NULL UNIQUE,
+                prompt         TEXT NOT NULL,
+                model          TEXT,
+                trigger_type   TEXT NOT NULL DEFAULT 'periodic',
+                trigger_config TEXT,
+                system_prompt  TEXT,
+                project_name   TEXT,
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                session_id     TEXT,
+                budget_usd     REAL,
+                spent_usd      REAL NOT NULL DEFAULT 0.0,
+                created_at     INTEGER NOT NULL
+            );",
+        )
+        .map_err(db_err("create agents table"))?;
 
         conn.execute_batch(
             "CREATE TABLE prompt_metrics (
@@ -539,8 +570,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name, is_agent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name, is_agent, successor_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     session.id,
                     model_json,
@@ -558,6 +589,7 @@ impl Db {
                     session.notify_parent as i32,
                     session.project_name,
                     session.is_agent as i32,
+                    session.successor_id,
                 ],
             )
             .map_err(db_err("insert session"))?;
@@ -879,6 +911,140 @@ impl Db {
     /// Update the working directory for a session.
     pub fn update_cwd(&self, session_id: &str, cwd: &str) -> crate::Result<()> {
         self.update_session_field(session_id, "cwd", &cwd)
+    }
+
+    // ----- successor (task 914) -----
+
+    /// Maximum number of `successor_id` hops [`resolve_successor`] will
+    /// follow before bailing out.  Walks longer than this are treated as
+    /// broken chains (see [`resolve_successor`]).
+    pub const MAX_SUCCESSOR_DEPTH: usize = 16;
+
+    /// Set or clear the `successor_id` for a session.  `None` clears the
+    /// pointer.
+    pub fn set_successor(&self, session_id: &str, successor_id: Option<&str>) -> crate::Result<()> {
+        match successor_id {
+            Some(s) => self.update_session_field(session_id, "successor_id", &s),
+            None => self.update_session_field(session_id, "successor_id", &rusqlite::types::Null),
+        }
+    }
+
+    /// Read the raw `successor_id` for a session (no chain resolution).
+    /// Returns `Ok(None)` both when the session is missing and when its
+    /// `successor_id` column is NULL.
+    pub fn get_successor(&self, session_id: &str) -> crate::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT successor_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|opt| opt.flatten())
+            .map_err(db_err("get successor"))
+    }
+
+    /// Walk the `successor_id` chain starting from `session_id` and return
+    /// the live tip.
+    ///
+    /// Returns `session_id` unchanged when:
+    /// * the row has no successor,
+    /// * the row is missing entirely,
+    /// * the immediate successor is missing or archived (we stop at the
+    ///   last live link),
+    /// * the chain forms a cycle, or
+    /// * the chain is longer than [`Self::MAX_SUCCESSOR_DEPTH`] hops.
+    ///
+    /// Both cycle and depth-cap conditions emit a `tracing::warn!` and
+    /// degrade gracefully — the last reachable session is returned so
+    /// callers can still deliver the message somewhere sensible.
+    pub fn resolve_successor(&self, session_id: &str) -> String {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut current = session_id.to_string();
+        visited.insert(current.clone());
+        for _ in 0..Self::MAX_SUCCESSOR_DEPTH {
+            // Read the row's successor + archived flag in one go.  A query
+            // failure (or missing row) terminates the walk at the previous
+            // live link.
+            let next: Option<String> = match self.get_successor(&current) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(session_id = %current, %e, "resolve_successor: get_successor failed");
+                    return current;
+                }
+            };
+            let Some(next) = next else {
+                return current;
+            };
+            // Skip archived / missing successors — stop at last live link.
+            match self.get_session(&next) {
+                Ok(Some(s)) if !s.archived => {}
+                Ok(Some(_)) => {
+                    // archived
+                    return current;
+                }
+                Ok(None) => return current,
+                Err(e) => {
+                    tracing::warn!(session_id = %next, %e, "resolve_successor: get_session failed");
+                    return current;
+                }
+            }
+            if !visited.insert(next.clone()) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    cycle_at = %next,
+                    "resolve_successor: cycle detected, stopping"
+                );
+                return current;
+            }
+            current = next;
+        }
+        tracing::warn!(
+            session_id = %session_id,
+            depth_cap = Self::MAX_SUCCESSOR_DEPTH,
+            "resolve_successor: depth cap exceeded, stopping"
+        );
+        current
+    }
+
+    /// Returns true if setting `session_id.successor_id = candidate_successor`
+    /// would create a cycle when resolved (i.e. walking from
+    /// `candidate_successor` eventually hits `session_id`).
+    ///
+    /// Used by the dispatch validator to reject self-referential or
+    /// looping successor links before they're written.
+    pub fn would_create_successor_cycle(
+        &self,
+        session_id: &str,
+        candidate_successor: &str,
+    ) -> bool {
+        if candidate_successor == session_id {
+            return true;
+        }
+        let mut current = candidate_successor.to_string();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(current.clone());
+        for _ in 0..Self::MAX_SUCCESSOR_DEPTH {
+            let next: Option<String> = match self.get_successor(&current) {
+                Ok(opt) => opt,
+                Err(_) => return false,
+            };
+            let Some(next) = next else {
+                return false;
+            };
+            if next == session_id {
+                return true;
+            }
+            if !visited.insert(next.clone()) {
+                // Pre-existing cycle in the DB — not caused by adding
+                // session_id, but worth surfacing as "don't extend it".
+                return false;
+            }
+            current = next;
+        }
+        // Exceeded depth cap without circling back to session_id; treat as
+        // safe (the resolver will degrade gracefully when it hits the cap).
+        false
     }
 
     /// Re-parent all child sessions from one parent to another.
@@ -2134,6 +2300,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         };
         db.create_session(&session).unwrap();
 
@@ -2164,6 +2331,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         };
         db.create_session(&session).unwrap();
 
@@ -2204,6 +2372,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -2235,6 +2404,7 @@ mod tests {
                 notify_parent: true,
                 project_name: None,
                 is_agent: false,
+                successor_id: None,
             })
             .unwrap();
         }
@@ -2265,6 +2435,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
@@ -2292,6 +2463,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2317,6 +2489,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2341,6 +2514,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2375,6 +2549,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2395,6 +2570,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2416,6 +2592,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2447,6 +2624,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2467,6 +2645,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2500,6 +2679,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("top", &Message::User(UserMessage::text("hello")))
@@ -2523,6 +2703,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("child1", &Message::User(UserMessage::text("work")))
@@ -2546,6 +2727,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message(
@@ -2572,6 +2754,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message(
@@ -2611,6 +2794,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2644,6 +2828,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("completed", &Message::User(UserMessage::text("hi")))
@@ -2667,6 +2852,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("archived", &Message::User(UserMessage::text("hi")))
@@ -2690,6 +2876,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("live", &Message::User(UserMessage::text("hi")))
@@ -2722,6 +2909,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("opt_out", &Message::User(UserMessage::text("hi")))
@@ -2746,6 +2934,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         // The message is persisted with "now" as created_at so we also
@@ -2769,6 +2958,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("fresh", &Message::User(UserMessage::text("hi")))
@@ -2804,6 +2994,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         let mut asst = AssistantMessage::empty("test", "test", "test-model");
@@ -2830,6 +3021,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         let mut asst = AssistantMessage::empty("test", "test", "test-model");
@@ -2855,6 +3047,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message(
@@ -2888,6 +3081,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2922,6 +3116,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -2977,6 +3172,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -3005,6 +3201,7 @@ mod tests {
                 notify_parent: true,
                 project_name: None,
                 is_agent: false,
+                successor_id: None,
             })
             .unwrap();
         }
@@ -3041,6 +3238,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -3072,6 +3270,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -3099,6 +3298,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -3180,6 +3380,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -3221,6 +3422,7 @@ mod tests {
             notify_parent: true,
             project_name: project.map(|p| p.to_string()),
             is_agent: false,
+            successor_id: None,
         }
     }
 
@@ -3448,6 +3650,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message("old_archived", &Message::User(UserMessage::text("hello")))
@@ -3472,6 +3675,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -3493,6 +3697,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
 
@@ -3531,6 +3736,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         }
     }
 
@@ -3672,6 +3878,145 @@ mod tests {
         assert_eq!(deleted, vec!["s1".to_string()]);
     }
 
+    // -----------------------------------------------------------------
+    // Task 914: successor_id round-trip + resolver tests
+    // -----------------------------------------------------------------
+
+    fn make_simple(id: &str) -> StoredSession {
+        StoredSession {
+            id: id.into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            is_agent: false,
+            successor_id: None,
+        }
+    }
+
+    #[test]
+    fn successor_id_roundtrips_through_create_and_get() {
+        let db = Db::open_memory().unwrap();
+        let mut s = make_simple("s1");
+        s.successor_id = Some("s2".into());
+        db.create_session(&s).unwrap();
+        let loaded = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(loaded.successor_id.as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn set_and_get_successor_clears_with_none() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_simple("s1")).unwrap();
+        db.create_session(&make_simple("s2")).unwrap();
+        db.set_successor("s1", Some("s2")).unwrap();
+        assert_eq!(db.get_successor("s1").unwrap().as_deref(), Some("s2"));
+        db.set_successor("s1", None).unwrap();
+        assert_eq!(db.get_successor("s1").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_successor_walks_linear_chain() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_simple("s1")).unwrap();
+        db.create_session(&make_simple("s2")).unwrap();
+        db.create_session(&make_simple("s3")).unwrap();
+        db.set_successor("s1", Some("s2")).unwrap();
+        db.set_successor("s2", Some("s3")).unwrap();
+        assert_eq!(db.resolve_successor("s1"), "s3");
+        assert_eq!(db.resolve_successor("s2"), "s3");
+        assert_eq!(db.resolve_successor("s3"), "s3");
+    }
+
+    #[test]
+    fn resolve_successor_no_pointer_returns_self() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_simple("s1")).unwrap();
+        assert_eq!(db.resolve_successor("s1"), "s1");
+    }
+
+    #[test]
+    fn resolve_successor_missing_target_falls_back() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_simple("s1")).unwrap();
+        // Successor points at a non-existent session.
+        // (No FK constraint on successor_id, so set_successor accepts it.)
+        db.set_successor("s1", Some("ghost")).unwrap();
+        assert_eq!(db.resolve_successor("s1"), "s1");
+    }
+
+    #[test]
+    fn resolve_successor_archived_target_falls_back() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_simple("s1")).unwrap();
+        let mut s2 = make_simple("s2");
+        s2.archived = true;
+        db.create_session(&s2).unwrap();
+        db.set_successor("s1", Some("s2")).unwrap();
+        // Archived terminal -> stop at last live link (s1).
+        assert_eq!(db.resolve_successor("s1"), "s1");
+    }
+
+    #[test]
+    fn resolve_successor_short_circuits_cycle() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_simple("s1")).unwrap();
+        db.create_session(&make_simple("s2")).unwrap();
+        db.set_successor("s1", Some("s2")).unwrap();
+        db.set_successor("s2", Some("s1")).unwrap();
+        // Walk: s1 -> s2 (visit), then would-revisit s1 -> stop at s2.
+        assert_eq!(db.resolve_successor("s1"), "s2");
+        // From s2: s2 -> s1 (visit), would-revisit s2 -> stop at s1.
+        assert_eq!(db.resolve_successor("s2"), "s1");
+    }
+
+    #[test]
+    fn resolve_successor_depth_cap_returns_last_reachable() {
+        let db = Db::open_memory().unwrap();
+        // Build a chain longer than MAX_SUCCESSOR_DEPTH so the resolver
+        // exits via the depth cap rather than the cycle / nil-successor
+        // branches.
+        let n = Db::MAX_SUCCESSOR_DEPTH + 4;
+        for i in 0..n {
+            db.create_session(&make_simple(&format!("s{}", i))).unwrap();
+        }
+        for i in 0..(n - 1) {
+            db.set_successor(&format!("s{}", i), Some(&format!("s{}", i + 1)))
+                .unwrap();
+        }
+        // We follow MAX_SUCCESSOR_DEPTH hops from s0, landing on
+        // sN where N == MAX_SUCCESSOR_DEPTH.
+        let resolved = db.resolve_successor("s0");
+        assert_eq!(resolved, format!("s{}", Db::MAX_SUCCESSOR_DEPTH));
+    }
+
+    #[test]
+    fn would_create_successor_cycle_detects_self_and_loops() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_simple("s1")).unwrap();
+        db.create_session(&make_simple("s2")).unwrap();
+        db.create_session(&make_simple("s3")).unwrap();
+        // Self-link is always a cycle.
+        assert!(db.would_create_successor_cycle("s1", "s1"));
+        // s1 -> s2 (no existing chain back to s1) is fine.
+        assert!(!db.would_create_successor_cycle("s1", "s2"));
+        // After s2 -> s1, attempting s1 -> s2 would loop.
+        db.set_successor("s2", Some("s1")).unwrap();
+        assert!(db.would_create_successor_cycle("s1", "s2"));
+        // s3 -> s2 currently lands on s1 (s3 -> s2 -> s1) and never sees s3.
+        assert!(!db.would_create_successor_cycle("s3", "s2"));
+    }
+
     #[test]
     fn fts_search_messages() {
         let db = Db::open_memory().unwrap();
@@ -3692,6 +4037,7 @@ mod tests {
             notify_parent: true,
             project_name: Some("myproject".into()),
             is_agent: false,
+            successor_id: None,
         };
         db.create_session(&session).unwrap();
 

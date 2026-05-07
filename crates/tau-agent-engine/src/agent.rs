@@ -595,27 +595,12 @@ Respond with EXACTLY one word:
 /// Number of recent messages to include in the loop review context.
 const LOOP_REVIEW_MESSAGE_COUNT: usize = 6;
 
-/// Run an inline LLM call to review whether the session is stuck.
-/// Returns `true` if the session appears stuck.
-async fn run_loop_review(
-    registry: &ProviderRegistry,
-    review_model: &Model,
-    messages: &[Message],
-    options: &StreamOptions,
-    config: &AgentConfig,
-    event_tx: &EventSender,
-) -> bool {
-    let _ = event_tx.try_send(StreamEvent::Phase {
-        phase: tau_agent_base::types::AgentPhase::Compacting,
-        turn_started_at_ms: None,
-        phase_started_at_ms: None,
-    });
-
-    // Extract the last N messages for review.
-    let start = messages.len().saturating_sub(LOOP_REVIEW_MESSAGE_COUNT);
-    let recent: Vec<Message> = messages[start..].to_vec();
-
-    // Format them as a single user message for the reviewer.
+/// Build the user-message text used for a loop-review LLM call from the
+/// supplied (already-trimmed) messages.
+///
+/// Tool-result content is byte-truncated to 1000 bytes, rounded down to a
+/// UTF-8 char boundary so multi-byte characters near the limit don't panic.
+fn build_loop_review_text(recent: &[Message]) -> String {
     let mut review_text = String::from("Here are the last messages from the session:\n\n");
     for (i, msg) in recent.iter().enumerate() {
         review_text.push_str(&format!("--- Message {} ---\n", i + 1));
@@ -658,7 +643,7 @@ async fn run_loop_review(
                     .join("\n");
                 // Truncate long tool results for the review.
                 if content.len() > 1000 {
-                    review_text.push_str(&content[..1000]);
+                    review_text.push_str(tau_agent_base::truncate_str(&content, 1000));
                     review_text.push_str("\n[...truncated...]\n");
                 } else {
                     review_text.push_str(&content);
@@ -677,6 +662,31 @@ async fn run_loop_review(
         review_text.push('\n');
     }
     review_text.push_str("Is this session making PROGRESS or is it STUCK?");
+    review_text
+}
+
+/// Run an inline LLM call to review whether the session is stuck.
+/// Returns `true` if the session appears stuck.
+async fn run_loop_review(
+    registry: &ProviderRegistry,
+    review_model: &Model,
+    messages: &[Message],
+    options: &StreamOptions,
+    config: &AgentConfig,
+    event_tx: &EventSender,
+) -> bool {
+    let _ = event_tx.try_send(StreamEvent::Phase {
+        phase: tau_agent_base::types::AgentPhase::Compacting,
+        turn_started_at_ms: None,
+        phase_started_at_ms: None,
+    });
+
+    // Extract the last N messages for review.
+    let start = messages.len().saturating_sub(LOOP_REVIEW_MESSAGE_COUNT);
+    let recent: Vec<Message> = messages[start..].to_vec();
+
+    // Format them as a single user message for the reviewer.
+    let review_text = build_loop_review_text(&recent);
 
     let review_context = Context {
         system_prompt: Some(LOOP_REVIEW_SYSTEM_PROMPT.into()),
@@ -1281,6 +1291,7 @@ mod tests {
                     assert_eq!(target_session_id, "caller");
                     assert_eq!(text, "hello");
                 }
+                other => panic!("unexpected post-persist action: {:?}", other),
             }
         });
     }
@@ -1380,6 +1391,7 @@ mod tests {
                             } => {
                                 s.push((target_session_id.clone(), text.clone()));
                             }
+                            PostPersistAction::StopAgentLoop { .. } => {}
                         }
                     }
                 })),
@@ -1407,7 +1419,96 @@ mod tests {
         });
     }
 
+    /// `PostPersistAction::StopAgentLoop` flips a flag whose `should_stop`
+    /// callback returns true, so the agent loop exits after persisting the
+    /// tool result without consulting the LLM for another turn.  This is
+    /// the load-bearing piece behind `session_succeed` (task 915).
     #[test]
+    fn stop_agent_loop_action_terminates_loop_after_tool_result() {
+        smol::block_on(async {
+            // Three queued LLM responses: tool-call, then two text replies
+            // the agent must NOT consume because the loop should stop
+            // after the first tool result.
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "mock".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                MockResponse::Text("should not be reached 1".into()),
+                MockResponse::Text("should not be reached 2".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = MockToolExecutor::new();
+            let actions = vec![PostPersistAction::StopAgentLoop {
+                reason: "test".into(),
+            }];
+            worker.handle().on_tool(
+                "mock",
+                MockToolResponse::SuccessWithActions("ok".into(), actions.clone()),
+            );
+
+            // The user wires a `should_stop` callback that reads a shared
+            // flag flipped from inside `post_persist_callback`.  This
+            // mirrors the production wiring in `agent_runner.rs`.
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_flag_pp = stop_flag.clone();
+            let stop_flag_check = stop_flag.clone();
+            let config = AgentConfig {
+                should_stop: Some(Box::new(move || {
+                    stop_flag_check.load(std::sync::atomic::Ordering::Relaxed)
+                })),
+                post_persist_callback: Some(Box::new(move |actions: &[PostPersistAction]| {
+                    for a in actions {
+                        if let PostPersistAction::StopAgentLoop { .. } = a {
+                            stop_flag_pp.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })),
+                ..Default::default()
+            };
+
+            let (tx, _rx) = smol::channel::unbounded();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .expect("run");
+
+            // Loop ended cleanly (not via max_turns).  The tool result is
+            // the last message; no follow-up assistant text from the
+            // queued mock responses.
+            assert!(!result.max_turns_reached, "loop must NOT hit max_turns");
+            let last = context.messages.last().expect("at least one message");
+            match last {
+                Message::ToolResult(_) => {}
+                other => panic!("last message must be the tool result, got: {:?}", other),
+            }
+            // Defensive: ensure no Assistant message was appended after
+            // the tool result — the agent must not consult the LLM again.
+            let assistant_after_tool = context
+                .messages
+                .iter()
+                .rev()
+                .take_while(|m| !matches!(m, Message::ToolResult(_)))
+                .any(|m| matches!(m, Message::Assistant(_)));
+            assert!(
+                !assistant_after_tool,
+                "no assistant message must follow the StopAgentLoop tool result"
+            );
+        });
+    }
+
+    #[test]
+
     fn loop_review_progress_continues() {
         // review_interval=3: 3 tool-call turns, then review says PROGRESS,
         // then 1 more turn that ends with Text (natural stop).
@@ -2923,5 +3024,46 @@ mod tests {
                 "tracked PGIDs should be empty after cancel"
             );
         });
+    }
+
+    /// Regression test for task 952: `&content[..1000]` would panic when the
+    /// 1000th byte fell inside a multi-byte UTF-8 character (e.g. the
+    /// box-drawing char `─`, U+2500, 3 bytes). After the fix the loop-review
+    /// text builder uses `truncate_str`, which rounds down to the nearest
+    /// char boundary instead of panicking.
+    #[test]
+    fn build_loop_review_text_does_not_panic_on_utf8_boundary() {
+        // 998 ASCII bytes followed by 5 box-drawing chars (3 bytes each).
+        // Boundaries land at 998, 1001, 1004, 1007, 1010, 1013 — so byte
+        // index 1000 is inside the first ─ and the old `&content[..1000]`
+        // would panic here.
+        let mut content = "a".repeat(998);
+        content.push_str("─────");
+        assert_eq!(content.len(), 998 + 15);
+
+        let tr = ToolResultMessage::success("tc1", "bash", content);
+        let messages = vec![Message::ToolResult(tr)];
+
+        let text = build_loop_review_text(&messages);
+
+        // Must contain the 998 "a"s and the truncation marker.
+        assert!(text.contains(&"a".repeat(998)));
+        assert!(text.contains("[...truncated...]"));
+        // Must not include the full ASCII run + all box-drawing chars
+        // (i.e. truncation actually happened).
+        assert!(!text.contains("─────"));
+    }
+
+    /// Sanity: short tool-result content takes the non-truncating path
+    /// and is included verbatim.
+    #[test]
+    fn build_loop_review_text_short_content_not_truncated() {
+        let tr = ToolResultMessage::success("tc1", "bash", "hello ─ world");
+        let messages = vec![Message::ToolResult(tr)];
+
+        let text = build_loop_review_text(&messages);
+
+        assert!(text.contains("hello ─ world"));
+        assert!(!text.contains("[...truncated...]"));
     }
 }

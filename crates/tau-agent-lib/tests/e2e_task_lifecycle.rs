@@ -1690,3 +1690,523 @@ fn watchdog_recovers_task_stuck_without_session_id() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// no_merge task lifecycle tests (task #942)
+// ---------------------------------------------------------------------------
+
+/// Full lifecycle for a no_merge task:
+/// `filed (interactive) → ready → active → review → approved → done`.
+///
+/// Asserts:
+/// - The task never gets a branch or worktree (scheduler skips
+///   provisioning for `no_merge=true`).
+/// - On approval the task transitions directly to `done` (no merge
+///   ceremony, no `merging` state).
+/// - `done` is terminal: subsequent transitions are rejected.
+#[test]
+fn no_merge_task_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    // Generous response budget for any auto-dispatched worker / reviewer
+    // sessions. The no_merge task does no real work — we drive the state
+    // transitions manually — but the dispatched sessions still consume
+    // mock responses for any chat turns they execute before shutdown.
+    let server = start_server_with_tasks(
+        &repo,
+        (0..16)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // File a no_merge task directly as `ready`. The auto-downgrade to
+    // planning is suppressed for no_merge tasks (no files to populate),
+    // so this should land in `ready` immediately.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "Investigate slow startup",
+            "initial_state": "ready",
+            "no_merge": true,
+            "message": "figure out why X is slow",
+        }),
+    );
+    let task_id = task["id"].as_i64().unwrap();
+    assert_eq!(task["state"].as_str().unwrap(), "ready");
+    assert_eq!(
+        task["no_merge"].as_bool(),
+        Some(true),
+        "no_merge flag should be persisted on creation"
+    );
+
+    // Scheduler should pick it up and transition it to `active` WITHOUT
+    // creating a branch or worktree.
+    let task_payload =
+        wait_for_task_state(&server, &sid, task_id, "active", Duration::from_secs(10));
+    let task_data = &task_payload["task"];
+    assert!(
+        task_data["branch"].is_null(),
+        "no_merge task must have null branch, got {:?}",
+        task_data["branch"]
+    );
+    assert!(
+        task_data["worktree_path"].is_null(),
+        "no_merge task must have null worktree_path, got {:?}",
+        task_data["worktree_path"]
+    );
+
+    // Worker reports findings and transitions active → review.
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_message",
+        serde_json::json!({
+            "id": task_id,
+            "content": "Investigation: startup is slow because of X. Recommend Y.",
+        }),
+    );
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": task_id, "state": "review"}),
+    );
+    assert_eq!(task["state"].as_str().unwrap(), "review");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Reviewer approves → approved.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": task_id, "state": "approved"}),
+    );
+    assert_eq!(task["state"].as_str().unwrap(), "approved");
+
+    // The MergeNeeded event auto-fires; for a no_merge task the merge
+    // sweep skips the ceremony and transitions to `done` directly.
+    let final_payload =
+        wait_for_task_state(&server, &sid, task_id, "done", Duration::from_secs(15));
+    let final_task = &final_payload["task"];
+    assert_eq!(final_task["state"].as_str().unwrap(), "done");
+    assert!(
+        final_task["branch"].is_null(),
+        "no_merge task must still have null branch after done"
+    );
+    assert!(
+        final_task["worktree_path"].is_null(),
+        "no_merge task must still have null worktree_path after done"
+    );
+
+    // The no_merge task never went through `merging`. We assert this
+    // indirectly: the task moved straight from `approved` to `done` in
+    // the previous wait_for_task_state call — had it taken the merging
+    // detour, the wait would have observed `merging` first, but the
+    // explicit transition path in the scheduler's no_merge branch goes
+    // approved → done with no `merging` step in between. Additionally
+    // there is no merge commit on main attributable to this task,
+    // verified by the absence of a task branch below.
+
+    // `done` is terminal: an attempt to transition out must be rejected.
+    let err = exec_tool_err(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": task_id, "state": "active"}),
+    );
+    assert!(
+        err.to_lowercase().contains("transition") || err.to_lowercase().contains("invalid"),
+        "transition out of done should be rejected, got: {err}"
+    );
+
+    // The task on disk: no branch was ever created in git either.
+    let branches = git(&repo, &["branch", "--list"]);
+    assert!(
+        !branches.contains(&format!("task-{}", task_id)),
+        "git should not have a branch for the no_merge task, got: {}",
+        branches
+    );
+
+    server.shutdown();
+}
+
+/// Coexistence: a no_merge investigation task and a code-merge task
+/// both sit in `approved`. A single merge sweep transitions the
+/// no_merge task to `done` AND merges the code task in one pass; the
+/// no_merge transition does not block the code merge and vice versa.
+#[test]
+fn no_merge_task_coexists_with_code_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let server = start_server_with_tasks(
+        &repo,
+        (0..32)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // ----- Code task first -----
+    // (filed first to get its branch+worktree; while it's in-flight the
+    // no_merge task can run in parallel because their file-claims are
+    // disjoint — the no_merge task explicitly opts in to the file-less
+    // slot via no `affected_files` only after the code task has its
+    // worktree.)
+    let code_task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "add file foo.txt",
+            "initial_state": "ready",
+            "affected_files": ["foo.txt"],
+            "message": "create foo.txt with hello",
+        }),
+    );
+    let code_id = code_task["id"].as_i64().unwrap();
+    assert!(
+        !code_task["no_merge"].as_bool().unwrap_or(false),
+        "code task should default to no_merge=false"
+    );
+
+    let code_active =
+        wait_for_task_state(&server, &sid, code_id, "active", Duration::from_secs(10));
+    let code_worktree = code_active["task"]["worktree_path"]
+        .as_str()
+        .expect("code task must have a worktree")
+        .to_string();
+    let wt_path = std::path::Path::new(&code_worktree);
+
+    // Worker writes the file and commits.
+    std::fs::write(wt_path.join("foo.txt"), "hello\n").unwrap();
+    git(wt_path, &["add", "foo.txt"]);
+    git(wt_path, &["commit", "-m", "Add foo.txt"]);
+    git(wt_path, &["rebase", "main"]);
+
+    // Move code task to `review` then `approved` — these states are NOT
+    // in-flight, so the file-less no_merge task can now schedule
+    // alongside it.
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": code_id, "state": "review"}),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": code_id, "state": "approved"}),
+    );
+
+    // ----- no_merge task -----
+    let no_merge_task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "audit auth module",
+            "initial_state": "ready",
+            "no_merge": true,
+            "message": "check whether auth needs hardening",
+        }),
+    );
+    let no_merge_id = no_merge_task["id"].as_i64().unwrap();
+
+    // Drive no_merge task to approved.
+    let _ = wait_for_task_state(
+        &server,
+        &sid,
+        no_merge_id,
+        "active",
+        Duration::from_secs(10),
+    );
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": no_merge_id, "state": "review"}),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": no_merge_id, "state": "approved"}),
+    );
+
+    // The code task lands on `merged`; the no_merge task lands on
+    // `done`. Both must reach their respective terminals — if either
+    // hung the assertions below would time out.
+    let no_merge_final =
+        wait_for_task_state(&server, &sid, no_merge_id, "done", Duration::from_secs(20));
+    let code_final = wait_for_task_state(&server, &sid, code_id, "merged", Duration::from_secs(20));
+
+    assert_eq!(no_merge_final["task"]["state"].as_str().unwrap(), "done");
+    assert!(
+        no_merge_final["task"]["branch"].is_null(),
+        "no_merge task must have null branch"
+    );
+    assert_eq!(code_final["task"]["state"].as_str().unwrap(), "merged");
+
+    // The code change actually landed on main.
+    let content = git(&repo, &["show", "main:foo.txt"]);
+    assert!(
+        content.contains("hello"),
+        "foo.txt should be on main after merge, got: {}",
+        content
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Task 1050: terminal-subtask wake forwards past dead creator session
+// ---------------------------------------------------------------------------
+
+/// Helper: open the tasks plugin's sqlite DB and run a SQL statement
+/// directly. Used to forge scenarios that the plugin's own RPC paths
+/// won't produce naturally — e.g. swapping a `creator` row from one
+/// session to another, or stamping a task to `merged` without walking
+/// the full state machine.
+fn tasks_db_execute(repo_path: &std::path::Path, sql: &str, params: &[&dyn rusqlite::ToSql]) {
+    let tasks_db_path = repo_path
+        .parent()
+        .expect("repo has parent")
+        .join("xdg_data")
+        .join("tau")
+        .join("tasks.db");
+    let conn = rusqlite::Connection::open(&tasks_db_path)
+        .expect("open plugin tasks.db for direct mutation");
+    conn.execute(sql, rusqlite::params_from_iter(params))
+        .expect("tasks.db direct execute");
+}
+
+/// Regression for task 1050: when the session that filed a subtask
+/// has terminated (its own task is in a terminal state, agent loop
+/// gone), the terminal-state wake for the subtask must be forwarded
+/// up the task-creator chain to a still-live ancestor.
+///
+/// Scenario:
+///   * Orchestrator session O files task A as ready. The scheduler
+///     dispatches a worker session W_A.
+///   * Task A is force-stamped `merged` (W_A is now "the worker of a
+///     terminal task"; its agent loop will not be resumed).
+///   * Subtask B is filed under A; we then rewrite B's `creator` row
+///     in `task_sessions` to point at W_A (modelling the case where
+///     A's worker filed B before terminating).
+///   * B is transitioned to `failed` (a terminal state), which fires
+///     `notify_state_change_split`'s creator-wake branch.
+///
+/// Assertion: O's session message history (via `GetMessages`) contains
+/// the QueueMessage for B's terminal transition. Without the
+/// task-1050 fix the wake would have landed on W_A and stalled there.
+#[test]
+fn terminal_subtask_wakes_orchestrator_past_dead_creator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let server = start_server_with_tasks(
+        &repo,
+        (0..16)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    // O = orchestrator / controller session.
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // 1. File task A as ready and wait for the scheduler to dispatch
+    //    a worker session W_A.
+    let task_a = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "A (orchestrator-filed)",
+            "initial_state": "ready",
+            "affected_files": ["a.txt"],
+            "message": "task A",
+        }),
+    );
+    let task_a_id = task_a["id"].as_i64().unwrap();
+    let _ = wait_for_task_state(&server, &sid, task_a_id, "active", Duration::from_secs(10));
+    let task_a_payload =
+        wait_for_task_session_id(&server, &sid, task_a_id, Duration::from_secs(10));
+    let w_a_session = task_a_payload["task"]["session_id"]
+        .as_str()
+        .expect("task A should have a worker session_id")
+        .to_string();
+
+    // 2. Force task A's state to `merged` directly. This makes W_A
+    //    appear as "the worker of a terminal task" — the durable
+    //    signal `resolve_done_recipient` keys off.
+    tasks_db_execute(
+        &repo,
+        "UPDATE tasks SET state = 'merged' WHERE id = ?1",
+        &[&task_a_id],
+    );
+
+    // 3. File subtask B from O. The plugin records O as B's creator.
+    let task_b = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "B (subtask)",
+            "parent_id": task_a_id,
+            "initial_state": "ready",
+            "affected_files": ["b.txt"],
+            "message": "task B",
+        }),
+    );
+    let task_b_id = task_b["id"].as_i64().unwrap();
+
+    // 4. Rewrite B's creator row from O → W_A. This models the
+    //    scenario where W_A (now-terminated) filed B before its agent
+    //    loop ended. We do it via raw SQL because the plugin doesn't
+    //    expose a "reassign creator" RPC — the row is normally a
+    //    one-shot insert at task-creation time.
+    tasks_db_execute(
+        &repo,
+        "UPDATE task_sessions SET session_id = ?1 \
+         WHERE task_id = ?2 AND role = 'creator'",
+        &[&w_a_session, &task_b_id],
+    );
+
+    // Sanity: B's creator row is now W_A.
+    {
+        let tasks_db_path = repo
+            .parent()
+            .unwrap()
+            .join("xdg_data")
+            .join("tau")
+            .join("tasks.db");
+        let conn = rusqlite::Connection::open(&tasks_db_path).unwrap();
+        let creator: String = conn
+            .query_row(
+                "SELECT session_id FROM task_sessions \
+                 WHERE task_id = ?1 AND role = 'creator'",
+                rusqlite::params![task_b_id],
+                |row| row.get(0),
+            )
+            .expect("B should have a creator row");
+        assert_eq!(creator, w_a_session);
+    }
+
+    // 5. Transition B to a terminal state. `failed` is reachable from
+    //    any non-terminal state via the universal-override rule, so
+    //    we don't have to walk through review/approved/merging.
+    //    This fires `notify_state_change_split` with `task.state` =
+    //    `Failed` (terminal), which dispatches the creator wake.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({
+            "id": task_b_id,
+            "state": "failed",
+        }),
+    );
+    assert_eq!(task["state"].as_str().unwrap(), "failed");
+
+    // Helper: extract concatenated text from a UserMessage's content.
+    let user_text = |u: &tau_agent_lib::UserMessage| -> String {
+        u.content
+            .iter()
+            .filter_map(|c| match c {
+                tau_agent_lib::types::UserContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // 6. Wait for the queued message to land on O's history.
+    //    The notifier is best-effort and runs synchronously inside
+    //    the plugin's task_update handler, but the message ride is
+    //    queue → server → history; allow a generous deadline.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut o_received_b_wake = false;
+    let mut w_a_received_b_wake = false;
+    while Instant::now() < deadline {
+        let conn = server.connect();
+        let resp = send_recv(
+            &conn,
+            &Request::GetMessages {
+                session_id: sid.clone(),
+            },
+        );
+        if let Response::Messages { messages } = resp {
+            for m in &messages {
+                if let tau_agent_lib::types::Message::User(u) = m {
+                    let text = user_text(u);
+                    // The QueueMessage from `notify_state_change_split`
+                    // carries the task title and id; sender_info
+                    // ("task notifier") is metadata only and may or
+                    // may not be embedded in the persisted user
+                    // message depending on drain path. Match on the
+                    // task identifier instead.
+                    if text.contains(&format!("#{}", task_b_id)) || text.contains("B (subtask)") {
+                        o_received_b_wake = true;
+                    }
+                }
+            }
+        }
+
+        // Also peek at W_A's inbox to confirm the wake did NOT land
+        // there (the bug being fixed).
+        let conn2 = server.connect();
+        let resp2 = send_recv(
+            &conn2,
+            &Request::GetMessages {
+                session_id: w_a_session.clone(),
+            },
+        );
+        if let Response::Messages { messages } = resp2 {
+            for m in &messages {
+                if let tau_agent_lib::types::Message::User(u) = m {
+                    let text = user_text(u);
+                    if text.contains(&format!("#{}", task_b_id)) || text.contains("B (subtask)") {
+                        w_a_received_b_wake = true;
+                    }
+                }
+            }
+        }
+
+        if o_received_b_wake {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        o_received_b_wake,
+        "orchestrator session must receive B's terminal wake \
+         (forwarded past dead worker session {})",
+        w_a_session
+    );
+    assert!(
+        !w_a_received_b_wake,
+        "creator wake must NOT land on the dead worker {} \
+         (the bug task 1050 fixes)",
+        w_a_session
+    );
+
+    server.shutdown();
+}

@@ -1,5 +1,8 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use futures::FutureExt;
 
 use super::notifications::{
     broadcast_to_subscribers, broadcast_to_subscribers_and_wait, emit_phase, emit_phase_and_wait,
@@ -312,6 +315,32 @@ impl crate::worker::ToolExecutor for PluginExecutor {
     }
 }
 
+/// Marker prefix used on the `crate::Error::Io` returned by the
+/// `catch_unwind` wrappers in this module so the post-turn cleanup logic
+/// can distinguish a panic from a regular error. Used by `is_panic_error`
+/// and the various `Err` arms in dispatch.rs / agent_runner.rs.
+pub(super) const PANIC_ERROR_PREFIX: &str = "agent panicked: ";
+
+/// Convert a `catch_unwind` payload into a human-readable string.  Best-
+/// effort: handles the two common payload types (`&'static str` and
+/// `String`) and falls back to a generic placeholder for anything else.
+pub(super) fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// True iff `e` was produced by one of the `catch_unwind` wrappers in
+/// this module.  Cleanup paths use this to surface a `"panicked"` exit
+/// status (vs `"error"`) so panics are visible in the session timeline.
+pub(super) fn is_panic_error(e: &crate::Error) -> bool {
+    matches!(e, crate::Error::Io(msg) if msg.starts_with(PANIC_ERROR_PREFIX))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_agent_turn<'a, W: futures::io::AsyncWrite + Unpin + Send + 'a>(
     state: &'a SharedState,
@@ -360,350 +389,403 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     session_locks: &SessionLocks,
     test_overrides: &SharedTestOverrides,
 ) -> crate::Result<crate::agent::AgentResult> {
-    // Check provider throttle — sleep if rate limited
-    if let Some(remaining) = throttle.check(&model.provider) {
-        let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
-        tracing::info!(provider = %model.provider, wait = %human, "provider throttled");
-        let msg = format!(
-            "provider '{}' rate limited, retrying in {}...",
-            model.provider, human
-        );
-        // Notify as a non-fatal status (not Error — Error would cause the TUI
-        // to switch out of Streaming mode prematurely).
-        let status_resp = Response::Stream {
-            event: Box::new(StreamEvent::Status {
-                message: msg.clone(),
-            }),
-        };
-        send(writer, &status_resp).await.ok();
-        broadcast_to_subscribers(state, session_id, &status_resp);
-        // Emit rate-limited phase
-        emit_phase(state, session_id, crate::types::AgentPhase::RateLimited);
-        // Sleep with periodic cancellation checks
-        let deadline = std::time::Instant::now() + remaining;
-        while std::time::Instant::now() < deadline {
-            if cancel_flag.load(Ordering::Relaxed) || shutdown.is_shutting_down() {
-                return Err(crate::Error::Cancelled);
+    // Wrap the loop body in `catch_unwind` so a panic anywhere in the
+    // engine, providers, plugins, or executor surfaces as a normal `Err`
+    // instead of leaking out of `smol::spawn(...).detach()` and wedging
+    // the session forever (no terminal broadcast, no `live_sessions`
+    // cleanup, no parent notification). See task #957.
+    //
+    // `AssertUnwindSafe` is required because the body holds `&mut W`,
+    // `&mut Context`, etc.  Safe here because callers drop both via
+    // their own scopes on panic — we don't read post-panic state.
+    let result = AssertUnwindSafe(async {
+        // Check provider throttle — sleep if rate limited
+        if let Some(remaining) = throttle.check(&model.provider) {
+            let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
+            tracing::info!(provider = %model.provider, wait = %human, "provider throttled");
+            let msg = format!(
+                "provider '{}' rate limited, retrying in {}...",
+                model.provider, human
+            );
+            // Notify as a non-fatal status (not Error — Error would cause the TUI
+            // to switch out of Streaming mode prematurely).
+            let status_resp = Response::Stream {
+                event: Box::new(StreamEvent::Status {
+                    message: msg.clone(),
+                }),
+            };
+            send(writer, &status_resp).await.ok();
+            broadcast_to_subscribers(state, session_id, &status_resp);
+            // Emit rate-limited phase
+            emit_phase(state, session_id, crate::types::AgentPhase::RateLimited);
+            // Sleep with periodic cancellation checks
+            let deadline = std::time::Instant::now() + remaining;
+            while std::time::Instant::now() < deadline {
+                if cancel_flag.load(Ordering::Relaxed) || shutdown.is_shutting_down() {
+                    return Err(crate::Error::Cancelled);
+                }
+                smol::Timer::after(std::time::Duration::from_secs(1)).await;
             }
-            smol::Timer::after(std::time::Duration::from_secs(1)).await;
         }
-    }
 
-    // Preflight: resolve API key unless the provider is a no-key provider
-    // (e.g. the `log` provider). This is the P1 safety net from task 582 —
-    // even if an agent loop somehow kicks off on a log-provider session we
-    // do NOT want to emit "no API key for provider: log".
-    let needs_key = {
-        let st = lock_state(state);
-        st.registry.needs_api_key(&model.api)
-    };
-    let api_key = if needs_key {
-        let api_key = {
+        // Preflight: resolve API key unless the provider is a no-key provider
+        // (e.g. the `log` provider). This is the P1 safety net from task 582 —
+        // even if an agent loop somehow kicks off on a log-provider session we
+        // do NOT want to emit "no API key for provider: log".
+        let needs_key = {
             let st = lock_state(state);
-            resolve_api_key(&st.auth, &st.config, &model.provider)?
+            st.registry.needs_api_key(&model.api)
         };
-        match api_key {
-            Some(key) => Some(key),
-            None => {
-                tracing::error!(
-                    session_id = %session_id,
-                    model = %model.id,
-                    provider = %model.provider,
-                    ts_ms = crate::types::timestamp_ms(),
-                    "agent_runner: NoApiKey early-return — see resolve_api_key warning above"
-                );
-                return Err(crate::Error::NoApiKey(model.provider.clone()));
+        let api_key = if needs_key {
+            let api_key = {
+                let st = lock_state(state);
+                resolve_api_key(&st.auth, &st.config, &model.provider)?
+            };
+            match api_key {
+                Some(key) => Some(key),
+                None => {
+                    tracing::error!(
+                        session_id = %session_id,
+                        model = %model.id,
+                        provider = %model.provider,
+                        ts_ms = crate::types::timestamp_ms(),
+                        "agent_runner: NoApiKey early-return — see resolve_api_key warning above"
+                    );
+                    return Err(crate::Error::NoApiKey(model.provider.clone()));
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
-    let options = StreamOptions {
-        api_key,
-        ..Default::default()
-    };
+        let options = StreamOptions {
+            api_key,
+            ..Default::default()
+        };
 
-    emit_phase(state, session_id, crate::types::AgentPhase::Connecting);
+        emit_phase(state, session_id, crate::types::AgentPhase::Connecting);
 
-    let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
+        let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
 
-    // Set up has_queued flag for this session
-    let has_queued_flag = {
-        let mut st = lock_state(state);
-        st.has_queued
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone()
-    };
+        // Set up has_queued flag for this session
+        let has_queued_flag = {
+            let mut st = lock_state(state);
+            st.has_queued
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
 
-    let shutdown_flag = shutdown.flag.clone();
-    let cancel_flag_clone = cancel_flag.clone();
-    let state_clone_persist = state.clone();
-    let session_id_persist = session_id.to_string();
-    let state_clone_drain = state.clone();
-    let session_id_drain = session_id.to_string();
-    let has_queued_clone = has_queued_flag.clone();
-    let agent_config = crate::agent::AgentConfig {
-        should_stop: Some(Box::new(move || {
-            shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
-        })),
-        cancel_token: Some(tau_agent_base::types::CancelToken::from_flag(
-            cancel_flag.clone(),
-        )),
-        drain_queued: Some(Box::new(move || {
-            if has_queued_clone.swap(false, Ordering::Acquire) {
-                let st = state_clone_drain.lock().expect("state mutex poisoned");
-                st.db
-                    .drain_queued_messages(&session_id_drain)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        })),
-        on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
-            let st = state_clone_persist.lock().expect("state mutex poisoned");
-            if let Err(e) = st.db.append_message(&session_id_persist, msg) {
-                tracing::warn!(%e, "db error persisting agent message");
-            }
-        }))),
-        post_persist_callback: {
-            let state_clone_pp = state.clone();
-            Some(Box::new(
-                move |actions: &[tau_agent_base::types::PostPersistAction]| {
-                    for action in actions {
-                        match action {
-                            tau_agent_base::types::PostPersistAction::EmitInfoMessage {
-                                target_session_id,
-                                text,
-                            } => {
-                                super::notifications::queue_info_to_session(
-                                    &state_clone_pp,
+        // Per-session "stop after next tool result" flag — set by
+        // PostPersistAction::StopAgentLoop and read by `should_stop` so the
+        // agent loop exits cleanly without consulting the LLM again.  Reset
+        // here for each Chat turn (a previous turn that succeeded would have
+        // left the predecessor session retired, but a defensive reset keeps
+        // the flag honest if the row is somehow re-used in tests).
+        let stop_after_tool_flag: Arc<AtomicBool> = {
+            let mut st = lock_state(state);
+            let flag = st
+                .stop_after_tool_flags
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            flag.store(false, Ordering::Relaxed);
+            flag
+        };
+
+        let shutdown_flag = shutdown.flag.clone();
+        let cancel_flag_clone = cancel_flag.clone();
+        let stop_after_tool_clone = stop_after_tool_flag.clone();
+        let state_clone_persist = state.clone();
+        let session_id_persist = session_id.to_string();
+        let state_clone_drain = state.clone();
+        let session_id_drain = session_id.to_string();
+        let has_queued_clone = has_queued_flag.clone();
+        let agent_config = crate::agent::AgentConfig {
+            should_stop: Some(Box::new(move || {
+                shutdown_flag.load(Ordering::Relaxed)
+                    || cancel_flag_clone.load(Ordering::Relaxed)
+                    || stop_after_tool_clone.load(Ordering::Relaxed)
+            })),
+            cancel_token: Some(tau_agent_base::types::CancelToken::from_flag(
+                cancel_flag.clone(),
+            )),
+            drain_queued: Some(Box::new(move || {
+                if has_queued_clone.swap(false, Ordering::Acquire) {
+                    let st = state_clone_drain.lock().expect("state mutex poisoned");
+                    st.db
+                        .drain_queued_messages(&session_id_drain)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            })),
+            on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
+                let st = state_clone_persist.lock().expect("state mutex poisoned");
+                if let Err(e) = st.db.append_message(&session_id_persist, msg) {
+                    tracing::warn!(%e, "db error persisting agent message");
+                }
+            }))),
+            post_persist_callback: {
+                let state_clone_pp = state.clone();
+                Some(Box::new(
+                    move |actions: &[tau_agent_base::types::PostPersistAction]| {
+                        for action in actions {
+                            match action {
+                                tau_agent_base::types::PostPersistAction::EmitInfoMessage {
                                     target_session_id,
                                     text,
-                                );
+                                } => {
+                                    super::notifications::queue_info_to_session(
+                                        &state_clone_pp,
+                                        target_session_id,
+                                        text,
+                                    );
+                                }
+                                tau_agent_base::types::PostPersistAction::StopAgentLoop { reason } => {
+                                    tracing::info!(
+                                        %reason,
+                                        "PostPersistAction::StopAgentLoop set; agent loop will exit after this tool result"
+                                    );
+                                    stop_after_tool_flag.store(true, Ordering::Relaxed);
+                                }
                             }
                         }
+                    },
+                ))
+            },
+            refresh_api_key: {
+                let state_clone_refresh = state.clone();
+                let provider_name = model.provider.clone();
+                Some(Box::new(move |stale: Option<&str>| {
+                    let st = state_clone_refresh.lock().expect("state mutex poisoned");
+                    resolve_api_key_excluding(&st.auth, &st.config, &provider_name, stale)
+                        .ok()
+                        .flatten()
+                }))
+            },
+            idle_timeout_secs: std::env::var("TAU_STREAM_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::agent::AgentConfig::default().idle_timeout_secs),
+            tool_gate: Some(Box::new(crate::tool_gate::assess)),
+            ..Default::default()
+        };
+
+        let registry_clone = {
+            let st = lock_state(state);
+            st.registry.clone()
+        };
+        let (child_budget, project_name) = {
+            let st = lock_state(state);
+            st.db
+                .get_session(session_id)
+                .ok()
+                .flatten()
+                .map(|s| (s.child_budget, s.project_name))
+                .unwrap_or((0, None))
+        };
+        let plugin_tools = if !test_overrides.mock_tools.is_empty() {
+            test_overrides.mock_tools.clone()
+        } else {
+            let pm = plugins.lock().expect("plugins mutex poisoned");
+            pm.tool_schemas(session_id, child_budget)
+        };
+
+        let model_clone = model.clone();
+        let options_clone = options;
+        let cwd_clone = cwd.to_string();
+        let mut context_clone = context.clone();
+
+        let plugins_clone = plugins.clone();
+        let state_clone_exec = state.clone();
+        let session_locks_clone = session_locks.clone();
+        let in_flight = shutdown.clone();
+        let shutdown_clone = shutdown.clone();
+        let throttle_clone = throttle.clone();
+        let session_id_for_executor = session_id.to_string();
+        let test_overrides_clone = test_overrides.clone();
+
+        // Channel for child Chat requests spawned by orchestration tools.
+        // The receiver task spawns async agent turns for each queued chat.
+        let (chat_spawn_tx, chat_spawn_rx) = smol::channel::unbounded::<super::state::ChatSpawn>();
+
+        // Spawn a task that processes queued child chats.
+        let spawn_state = state.clone();
+        let spawn_plugins = plugins.clone();
+        let spawn_shutdown = shutdown.clone();
+        let spawn_session_locks = session_locks.clone();
+        let spawn_throttle = throttle.clone();
+        let spawn_overrides = test_overrides.clone();
+        smol::spawn(async move {
+            while let Ok(spawn) = chat_spawn_rx.recv().await {
+                // Each child chat gets its own async task (fire-and-forget).
+                let s = spawn_state.clone();
+                let p = spawn_plugins.clone();
+                let sh = spawn_shutdown.clone();
+                let sl = spawn_session_locks.clone();
+                let th = spawn_throttle.clone();
+                let ov = spawn_overrides.clone();
+                smol::spawn(async move {
+                    let super::state::ChatSpawn {
+                        session_id,
+                        text,
+                        attachments,
+                    } = spawn;
+                    let sid = session_id;
+                    if let Err(e) =
+                        run_child_chat(s, p, sh, sl, th, sid.clone(), text, attachments, ov).await
+                    {
+                        tracing::warn!(session_id = %sid, %e, "child chat error");
                     }
-                },
-            ))
-        },
-        refresh_api_key: {
-            let state_clone_refresh = state.clone();
-            let provider_name = model.provider.clone();
-            Some(Box::new(move |stale: Option<&str>| {
-                let st = state_clone_refresh.lock().expect("state mutex poisoned");
-                resolve_api_key_excluding(&st.auth, &st.config, &provider_name, stale)
-                    .ok()
-                    .flatten()
-            }))
-        },
-        idle_timeout_secs: std::env::var("TAU_STREAM_IDLE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(crate::agent::AgentConfig::default().idle_timeout_secs),
-        tool_gate: Some(Box::new(crate::tool_gate::assess)),
-        ..Default::default()
-    };
+                })
+                .detach();
+            }
+        })
+        .detach();
 
-    let registry_clone = {
-        let st = lock_state(state);
-        st.registry.clone()
-    };
-    let (child_budget, project_name) = {
-        let st = lock_state(state);
-        st.db
-            .get_session(session_id)
-            .ok()
-            .flatten()
-            .map(|s| (s.child_budget, s.project_name))
-            .unwrap_or((0, None))
-    };
-    let plugin_tools = if !test_overrides.mock_tools.is_empty() {
-        test_overrides.mock_tools.clone()
-    } else {
-        let pm = plugins.lock().expect("plugins mutex poisoned");
-        pm.tool_schemas(session_id, child_budget)
-    };
+        let agent_handle = {
+            async move {
+                in_flight.enter();
+                let mut executor: Box<dyn crate::worker::ToolExecutor> =
+                    if let Some(ref factory) = test_overrides_clone.tool_executor_factory {
+                        factory()
+                    } else {
+                        Box::new(PluginExecutor {
+                            plugins: plugins_clone,
+                            state: state_clone_exec,
+                            session_locks: session_locks_clone,
+                            chat_spawn_tx,
+                            shutdown: shutdown_clone,
+                            throttle: throttle_clone,
+                            session_id: session_id_for_executor,
+                            cwd: cwd_clone,
+                            project_name,
+                            test_overrides: test_overrides_clone.clone(),
+                        })
+                    };
+                let result = crate::agent::run(
+                    &registry_clone,
+                    &model_clone,
+                    &mut context_clone,
+                    &mut *executor,
+                    &options_clone,
+                    &agent_config,
+                    &plugin_tools,
+                    event_tx,
+                )
+                .await;
+                in_flight.leave();
+                result
+            }
+        };
 
-    let model_clone = model.clone();
-    let options_clone = options;
-    let cwd_clone = cwd.to_string();
-    let mut context_clone = context.clone();
-
-    let plugins_clone = plugins.clone();
-    let state_clone_exec = state.clone();
-    let session_locks_clone = session_locks.clone();
-    let in_flight = shutdown.clone();
-    let shutdown_clone = shutdown.clone();
-    let throttle_clone = throttle.clone();
-    let session_id_for_executor = session_id.to_string();
-    let test_overrides_clone = test_overrides.clone();
-
-    // Channel for child Chat requests spawned by orchestration tools.
-    // The receiver task spawns async agent turns for each queued chat.
-    let (chat_spawn_tx, chat_spawn_rx) = smol::channel::unbounded::<super::state::ChatSpawn>();
-
-    // Spawn a task that processes queued child chats.
-    let spawn_state = state.clone();
-    let spawn_plugins = plugins.clone();
-    let spawn_shutdown = shutdown.clone();
-    let spawn_session_locks = session_locks.clone();
-    let spawn_throttle = throttle.clone();
-    let spawn_overrides = test_overrides.clone();
-    smol::spawn(async move {
-        while let Ok(spawn) = chat_spawn_rx.recv().await {
-            // Each child chat gets its own async task (fire-and-forget).
-            let s = spawn_state.clone();
-            let p = spawn_plugins.clone();
-            let sh = spawn_shutdown.clone();
-            let sl = spawn_session_locks.clone();
-            let th = spawn_throttle.clone();
-            let ov = spawn_overrides.clone();
-            smol::spawn(async move {
-                let super::state::ChatSpawn {
-                    session_id,
-                    text,
-                    attachments,
-                } = spawn;
-                let sid = session_id;
-                if let Err(e) =
-                    run_child_chat(s, p, sh, sl, th, sid.clone(), text, attachments, ov).await
-                {
-                    tracing::warn!(session_id = %sid, %e, "child chat error");
+        let state_clone = state.clone();
+        let session_id_owned = session_id.to_string();
+        let forward_handle = async {
+            let mut writer_alive = true;
+            while let Ok(event) = event_rx.recv().await {
+                // Broadcast steering messages as UserMessage (persistence handled by on_message)
+                if let StreamEvent::SteerMessage { ref message } = event {
+                    let text = message
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let user_resp = Response::UserMessage { text };
+                    broadcast_to_subscribers(&state_clone, &session_id_owned, &user_resp);
+                    if writer_alive && send(writer, &user_resp).await.is_err() {
+                        writer_alive = false;
+                    }
+                    continue;
                 }
-            })
-            .detach();
-        }
-    })
-    .detach();
-
-    let agent_handle = {
-        async move {
-            in_flight.enter();
-            let mut executor: Box<dyn crate::worker::ToolExecutor> =
-                if let Some(ref factory) = test_overrides_clone.tool_executor_factory {
-                    factory()
-                } else {
-                    Box::new(PluginExecutor {
-                        plugins: plugins_clone,
-                        state: state_clone_exec,
-                        session_locks: session_locks_clone,
-                        chat_spawn_tx,
-                        shutdown: shutdown_clone,
-                        throttle: throttle_clone,
-                        session_id: session_id_for_executor,
-                        cwd: cwd_clone,
-                        project_name,
-                        test_overrides: test_overrides_clone.clone(),
-                    })
+                // Update stored phase from implicit stream events and, for
+                // explicit `Phase` events emitted by the engine, rebuild the
+                // event with a server-stamped `turn_started_at_ms` anchor.
+                let event = match event {
+                    StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
+                        super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            crate::types::AgentPhase::Thinking,
+                        );
+                        event
+                    }
+                    StreamEvent::TextStart { .. }
+                    | StreamEvent::TextDelta { .. }
+                    | StreamEvent::ToolcallStart { .. } => {
+                        super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            crate::types::AgentPhase::Responding,
+                        );
+                        event
+                    }
+                    StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
+                        super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            crate::types::AgentPhase::ToolExec,
+                        );
+                        event
+                    }
+                    StreamEvent::Phase { phase, .. } => {
+                        // Engine-emitted phase events don't carry a timestamp
+                        // (engine is wire-agnostic). Stamp on forward.
+                        let (turn_ts, phase_ts) = super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            phase,
+                        );
+                        StreamEvent::Phase {
+                            phase,
+                            turn_started_at_ms: turn_ts,
+                            phase_started_at_ms: phase_ts,
+                        }
+                    }
+                    other => other,
                 };
-            let result = crate::agent::run(
-                &registry_clone,
-                &model_clone,
-                &mut context_clone,
-                &mut *executor,
-                &options_clone,
-                &agent_config,
-                &plugin_tools,
-                event_tx,
-            )
-            .await;
-            in_flight.leave();
-            result
-        }
-    };
-
-    let state_clone = state.clone();
-    let session_id_owned = session_id.to_string();
-    let forward_handle = async {
-        let mut writer_alive = true;
-        while let Ok(event) = event_rx.recv().await {
-            // Broadcast steering messages as UserMessage (persistence handled by on_message)
-            if let StreamEvent::SteerMessage { ref message } = event {
-                let text = message
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        UserContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                let user_resp = Response::UserMessage { text };
-                broadcast_to_subscribers(&state_clone, &session_id_owned, &user_resp);
-                if writer_alive && send(writer, &user_resp).await.is_err() {
+                let resp = Response::Stream {
+                    event: Box::new(event),
+                };
+                broadcast_to_subscribers(&state_clone, &session_id_owned, &resp);
+                // Keep broadcasting even if the direct writer disconnected
+                // (fire-and-forget clients close immediately).
+                if writer_alive && send(writer, &resp).await.is_err() {
                     writer_alive = false;
                 }
-                continue;
             }
-            // Update stored phase from implicit stream events and, for
-            // explicit `Phase` events emitted by the engine, rebuild the
-            // event with a server-stamped `turn_started_at_ms` anchor.
-            let event = match event {
-                StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
-                    super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        crate::types::AgentPhase::Thinking,
-                    );
-                    event
-                }
-                StreamEvent::TextStart { .. }
-                | StreamEvent::TextDelta { .. }
-                | StreamEvent::ToolcallStart { .. } => {
-                    super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        crate::types::AgentPhase::Responding,
-                    );
-                    event
-                }
-                StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
-                    super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        crate::types::AgentPhase::ToolExec,
-                    );
-                    event
-                }
-                StreamEvent::Phase { phase, .. } => {
-                    // Engine-emitted phase events don't carry a timestamp
-                    // (engine is wire-agnostic). Stamp on forward.
-                    let (turn_ts, phase_ts) = super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        phase,
-                    );
-                    StreamEvent::Phase {
-                        phase,
-                        turn_started_at_ms: turn_ts,
-                        phase_started_at_ms: phase_ts,
-                    }
-                }
-                other => other,
-            };
-            let resp = Response::Stream {
-                event: Box::new(event),
-            };
-            broadcast_to_subscribers(&state_clone, &session_id_owned, &resp);
-            // Keep broadcasting even if the direct writer disconnected
-            // (fire-and-forget clients close immediately).
-            if writer_alive && send(writer, &resp).await.is_err() {
-                writer_alive = false;
-            }
+            Ok::<(), crate::Error>(())
+        };
+
+        let (agent_result, forward_result) = futures::future::join(agent_handle, forward_handle).await;
+        if let Err(e) = forward_result {
+            tracing::warn!(%e, "event forward error");
         }
-        Ok::<(), crate::Error>(())
-    };
 
-    let (agent_result, forward_result) = futures::future::join(agent_handle, forward_handle).await;
-    if let Err(e) = forward_result {
-        tracing::warn!(%e, "event forward error");
+        let agent_result = agent_result?;
+
+            Ok(agent_result)
+    })
+    .catch_unwind()
+    .await;
+
+    match result {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "agent loop panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
     }
-
-    let agent_result = agent_result?;
-
-    Ok(agent_result)
 }
 
 /// Run an agent turn for a child session (spawned by orchestration tools).
@@ -740,7 +822,23 @@ pub(super) async fn run_child_chat(
         flag
     };
 
-    let chat_result: Result<(bool, bool), crate::Error> = async {
+    // Per-session "stop after tool" flag (see task 915 / dispatch.rs).
+    let stop_after_tool_flag: Arc<AtomicBool> = {
+        let mut st = lock_state(&state);
+        let flag = st
+            .stop_after_tool_flags
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(false, Ordering::Relaxed);
+        flag.clone()
+    };
+
+    // Wrap the chat body in `catch_unwind` so a panic anywhere in the
+    // engine, providers, plugins, or executor surfaces as a normal `Err`
+    // and the existing terminal-broadcast / parent-notify cleanup path
+    // below runs.  Without this, a panic in the detached spawn would
+    // wedge the session forever.  See task #957.
+    let chat_result: Result<(bool, bool, bool), crate::Error> = match AssertUnwindSafe(async {
         // Load session
         let (stored, mut messages, cwd) = {
             let st = lock_state(&state);
@@ -872,9 +970,26 @@ pub(super) async fn run_child_chat(
             Err(e) => return Err(e),
         };
 
-        Ok((cancel_flag.load(Ordering::Relaxed), max_turns_reached))
-    }
-    .await;
+        Ok((
+            cancel_flag.load(Ordering::Relaxed),
+            max_turns_reached,
+            stop_after_tool_flag.load(Ordering::Relaxed),
+        ))
+    })
+    .catch_unwind()
+    .await
+    {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "child chat agent loop panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
+    };
 
     // Record prompt metrics for optimization
     {
@@ -884,8 +999,8 @@ pub(super) async fn run_child_chat(
         };
         if let Some(ref project_name) = project_name {
             let outcome = match &chat_result {
-                Ok((true, _)) => "cancelled",
-                Ok((false, _)) => "completed",
+                Ok((true, _, _)) => "cancelled",
+                Ok((false, _, _)) => "completed",
                 Err(_) => "error",
             };
             let (messages, sys_prompt) = {
@@ -912,7 +1027,7 @@ pub(super) async fn run_child_chat(
     // the awaiting variant so subscribers observe them before the session
     // transitions to idle via another code path.
     match chat_result {
-        Ok((true, _)) => {
+        Ok((true, _, _)) => {
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::Cancelled).await;
             // Notify parent about cancellation.
             notify_parent_of_child_completion(
@@ -927,7 +1042,7 @@ pub(super) async fn run_child_chat(
                 &test_overrides,
             );
         }
-        Ok((false, max_turns_reached)) => {
+        Ok((false, max_turns_reached, _was_succeeded)) => {
             if max_turns_reached {
                 // Notify the parent session that this child hit its step limit.
                 let parent_id = {
@@ -974,7 +1089,12 @@ pub(super) async fn run_child_chat(
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
         }
         Err(ref e) => {
-            let err_msg = format!("child agent error: {}", e);
+            let panicked = is_panic_error(e);
+            let err_msg = if panicked {
+                format!("child agent loop panicked: {}", e)
+            } else {
+                format!("child agent error: {}", e)
+            };
             broadcast_to_subscribers(
                 &state,
                 &session_id,
@@ -983,7 +1103,12 @@ pub(super) async fn run_child_chat(
                 },
             );
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
-            // Notify parent about error.
+            // Notify parent about error / panic.
+            let status = if panicked {
+                "panicked".to_string()
+            } else {
+                format!("error: {}", e)
+            };
             notify_parent_of_child_completion(
                 &state,
                 &session_locks,
@@ -991,7 +1116,7 @@ pub(super) async fn run_child_chat(
                 &shutdown,
                 &throttle,
                 &session_id,
-                &format!("error: {}", e),
+                &status,
                 None,
                 &test_overrides,
             );
@@ -1061,7 +1186,22 @@ pub(super) async fn resume_child_session(
         flag
     };
 
-    let chat_result: Result<(bool, bool), crate::Error> = async {
+    // Per-session "stop after tool" flag (see task 915 / dispatch.rs).
+    let stop_after_tool_flag: Arc<AtomicBool> = {
+        let mut st = lock_state(&state);
+        let flag = st
+            .stop_after_tool_flags
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(false, Ordering::Relaxed);
+        flag.clone()
+    };
+
+    // Wrap the resume body in `catch_unwind` so a panic anywhere in the
+    // engine, providers, plugins, or executor surfaces as a normal `Err`
+    // and the existing terminal-broadcast / parent-notify cleanup path
+    // below runs.  See task #957.
+    let chat_result: Result<(bool, bool, bool), crate::Error> = match AssertUnwindSafe(async {
         // Load session
         let (stored, mut messages, cwd) = {
             let st = lock_state(&state);
@@ -1186,14 +1326,31 @@ pub(super) async fn resume_child_session(
             Err(e) => return Err(e),
         };
 
-        Ok((cancel_flag.load(Ordering::Relaxed), max_turns_reached))
-    }
-    .await;
+        Ok((
+            cancel_flag.load(Ordering::Relaxed),
+            max_turns_reached,
+            stop_after_tool_flag.load(Ordering::Relaxed),
+        ))
+    })
+    .catch_unwind()
+    .await
+    {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "resume agent loop panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
+    };
 
     // Broadcast terminal response and notify parent (same as run_child_chat).
     // Terminal broadcasts are awaited; see module comment in notifications.rs.
     match chat_result {
-        Ok((true, _)) => {
+        Ok((true, _, _)) => {
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::Cancelled).await;
             notify_parent_of_child_completion(
                 &state,
@@ -1207,7 +1364,7 @@ pub(super) async fn resume_child_session(
                 &test_overrides,
             );
         }
-        Ok((false, max_turns_reached)) => {
+        Ok((false, max_turns_reached, _was_succeeded)) => {
             if max_turns_reached {
                 let parent_id = {
                     let st = lock_state(&state);
@@ -1252,7 +1409,12 @@ pub(super) async fn resume_child_session(
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
         }
         Err(ref e) => {
-            let err_msg = format!("child agent error: {}", e);
+            let panicked = is_panic_error(e);
+            let err_msg = if panicked {
+                format!("child agent loop panicked: {}", e)
+            } else {
+                format!("child agent error: {}", e)
+            };
             broadcast_to_subscribers(
                 &state,
                 &session_id,
@@ -1261,6 +1423,11 @@ pub(super) async fn resume_child_session(
                 },
             );
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
+            let status = if panicked {
+                "panicked".to_string()
+            } else {
+                format!("error: {}", e)
+            };
             notify_parent_of_child_completion(
                 &state,
                 &session_locks,
@@ -1268,7 +1435,7 @@ pub(super) async fn resume_child_session(
                 &shutdown,
                 &throttle,
                 &session_id,
-                &format!("error: {}", e),
+                &status,
                 None,
                 &test_overrides,
             );
@@ -1310,123 +1477,144 @@ pub(super) async fn run_compaction(
     keep_hint: Option<&str>,
     manual: bool,
 ) -> crate::Result<()> {
-    emit_phase(state, session_id, crate::types::AgentPhase::Compacting);
+    // Wrap the compaction body in `catch_unwind` so a panic in the engine
+    // / provider stack surfaces as a normal error and the caller's `Err`
+    // arm runs (logging or surfacing to the user) instead of the panic
+    // leaking out of the detached spawn.  See task #957.
+    let result = AssertUnwindSafe(async {
+        emit_phase(state, session_id, crate::types::AgentPhase::Compacting);
 
-    let settings = compaction::CompactionSettings::default();
+        let settings = compaction::CompactionSettings::default();
 
-    // Load messages and find cut point
-    let (messages, cut_idx) = {
-        let st = lock_state(state);
-        let messages = st.db.get_messages(session_id)?;
-        let cut = compaction::find_cut_point(&messages, settings.keep_recent_tokens);
-        (messages, cut)
-    };
+        // Load messages and find cut point
+        let (messages, cut_idx) = {
+            let st = lock_state(state);
+            let messages = st.db.get_messages(session_id)?;
+            let cut = compaction::find_cut_point(&messages, settings.keep_recent_tokens);
+            (messages, cut)
+        };
 
-    if cut_idx == 0 {
-        // Nothing meaningful to compact. Auto-compaction silently no-ops; for
-        // a manual `/compact` request, broadcast a Status so any subscriber
-        // (the requesting TUI plus any others watching) sees that the
-        // command was received and why nothing happened, and persist a
-        // matching Info message so there's a durable record in the
-        // transcript. Auto-compaction (manual=false) stays silent: it
-        // shouldn't spam the transcript with no-op notes.
-        if manual {
-            let text = "manual compaction: nothing to compact yet \
+        if cut_idx == 0 {
+            // Nothing meaningful to compact. Auto-compaction silently no-ops; for
+            // a manual `/compact` request, broadcast a Status so any subscriber
+            // (the requesting TUI plus any others watching) sees that the
+            // command was received and why nothing happened, and persist a
+            // matching Info message so there's a durable record in the
+            // transcript. Auto-compaction (manual=false) stays silent: it
+            // shouldn't spam the transcript with no-op notes.
+            if manual {
+                let text = "manual compaction: nothing to compact yet \
                         (history fits within keep-recent window)";
-            let info = Response::Stream {
+                let info = Response::Stream {
+                    event: Box::new(crate::types::StreamEvent::Status {
+                        message: text.to_string(),
+                    }),
+                };
+                broadcast_to_subscribers(state, session_id, &info);
+                queue_info_to_session(state, session_id, text);
+            }
+            return Ok(());
+        }
+
+        let messages_to_summarize = &messages[..cut_idx];
+        let ctx_before = compaction::estimate_context_tokens(&messages);
+
+        // Notify subscribers that compaction is starting. The requesting
+        // client (TUI) is also a subscriber on its Subscribe connection, so
+        // it sees this Status alongside any other attached subscribers.
+        {
+            let progress = Response::Stream {
                 event: Box::new(crate::types::StreamEvent::Status {
-                    message: text.to_string(),
+                    message: format!(
+                        "compacting session ({} messages \u{2192} summary)...",
+                        messages_to_summarize.len()
+                    ),
                 }),
             };
-            broadcast_to_subscribers(state, session_id, &info);
-            queue_info_to_session(state, session_id, text);
+            broadcast_to_subscribers(state, session_id, &progress);
         }
-        return Ok(());
-    }
 
-    let messages_to_summarize = &messages[..cut_idx];
-    let ctx_before = compaction::estimate_context_tokens(&messages);
+        // Build summarization context and call LLM
+        let summary_ctx = compaction::build_summarization_context(messages_to_summarize, keep_hint);
 
-    // Notify subscribers that compaction is starting. The requesting
-    // client (TUI) is also a subscriber on its Subscribe connection, so
-    // it sees this Status alongside any other attached subscribers.
-    {
-        let progress = Response::Stream {
+        let api_key = {
+            let st = lock_state(state);
+            resolve_api_key(&st.auth, &st.config, &model.provider)?
+        };
+
+        let options = StreamOptions {
+            api_key,
+            max_tokens: Some(settings.reserve_tokens),
+            ..Default::default()
+        };
+
+        let rx = {
+            let st = lock_state(state);
+            st.registry.stream(model, &summary_ctx, &options)?
+        };
+
+        // Wait for summary (blocking on the channel)
+        let summary = smol::unblock({
+            let rx = rx.clone();
+            move || compaction::extract_summary(&rx)
+        })
+        .await?;
+
+        // Get the DB row ID of the first kept message
+        let keep_from_id = {
+            let st = lock_state(state);
+            st.db
+                .get_message_row_id(session_id, cut_idx)?
+                .ok_or_else(|| crate::Error::Io("cut point message not found".into()))?
+        };
+
+        // Perform compaction in DB
+        {
+            let st = lock_state(state);
+            st.db
+                .compact_session(session_id, &summary, keep_from_id, ctx_before)?;
+        }
+
+        let after_tokens = {
+            let st = lock_state(state);
+            let messages = st.db.get_messages(session_id)?;
+            compaction::estimate_context_tokens(&messages)
+        };
+
+        let done_text = format!(
+            "compaction done: {} \u{2192} {} tokens",
+            ctx_before, after_tokens
+        );
+        let done = Response::Stream {
             event: Box::new(crate::types::StreamEvent::Status {
-                message: format!(
-                    "compacting session ({} messages \u{2192} summary)...",
-                    messages_to_summarize.len()
-                ),
+                message: done_text.clone(),
             }),
         };
-        broadcast_to_subscribers(state, session_id, &progress);
-    }
+        broadcast_to_subscribers(state, session_id, &done);
+        if manual {
+            // Persist a durable record of the outcome to the transcript so a
+            // user asking "did /compact work?" days later can find evidence
+            // even if they missed the live Status.
+            queue_info_to_session(state, session_id, &done_text);
+        }
 
-    // Build summarization context and call LLM
-    let summary_ctx = compaction::build_summarization_context(messages_to_summarize, keep_hint);
-
-    let api_key = {
-        let st = lock_state(state);
-        resolve_api_key(&st.auth, &st.config, &model.provider)?
-    };
-
-    let options = StreamOptions {
-        api_key,
-        max_tokens: Some(settings.reserve_tokens),
-        ..Default::default()
-    };
-
-    let rx = {
-        let st = lock_state(state);
-        st.registry.stream(model, &summary_ctx, &options)?
-    };
-
-    // Wait for summary (blocking on the channel)
-    let summary = smol::unblock({
-        let rx = rx.clone();
-        move || compaction::extract_summary(&rx)
+        Ok(())
     })
-    .await?;
+    .catch_unwind()
+    .await;
 
-    // Get the DB row ID of the first kept message
-    let keep_from_id = {
-        let st = lock_state(state);
-        st.db
-            .get_message_row_id(session_id, cut_idx)?
-            .ok_or_else(|| crate::Error::Io("cut point message not found".into()))?
-    };
-
-    // Perform compaction in DB
-    {
-        let st = lock_state(state);
-        st.db
-            .compact_session(session_id, &summary, keep_from_id, ctx_before)?;
+    match result {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "compaction panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
     }
-
-    let after_tokens = {
-        let st = lock_state(state);
-        let messages = st.db.get_messages(session_id)?;
-        compaction::estimate_context_tokens(&messages)
-    };
-
-    let done_text = format!(
-        "compaction done: {} \u{2192} {} tokens",
-        ctx_before, after_tokens
-    );
-    let done = Response::Stream {
-        event: Box::new(crate::types::StreamEvent::Status {
-            message: done_text.clone(),
-        }),
-    };
-    broadcast_to_subscribers(state, session_id, &done);
-    if manual {
-        // Persist a durable record of the outcome to the transcript so a
-        // user asking "did /compact work?" days later can find evidence
-        // even if they missed the live Status.
-        queue_info_to_session(state, session_id, &done_text);
-    }
-
-    Ok(())
 }
 
 pub(super) async fn send<W: futures::io::AsyncWrite + Unpin>(
@@ -1467,6 +1655,7 @@ mod compaction_tests {
             all_models: vec![model],
             usage_cache: None,
             cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
             has_queued: HashMap::new(),
             subscribers: HashMap::new(),
             phases: HashMap::new(),
@@ -1500,6 +1689,7 @@ mod compaction_tests {
                 notify_parent: true,
                 project_name: None,
                 is_agent: false,
+                successor_id: None,
             })
             .expect("create session");
 
@@ -1666,6 +1856,7 @@ mod compaction_tests {
                         notify_parent: true,
                         project_name: None,
                         is_agent: false,
+                        successor_id: None,
                     })
                     .expect("create session");
                 st.db
@@ -1687,5 +1878,362 @@ mod compaction_tests {
                 messages_after
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod panic_recovery_tests {
+    //! Regression tests for task #957: a panic anywhere in the agent loop
+    //! must surface as a normal `Err`, run the standard cleanup path, and
+    //! emit terminal Response::Error + Response::AgentDone to subscribers
+    //! — instead of silently wedging the session.
+
+    use super::*;
+    use crate::db::{Db, StoredSession};
+    use crate::provider::ProviderRegistry;
+    use crate::server::state::State;
+    use std::collections::{HashMap, HashSet};
+    use tau_agent_engine::providers::mock::{MockProvider, MockResponse, mock_model};
+
+    /// A `ToolExecutor` whose `execute` panics with the configured
+    /// payload on first invocation.
+    struct PanickingExecutor {
+        msg: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::worker::ToolExecutor for PanickingExecutor {
+        async fn execute(
+            &mut self,
+            _tool_call: &ToolCall,
+            _output_tx: &smol::channel::Sender<String>,
+            _cancel: &tau_agent_base::types::CancelToken,
+        ) -> crate::Result<ToolResultMessage> {
+            panic!("{}", self.msg);
+        }
+    }
+
+    fn mk_state_with_tool_call(tool_name: &str) -> SharedState {
+        let db = Db::open_memory().expect("open in-memory db");
+        let mut registry = ProviderRegistry::new();
+        // Provider returns a single tool-call response so the executor
+        // is invoked exactly once before the loop would otherwise wait
+        // for a tool result.
+        registry.register(MockProvider::new(vec![MockResponse::ToolCalls(vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: tool_name.to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ])]));
+        let model = mock_model();
+        Arc::new(Mutex::new(State {
+            db,
+            registry,
+            auth: crate::auth::AuthStorage::open_default(),
+            config: {
+                let mut cfg = crate::config::Config::default();
+                cfg.providers.insert(
+                    "mock".into(),
+                    crate::config::ProviderConfig {
+                        api: "openai".into(),
+                        base_url: "http://mock".into(),
+                        api_key: Some("mock-key".into()),
+                        models: vec![],
+                    },
+                );
+                cfg
+            },
+            global_aliases: HashMap::new(),
+            default_model: model.clone(),
+            all_models: vec![model],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }))
+    }
+
+    fn seed_session(state: &SharedState, session_id: &str, model: &Model, parent_id: Option<&str>) {
+        let st = lock_state(state);
+        st.db
+            .create_session(&StoredSession {
+                id: session_id.to_string(),
+                model: model.clone(),
+                system_prompt: None,
+                cwd: None,
+                is_subscription: false,
+                created_at: 0,
+                parent_id: parent_id.map(|s| s.to_string()),
+                child_budget: 0,
+                tagline: None,
+                archived: false,
+                last_exit_status: None,
+                last_phase: None,
+                auto_archive: false,
+                notify_parent: true,
+                project_name: None,
+                successor_id: None,
+            })
+            .expect("create session");
+    }
+
+    fn mk_test_overrides_with_panicking_executor(
+        msg: &'static str,
+        tool_name: &str,
+    ) -> SharedTestOverrides {
+        Arc::new(super::super::TestOverrides {
+            tool_executor_factory: Some(Arc::new(move || {
+                Box::new(PanickingExecutor { msg }) as Box<dyn crate::worker::ToolExecutor>
+            })),
+            mock_tools: vec![Tool {
+                name: tool_name.to_string(),
+                description: "panicky test tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        })
+    }
+
+    fn mk_plugins() -> Arc<Mutex<crate::plugin::PluginManager>> {
+        Arc::new(Mutex::new(crate::plugin::PluginManager::new(
+            crate::plugin::PluginsConfig::default(),
+        )))
+    }
+
+    fn mk_session_locks() -> SessionLocks {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// Layer 1 acceptance: a panic in the tool executor must surface
+    /// as a normal `Err` whose message carries the panic payload.  This
+    /// is the *primitive* the wider cleanup paths rely on — with this in
+    /// place, every existing `match result { Ok / Err }` arm in
+    /// `run_child_chat`, `resume_child_session`, and the dispatch.rs
+    /// Chat handler does the right thing automatically.
+    ///
+    /// We exercise `run_agent_turn` directly (rather than
+    /// `run_child_chat`) to keep wall-clock cost low: this test owns
+    /// only its own `block_on` executor and doesn't bring up the full
+    /// child-chat machinery.  The downstream cleanup paths get separate,
+    /// more targeted coverage in `agent_panic_in_tool_runs_full_cleanup_and_notifies_parent`.
+    #[test]
+    fn agent_panic_in_tool_returns_err_with_marker_prefix() {
+        smol::block_on(async {
+            let state = mk_state_with_tool_call("panicky");
+            let session_id = "s-panic-direct";
+            let model = mock_model();
+            seed_session(&state, session_id, &model, None);
+
+            let plugins = mk_plugins();
+            let shutdown = ShutdownHandle::new();
+            let session_locks = mk_session_locks();
+            let throttle = crate::throttle::ProviderThrottle::new();
+            let test_overrides = mk_test_overrides_with_panicking_executor(
+                "divide by zero in test executor",
+                "panicky",
+            );
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let mut context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(UserMessage::text("go"))],
+                tools: Vec::new(),
+            };
+            let mut sink = futures::io::sink();
+
+            let result = run_agent_turn(
+                &state,
+                &plugins,
+                &shutdown,
+                cancel_flag,
+                &model,
+                &mut context,
+                "/tmp",
+                session_id,
+                &mut sink,
+                &throttle,
+                &session_locks,
+                &test_overrides,
+            )
+            .await;
+
+            let err = match result {
+                Ok(_) => panic!("agent loop should error after tool panic"),
+                Err(e) => e,
+            };
+            assert!(
+                is_panic_error(&err),
+                "err should carry the panic-marker prefix; got {:?}",
+                err,
+            );
+            let msg = match &err {
+                crate::Error::Io(s) => s.clone(),
+                other => panic!("unexpected error variant: {:?}", other),
+            };
+            assert!(
+                msg.contains("divide by zero in test executor"),
+                "panic payload should appear in error message; got {:?}",
+                msg,
+            );
+        });
+    }
+
+    /// Layer 1 cleanup: a panic during a child-session turn must run
+    /// the standard terminal-broadcast / parent-notify cleanup so the
+    /// session is removed from `live_sessions`, subscribers see
+    /// `Response::Error` (with the panic payload) followed by
+    /// `Response::AgentDone`, and the parent receives a `"panicked"`
+    /// completion notice.  Marked `#[ignore]` because driving the full
+    /// `run_child_chat` machinery against a panicking executor is
+    /// heavy enough to perturb wall-clock-sensitive periodic-job tests
+    /// when run in parallel; CI / on-demand runs (`cargo test --
+    /// --ignored`) still cover it.
+    #[test]
+    #[ignore]
+    fn agent_panic_in_tool_runs_full_cleanup_and_notifies_parent() {
+        smol::block_on(async {
+            let state = mk_state_with_tool_call("panicky");
+            let parent_id = "s-panic-parent";
+            let child_id = "s-panic-child";
+            let model = mock_model();
+            seed_session(&state, parent_id, &model, None);
+            seed_session(&state, child_id, &model, Some(parent_id));
+
+            let (sub_tx, sub_rx) = smol::channel::unbounded::<Response>();
+            {
+                let mut st = lock_state(&state);
+                st.subscribers.insert(child_id.into(), vec![sub_tx]);
+            }
+
+            let plugins = mk_plugins();
+            let shutdown = ShutdownHandle::new();
+            let session_locks = mk_session_locks();
+            let throttle = crate::throttle::ProviderThrottle::new();
+            let test_overrides = mk_test_overrides_with_panicking_executor(
+                "divide by zero in test executor",
+                "panicky",
+            );
+
+            let result = run_child_chat(
+                state.clone(),
+                plugins,
+                shutdown,
+                session_locks,
+                throttle,
+                child_id.to_string(),
+                "trigger panic please".to_string(),
+                Vec::new(),
+                test_overrides,
+            )
+            .await;
+
+            // -- run_child_chat itself returns Ok(()) — the panic flows
+            //    through the existing terminal-broadcast path.
+            assert!(
+                result.is_ok(),
+                "run_child_chat must complete cleanly even when the agent loop panics; got {:?}",
+                result,
+            );
+
+            // -- live_sessions cleanup
+            {
+                let st = lock_state(&state);
+                assert!(
+                    !st.live_sessions.contains(child_id),
+                    "panicked session should be removed from live_sessions",
+                );
+            }
+
+            // -- subscriber sequence: Error then AgentDone, with the
+            //    panic payload visible in the Error message.
+            let mut collected = Vec::new();
+            while let Ok(resp) = sub_rx.try_recv() {
+                collected.push(resp);
+            }
+            let saw_panic_error = collected.iter().any(|r| {
+                matches!(
+                    r,
+                    Response::Error { message }
+                        if message.contains("panicked")
+                            && message.contains("divide by zero in test executor")
+                )
+            });
+            assert!(
+                saw_panic_error,
+                "expected Response::Error mentioning the panic payload, got: {:?}",
+                collected,
+            );
+            let saw_agent_done = collected.iter().any(|r| matches!(r, Response::AgentDone));
+            assert!(
+                saw_agent_done,
+                "expected Response::AgentDone after panic, got: {:?}",
+                collected,
+            );
+
+            // -- parent receives a "panicked" completion notice (so a
+            //    parent session waiting on the child isn't stuck forever).
+            let queued = {
+                let st = lock_state(&state);
+                st.db
+                    .drain_queued_messages(parent_id)
+                    .expect("drain queued")
+            };
+            let saw_panicked_notice = queued.iter().any(|m| match m {
+                Message::User(u) => u.content.iter().any(|c| match c {
+                    UserContent::Text(t) => t.text.contains("panicked"),
+                    _ => false,
+                }),
+                Message::Info(i) => i.text.contains("panicked"),
+                _ => false,
+            });
+            assert!(
+                saw_panicked_notice,
+                "parent should receive a notice mentioning the child's \"panicked\" status, got: {:?}",
+                queued,
+            );
+        });
+    }
+
+    /// Helper-level: `panic_payload_to_string` extracts the common
+    /// payload shapes humans actually panic with.
+    #[test]
+    fn panic_payload_to_string_handles_str_string_and_other() {
+        let r = std::panic::catch_unwind(|| panic!("static str payload"));
+        let payload = r.expect_err("panicked");
+        assert_eq!(panic_payload_to_string(&*payload), "static str payload");
+
+        let r = std::panic::catch_unwind(|| panic!("{}", "owned String payload".to_string()));
+        let payload = r.expect_err("panicked");
+        assert_eq!(panic_payload_to_string(&*payload), "owned String payload");
+
+        // Custom payload type — falls back to the placeholder.
+        let r = std::panic::catch_unwind(|| std::panic::panic_any(42_u32));
+        let payload = r.expect_err("panicked");
+        assert_eq!(
+            panic_payload_to_string(&*payload),
+            "<non-string panic payload>",
+        );
+    }
+
+    /// `is_panic_error` recognises the synthetic Err produced by the
+    /// `catch_unwind` wrappers and ignores other Io errors.
+    #[test]
+    fn is_panic_error_recognises_marker_prefix() {
+        let panic_err = crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, "boom"));
+        assert!(is_panic_error(&panic_err));
+
+        let regular_io = crate::Error::Io("disk full".into());
+        assert!(!is_panic_error(&regular_io));
+
+        let other = crate::Error::Cancelled;
+        assert!(!is_panic_error(&other));
     }
 }

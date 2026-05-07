@@ -206,6 +206,7 @@ mod tests {
             all_models: vec![mk_model()],
             usage_cache: None,
             cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
             has_queued: HashMap::new(),
             subscribers: HashMap::new(),
             phases: HashMap::new(),
@@ -242,6 +243,7 @@ mod tests {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         }
     }
 

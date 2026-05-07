@@ -773,6 +773,40 @@ async fn run_inner(
                         }
                     }
                 }
+                Action::SucceedSession { tagline } => {
+                    let old_id = sid.clone();
+                    match succeed_session(&old_id, tagline).await {
+                        Ok(new_id) => match fetch_session_info(&new_id).await {
+                            Ok(new_info) => {
+                                app.save_nav_state();
+                                app.switch_to_session(&new_info, vec![]);
+                                sub_switch_tx.send(new_id.clone()).await.ok();
+                                app.messages.push(crate::message::MessageItem::Status {
+                                    text: format!(
+                                        "Succeeded {} \u{2192} {}",
+                                        &old_id[..old_id.len().min(8)],
+                                        &new_id[..new_id.len().min(8)],
+                                    ),
+                                });
+                            }
+                            Err(e) => {
+                                app.messages.push(crate::message::MessageItem::Error {
+                                    text: format!(
+                                        "succeed: created {} but failed to fetch session: {}",
+                                        &new_id[..new_id.len().min(8)],
+                                        e,
+                                    ),
+                                });
+                            }
+                        },
+                        Err(e) => {
+                            app.messages.push(crate::message::MessageItem::Error {
+                                text: format!("succeed: {}", e),
+                            });
+                        }
+                    }
+                }
+
                 Action::FireHook { name, data } => {
                     // Best-effort: fire the hook on the server so plugins
                     // (e.g. the task scheduler) can react. If it fails we
@@ -967,9 +1001,16 @@ async fn run_inner(
         app.sync_streaming_timer();
         event_loop.set_ticking(app.mode == AppMode::Streaming || app.has_active_tool());
 
-        // Periodic subscription usage refresh (every 60s)
+        // Fallback subscription-usage poll.
+        //
+        // The server-side `refresh_subscription_usage` bg job fires
+        // every 60s and pushes the result over the Subscribe channel,
+        // so under normal operation the status line refreshes without
+        // any client polling.  Keep a long-interval fallback (5min) in
+        // case the push channel is broken — e.g. mid-reconnect, or a
+        // bug we haven't spotted yet.
         if app.totals.is_subscription
-            && app.last_usage_fetch.elapsed() >= std::time::Duration::from_secs(60)
+            && app.last_usage_fetch.elapsed() >= std::time::Duration::from_secs(5 * 60)
         {
             app.last_usage_fetch = std::time::Instant::now();
             send_request_and_recv(Request::GetSubscriptionUsage, server_tx.clone()).await?;
@@ -1080,6 +1121,45 @@ async fn fetch_session_info(
         .await?;
 
     info.ok_or_else(|| tau_agent_lib::Error::Io("no session info response".into()))
+}
+
+/// Issue a SucceedSession request and return the new session id.
+async fn succeed_session(
+    session_id: &str,
+    tagline: Option<String>,
+) -> tau_agent_lib::Result<String> {
+    let mut client = Client::connect().await?;
+    client
+        .send(&Request::SucceedSession {
+            session_id: session_id.to_string(),
+            tagline,
+            // The TUI process has no agent-loop session id of its own to
+            // record as the caller (it acts on behalf of the human user),
+            // so the audit info-message in the predecessor reads "Session
+            // retired" rather than "Session retired by <id>". The
+            // agent-tool path (worker.rs::session_succeed) does pass
+            // its own session id here.
+            caller_session_id: None,
+        })
+        .await?;
+
+    let mut new_id: Option<String> = None;
+    let mut err: Option<String> = None;
+    client
+        .recv_streaming(|resp| match resp {
+            Response::SessionCreated { session_id } => {
+                new_id = Some(session_id.clone());
+            }
+            Response::Error { message } => {
+                err = Some(message.clone());
+            }
+            _ => {}
+        })
+        .await?;
+    if let Some(message) = err {
+        return Err(tau_agent_lib::Error::Io(message));
+    }
+    new_id.ok_or_else(|| tau_agent_lib::Error::Io("no SessionCreated response".into()))
 }
 
 /// Send a request and forget — don't recv responses.

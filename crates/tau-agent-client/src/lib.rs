@@ -74,6 +74,10 @@ impl Client {
                         tau_agent_base::types::StreamEvent::Error { .. }
                     )
                 }
+                // Broadcast on the predecessor's subscriber channel when the
+                // session is succeeded (task 915).  Subscribers stay attached
+                // and react out-of-band; not a terminal event for an open RPC.
+                Response::SessionSucceeded { .. } => false,
                 Response::AgentDone
                 | Response::Cancelled
                 | Response::Error { .. }
@@ -119,6 +123,8 @@ impl Client {
                 | Response::AgentPaused
                 | Response::AgentResumed
                 | Response::AgentStarted { .. }
+                | Response::ResolvedSuccessor { .. }
+                | Response::TaskSessionRole { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);

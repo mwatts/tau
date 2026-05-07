@@ -255,6 +255,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "type": "boolean",
                         "description": "When true, the task is created but NOT scheduled for dispatch, even if initial_state='ready'. Release by calling task_update with hold=false. Useful for batch-seeding a task board before manually choosing dispatch order. Default: false."
                     },
+                    "no_merge": {
+                        "type": "boolean",
+                        "description": "When true, the task does not produce a code change. The scheduler skips worktree creation; on approval the task transitions directly to `done` (no merge ceremony, no checklist run). Use for investigations, audits, design discussions, coordination, etc. Default: false."
+                    },
                     "affected_files": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -286,6 +290,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Pass hold=true to create a task without scheduling it. Useful for batch-seeding a backlog on a greenfield project: file N tasks at once, review, then release them in considered order via task_update(hold=false). Held tasks are visible in task_list/task_status with a held indicator but the scheduler skips them.".into(),
                 "When filing with initial_state=\"ready\", pass `affected_files` (the files the work will touch) so the scheduler can run your task in parallel with disjoint tasks. Omit it only if the file set is genuinely unpredictable — in which case the task is auto-routed through a focused planning phase that populates the list. Use `affected_files: [\"*\"]` as the explicit \"touches everything / unknowable\" marker; that bypasses planning but keeps the task serialised against all other work.".into(),
                 "Pass `project` to file a task in a different project from the calling session's. Use this for cross-repo workflows: file one task per repo from the same orchestrator session and link them with `task_relate` / `depends_on`. Defaults to the caller's project; the named project must be registered (run `tau project init` inside its repo first).".into(),
+                "Pass `no_merge=true` for tasks that complete without a code change (investigations, audits, design discussions, coordination). The scheduler skips worktree creation and the task transitions `approved → done` instead of through merging. Pair with empty `affected_files` (or omit it) so the task can run in parallel with code work.".into(),
             ],
         },
         PluginToolDef {
@@ -409,6 +414,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "hold": {
                         "type": "boolean",
                         "description": "Hold (true) or release (false) a task from scheduler dispatch. A held task remains visible in lists and preserves its state but the scheduler will not dispatch it. See task_create for details."
+                    },
+                    "no_merge": {
+                        "type": "boolean",
+                        "description": "Set/clear the no_merge flag. Pre-dispatch only — rejected after a worktree has been created. See task_create for full semantics."
                     },
                     "project": {
                         "type": "string",
@@ -717,6 +726,10 @@ fn handle_task_create(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let hold = args.get("hold").and_then(|v| v.as_bool()).unwrap_or(false);
+    let no_merge = args
+        .get("no_merge")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str());
     let merge_target = args.get("merge_target").and_then(|v| v.as_str());
     let sandbox_profile = args.get("sandbox_profile").and_then(|v| v.as_str());
@@ -780,6 +793,51 @@ fn handle_task_create(
         }
     }
 
+    // Layer B (task #949): pre-flight check that the project is a git
+    // repo before filing tasks. Without this, the task gets queued, the
+    // scheduler hammers `git rev-parse` on every pass, the user sees
+    // nothing helpful, and the task languishes in `ready` forever.
+    //
+    // `no_merge` tasks (#942) intentionally don't need a worktree, so we
+    // skip the check for them. They share the project's tasks DB but
+    // never touch git.
+    if !no_merge {
+        match resolver.resolve(project_name) {
+            Ok(root) => {
+                // Skip the check when the resolved path doesn't exist on
+                // disk — this is almost always a test using a synthetic
+                // resolver path. Real users register projects with valid
+                // canonicalised paths, so a missing directory in
+                // production would be a separate (and rarer) failure
+                // mode that the scheduler will catch downstream.
+                if std::path::Path::new(&root).is_dir()
+                    && let Err(e) = crate::tasks_git::get_repo_root(&root)
+                {
+                    return tool_err(
+                        tool_call_id,
+                        &format!(
+                            "project '{}' is not inside a git working tree ({}). \
+                             tau tasks need a git repository to host per-task \
+                             worktrees and branches. Run `git init` in {} (or \
+                             move .tau/project.toml into a git repo), then \
+                             retry. For investigations / coordination tasks that \
+                             don't need a worktree, pass `no_merge: true`.",
+                            project_name, e, root,
+                        ),
+                    );
+                }
+            }
+            Err(_) => {
+                // Already handled by the `unknown project` arm above when
+                // the caller explicitly passed `project`. The implicit
+                // (caller's own project) path can also reach here — if
+                // the resolver doesn't know the project we silently fall
+                // through; the downstream create_task call will surface
+                // the real error.
+            }
+        }
+    }
+
     // Auto-downgrade (task #596): a `ready`-state task without a usable
     // `affected_files` list serialises against every other file-less
     // task in the scheduler's "at most one file-less task per project"
@@ -806,7 +864,13 @@ fn handle_task_create(
         affected_files_arg.as_ref(),
         Some(serde_json::Value::Array(arr)) if !arr.is_empty()
     ) && !star_marker;
-    let auto_downgrade = initial_state == "ready" && !has_concrete_files && !star_marker;
+    // no_merge tasks (task #942) intentionally have no `affected_files`
+    // — they don't write to the codebase. Skipping the auto-downgrade
+    // for them keeps the lifecycle simple: they go straight from `ready`
+    // to `active` without a planning detour to populate a file list
+    // that doesn't exist.
+    let auto_downgrade =
+        initial_state == "ready" && !has_concrete_files && !star_marker && !no_merge;
     if auto_downgrade {
         initial_state = "planning";
     }
@@ -825,8 +889,10 @@ fn handle_task_create(
         hold,
         affected_files_arg.as_ref(),
         auto_downgrade,
+        no_merge,
         // Provenance: record where the file-call came from. Always the
-        // *caller's* project (`ctx.project_name`), not the resolved
+        // *caller's* project (`ctx.project_name`),
+        // not the resolved
         // target project — same-project filing still gets recorded
         // (it's still useful provenance) and cross-project filing
         // reveals which project's session reached over the fence.
@@ -1725,6 +1791,7 @@ fn handle_task_update(
             .map(String::from),
         held: args.get("hold").and_then(|v| v.as_bool()),
         project_name: project_name_update,
+        no_merge: args.get("no_merge").and_then(|v| v.as_bool()),
     };
 
     // Track session as reviewer if it approves the task — the transition
@@ -1838,7 +1905,7 @@ fn handle_task_update(
                         session_id.map(String::from),
                     ));
                 }
-                TaskState::Merged | TaskState::Closed => {
+                TaskState::Merged | TaskState::Done | TaskState::Closed => {
                     // Dependents may have been blocked on this task — re-
                     // evaluate schedulability on the next scheduler pass.
                     eprintln!(
@@ -2606,6 +2673,12 @@ fn handle_task_dispatch(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> PluginToolResult {
+    // Note: this is the *tool-driven* dispatch path. Failures here surface
+    // back to the caller as a `tool_err`, so the user/agent sees them
+    // immediately. The auto-scheduler's failure-count machinery (#949)
+    // intentionally does NOT run here — we don't want a hand-fired
+    // `task_dispatch` to race the watchdog or accidentally push a task
+    // toward `failed` when the operator is actively poking at it.
     let id = match args.get("id").and_then(|v| v.as_i64()) {
         Some(id) => id,
         None => return tool_err(tool_call_id, "id is required"),
@@ -3278,6 +3351,7 @@ pub fn run_tasks_plugin() {
                             | TaskState::Merging
                             | TaskState::Failed
                             | TaskState::Merged
+                            | TaskState::Done
                             | TaskState::Closed => {}
                         }
                     }
@@ -3747,15 +3821,79 @@ pub(crate) fn run_schedule_pass(
                             "tasks scheduler: dispatch completed for task {} → session {}",
                             st.id, session_id
                         );
+                        // Task #949: clear the consecutive-failure counter
+                        // so transient failures from a previous pass don't
+                        // accumulate and trip the permanent-failure threshold
+                        // after a happy retry.
+                        if let Err(e) = db.reset_dispatch_failure_count(st.id) {
+                            eprintln!(
+                                "tasks scheduler: failed to reset dispatch_failure_count for task {}: {}",
+                                st.id, e
+                            );
+                        }
                     }
                     Err(e) => {
                         eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
 
-                        // For non-planning tasks, schedule() already transitioned
-                        // to active via prepare_task().  Revert to ready so the
-                        // scheduler can retry on the next pass.
                         let is_planning = st.branch.is_empty();
-                        if !is_planning {
+
+                        // Task #949: classify the failure and decide whether
+                        // to retry, give up early (permanent), or give up
+                        // after N attempts (threshold). Increment the per-task
+                        // failure counter for both branches; the counter is
+                        // only reset on the *next* successful dispatch.
+                        let count = match db.increment_dispatch_failure(st.id) {
+                            Ok(c) => c,
+                            Err(inc_err) => {
+                                eprintln!(
+                                    "tasks scheduler: failed to increment dispatch_failure_count for task {}: {}",
+                                    st.id, inc_err
+                                );
+                                // Best-effort fallback: assume first failure.
+                                1
+                            }
+                        };
+                        let permanent = crate::tasks_git::is_permanent_dispatch_error(&e);
+                        let exhausted = count >= MAX_DISPATCH_FAILURES as i64;
+                        let give_up = permanent || exhausted;
+
+                        // Compute the target state: keep planning tasks in
+                        // planning (they're stateless re: worktree) unless
+                        // we're giving up; otherwise revert ready-prepared
+                        // tasks to `ready` for retry, or `failed` if we've
+                        // hit a terminal condition.
+                        if give_up {
+                            // Best-effort cleanup of any worktree the
+                            // scheduler created during prepare_task() before
+                            // dispatch failed. Errors are ignored — a stale
+                            // worktree directory is annoying but not
+                            // catastrophic, and the user can clear it via
+                            // the existing stale-worktree watchdog.
+                            if !is_planning && !st.worktree_path.is_empty() {
+                                if let Ok(repo_root) =
+                                    crate::tasks_git::get_repo_root(&project_path)
+                                {
+                                    let _ = crate::tasks_git::remove_worktree(
+                                        &repo_root,
+                                        &st.worktree_path,
+                                    );
+                                }
+                                let _ = db.clear_worktree(st.id);
+                            }
+                            if let Err(fail_err) = db.update_task(
+                                st.id,
+                                &TaskUpdate {
+                                    state: Some(TaskState::Failed),
+                                    ..Default::default()
+                                },
+                                None,
+                            ) {
+                                eprintln!(
+                                    "tasks scheduler: failed to mark task {} as failed: {}",
+                                    st.id, fail_err
+                                );
+                            }
+                        } else if !is_planning {
                             if let Err(revert_err) = db.update_task(
                                 st.id,
                                 &TaskUpdate {
@@ -3771,13 +3909,26 @@ pub(crate) fn run_schedule_pass(
                             }
                         }
 
-                        let revert_note = if is_planning {
-                            "Task remains in planning state and will be retried."
+                        // User-facing tail explaining what we did.
+                        let revert_note = if give_up {
+                            if permanent {
+                                " Marked as failed (permanent error — won't retry).".to_string()
+                            } else {
+                                format!(" Marked as failed after {} consecutive failures.", count)
+                            }
+                        } else if is_planning {
+                            format!(
+                                " Task remains in planning state and will be retried (failure {}/{}).",
+                                count, MAX_DISPATCH_FAILURES
+                            )
                         } else {
-                            "Task has been reverted to ready state and will be retried."
+                            format!(
+                                " Task has been reverted to ready state and will be retried (failure {}/{}).",
+                                count, MAX_DISPATCH_FAILURES
+                            )
                         };
                         let warn_msg = format!(
-                            "⚠️ Auto-dispatch of session failed for task {} ({}): {}. {}",
+                            "⚠️ Auto-dispatch of session failed for task {} ({}): {}.{}",
                             st.id, st.title, e, revert_note
                         );
                         if let Err(msg_err) = db.add_message(st.id, &warn_msg, Some("system")) {
@@ -3789,18 +3940,17 @@ pub(crate) fn run_schedule_pass(
                         warnings.push(warn_msg.clone());
 
                         // Re-queue a ScheduleNeeded event so the current drain
-                        // loop retries.  Bug 2 from the #534 investigation:
-                        // without this the task sits in ready (or planning)
-                        // until some unrelated event fires a schedule pass.
-                        // The drain loop already deduplicates same-project
-                        // schedule events, so at most one retry pass runs
-                        // per drain cycle regardless of batch size.
-                        if !pending_events.iter().any(|e| {
-                            matches!(
-                                e,
-                                SchedulerEvent::ScheduleNeeded(p, _) if p == project_name
-                            )
-                        }) {
+                        // loop retries — but only if we're going to retry.
+                        // For tasks we just transitioned to `failed`, requeueing
+                        // is pointless work (and noisy in the log).
+                        if !give_up
+                            && !pending_events.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    SchedulerEvent::ScheduleNeeded(p, _) if p == project_name
+                                )
+                            })
+                        {
                             pending_events.push(SchedulerEvent::ScheduleNeeded(
                                 project_name.to_string(),
                                 session_id.map(String::from),
@@ -3815,6 +3965,33 @@ pub(crate) fn run_schedule_pass(
                                 reader,
                                 tau_agent_plugin::Request::QueueMessage {
                                     target_session_id: sid.to_string(),
+                                    content: warn_msg.clone(),
+                                    sender_info: "task-scheduler".to_string(),
+                                    await_reply: false,
+                                    reply_to: None,
+                                },
+                            );
+                        }
+
+                        // Task #949: also notify the placeholder session so
+                        // the user-visible task thread surfaces the failure
+                        // even when the dispatch was triggered by a system
+                        // session (cron, watchdog, ...). Skip when the
+                        // placeholder *is* the trigger to avoid duplicate
+                        // notifications.
+                        let placeholder_sid = db
+                            .get_task(st.id)
+                            .ok()
+                            .flatten()
+                            .and_then(|t| t.placeholder_session_id);
+                        if let Some(ph_sid) = placeholder_sid
+                            && Some(ph_sid.as_str()) != session_id
+                        {
+                            let _ = tasks_scheduler::server_request(
+                                writer,
+                                reader,
+                                tau_agent_plugin::Request::QueueMessage {
+                                    target_session_id: ph_sid,
                                     content: warn_msg,
                                     sender_info: "task-scheduler".to_string(),
                                     await_reply: false,
@@ -3862,6 +4039,16 @@ pub(crate) fn run_schedule_pass(
 /// (the observed failure in task #570 sat in this state for ~20
 /// minutes before manual intervention).
 const STUCK_TASK_THRESHOLD_MS: i64 = 60_000;
+
+/// Maximum number of consecutive auto-scheduler dispatch failures
+/// for a given task before giving up and transitioning it to
+/// `failed` (#949).
+///
+/// Counted by [`tasks_db::TasksDb::increment_dispatch_failure`] and
+/// reset on successful dispatch. A `not a git repository` failure is
+/// classified as permanent by [`tasks_git::is_permanent_dispatch_error`]
+/// and skips the retry loop entirely.
+pub(crate) const MAX_DISPATCH_FAILURES: usize = 3;
 
 /// Maximum number of consecutive watchdog-driven dispatch attempts
 /// for a given task before giving up and transitioning it to
@@ -4736,6 +4923,7 @@ mod tests {
                                     turn_started_at_ms: None,
                                     phase_started_at_ms: None,
                                     project_name: None,
+                                    successor_id: None,
                                 },
                             }
                         }
@@ -4768,6 +4956,7 @@ mod tests {
                                         turn_started_at_ms: None,
                                         phase_started_at_ms: None,
                                         project_name: None,
+                                        successor_id: None,
                                     }]
                                 });
                             tau_agent_plugin::Response::SessionAncestors { sessions }
@@ -5033,6 +5222,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -5050,6 +5240,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5088,6 +5279,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5958,6 +6150,130 @@ mod tests {
         assert_eq!(other_tasks.len(), 1, "named project should own the task");
     }
 
+    /// Task #949 Layer B: filing a task in a project whose root is
+    /// not a git repository must be rejected up front. Without this
+    /// check, the task gets queued and the auto-scheduler hits
+    /// `git rev-parse --show-toplevel` failures forever.
+    #[test]
+    fn test_handle_task_create_rejects_non_git_project() {
+        let db = TasksDb::open_memory().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let project_path = tmp.path().to_str().unwrap();
+        // Resolver maps "nogit" → a real but non-git directory.
+        let resolver = ProjectResolver::test(&[("nogit", project_path)]);
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Doomed task",
+                "initial_state": "ready",
+                "project": "nogit",
+                "affected_files": ["x.rs"],
+            }),
+            &ToolCtx {
+                project_name: Some("nogit"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            result.is_error,
+            "non-git project must be rejected at task_create"
+        );
+        let text = extract_text(&result);
+        assert!(
+            text.contains("not inside a git working tree"),
+            "error should explain the git problem: {text}"
+        );
+        assert!(
+            text.contains("git init"),
+            "error should hint at remediation: {text}"
+        );
+        assert!(
+            text.contains("no_merge"),
+            "error should mention the no_merge escape hatch: {text}"
+        );
+        let tasks = db.list_tasks("nogit", None, None, None, None).unwrap();
+        assert!(
+            tasks.is_empty(),
+            "rejected task_create must not insert a row; got {tasks:?}"
+        );
+    }
+
+    /// Layer B companion: `no_merge` tasks bypass the git check
+    /// because they don't need a worktree (#942).
+    #[test]
+    fn test_handle_task_create_accepts_no_merge_in_non_git_project() {
+        let db = TasksDb::open_memory().unwrap();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let project_path = tmp.path().to_str().unwrap();
+        let resolver = ProjectResolver::test(&[("nogit", project_path)]);
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Investigation",
+                "initial_state": "ready",
+                "project": "nogit",
+                "no_merge": true,
+            }),
+            &ToolCtx {
+                project_name: Some("nogit"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "no_merge task should be allowed in a non-git project: {}",
+            extract_text(&result)
+        );
+    }
+
+    /// Layer B fast-path: when the resolved project path doesn't even
+    /// exist on disk (synthetic test resolvers do this), the git
+    /// pre-flight is skipped — we don't want to break the existing
+    /// fake-path test fixtures, and a missing directory in production
+    /// is a separate failure that the scheduler will catch.
+    #[test]
+    fn test_handle_task_create_skips_git_check_when_path_missing() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver(); // /test/project doesn't exist
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Synthetic path task",
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "task_create with synthetic resolver path should skip git check: {}",
+            extract_text(&result)
+        );
+    }
+
     /// Task #750: an unknown project name returns `tool_err` with a
     /// helpful message that lists the registered projects, and does
     /// NOT insert a row. The error message format is part of the
@@ -6263,6 +6579,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6325,6 +6642,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6378,6 +6696,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6438,6 +6757,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6484,6 +6804,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6549,6 +6870,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6598,6 +6920,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6656,6 +6979,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6713,6 +7037,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6766,6 +7091,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6837,6 +7163,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6903,6 +7230,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6952,6 +7280,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6994,6 +7323,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7067,6 +7397,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7145,6 +7476,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7228,6 +7560,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7287,6 +7620,7 @@ mod tests {
                 let expected_line = format!("[task #{}] Emit test: ready → active", task.id);
                 assert_eq!(text, &expected_line);
             }
+            other => panic!("unexpected post-persist action: {:?}", other),
         }
     }
 
@@ -7311,6 +7645,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7426,6 +7761,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7520,6 +7856,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7598,6 +7935,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7670,6 +8008,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7750,6 +8089,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7811,7 +8151,7 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 21,
+            total < 22,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );
@@ -8048,6 +8388,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8097,6 +8438,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8128,6 +8470,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8145,6 +8488,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8176,6 +8520,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8193,6 +8538,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8234,6 +8580,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8251,6 +8598,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8287,6 +8635,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8344,6 +8693,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8378,6 +8728,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8395,6 +8746,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8430,6 +8782,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8447,6 +8800,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8483,6 +8837,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8500,6 +8855,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8538,6 +8894,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8555,6 +8912,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8932,6 +9290,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -9193,6 +9552,7 @@ mod tests {
             turn_started_at_ms: None,
             phase_started_at_ms: None,
             project_name: None,
+            successor_id: None,
         }
     }
 
@@ -9673,6 +10033,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -9732,6 +10093,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -9790,6 +10152,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -9863,6 +10226,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -9946,6 +10310,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -9989,6 +10354,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10088,6 +10454,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10108,6 +10475,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10184,6 +10552,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10332,6 +10701,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10387,6 +10757,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10454,6 +10825,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10559,6 +10931,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10640,6 +11013,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10708,6 +11082,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10778,6 +11153,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10850,6 +11226,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10917,6 +11294,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11041,6 +11419,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11160,6 +11539,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11177,6 +11557,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11290,6 +11671,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11307,6 +11689,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11420,6 +11803,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11437,6 +11821,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11559,6 +11944,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11576,6 +11962,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11636,6 +12023,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11653,6 +12041,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11730,6 +12119,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11747,6 +12137,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11880,6 +12271,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11982,6 +12374,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12074,6 +12467,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12283,6 +12677,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12300,6 +12695,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12382,6 +12778,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12399,6 +12796,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12611,6 +13009,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12628,6 +13027,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12713,6 +13113,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12730,6 +13131,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12888,6 +13290,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12905,6 +13308,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13031,6 +13435,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13131,6 +13536,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13207,6 +13613,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13224,6 +13631,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13317,6 +13725,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13376,6 +13785,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13461,6 +13871,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13478,6 +13889,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13526,6 +13938,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13588,6 +14001,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13605,6 +14019,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13665,6 +14080,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13919,6 +14335,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -14031,6 +14448,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -14047,6 +14465,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             false,
             crate::tasks_db::FiledBy::default(),
         )
@@ -14074,6 +14493,457 @@ mod tests {
             "expected ScheduleNeeded to be re-queued after dispatch failure, got {:?}",
             pending
         );
+    }
+
+    /// Task #949 Layer C: a permanent dispatch failure (e.g. "not a git
+    /// repository") must transition the task straight to `failed` —
+    /// retrying without user intervention will hit the same error.
+    #[test]
+    fn test_dispatch_failure_permanent_marks_failed_no_retry() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io_failing_session(
+            "git rev-parse --show-toplevel in /test/project: fatal: not a git repository",
+        );
+
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Doomed",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        let mut pending: Vec<SchedulerEvent> = Vec::new();
+        let warnings = run_schedule_pass(
+            &db,
+            "test-project",
+            &resolver,
+            Some("trigger-session"),
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        assert!(!warnings.is_empty(), "dispatch should have failed");
+        assert!(
+            warnings[0].contains("Marked as failed (permanent error"),
+            "warning should announce permanent failure: {}",
+            warnings[0]
+        );
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.state,
+            TaskState::Failed,
+            "permanent dispatch failure must mark task failed"
+        );
+        assert_eq!(
+            updated.dispatch_failure_count, 1,
+            "counter still incremented for audit purposes"
+        );
+
+        // No ScheduleNeeded should be re-queued for a doomed task.
+        let requeued = pending
+            .iter()
+            .any(|e| matches!(e, SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"));
+        assert!(
+            !requeued,
+            "permanent failure must not re-queue a schedule retry"
+        );
+    }
+
+    /// Task #949 Layer C: three consecutive transient failures push the
+    /// task to `failed` after the threshold, even though each error
+    /// individually would be retryable.
+    #[test]
+    fn test_dispatch_failure_three_strikes_marks_failed() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Three strikes",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        // Each pass uses a fresh mock_io_failing_session because the
+        // mock's queue_message_calls / written_lines accumulate across
+        // iterations and we want clean state per attempt.
+        for attempt in 1..=MAX_DISPATCH_FAILURES {
+            let (mut writer, mut reader) =
+                mock_io_failing_session("child budget exceeded: 16 active children, budget is 16");
+            let _ = run_schedule_pass(
+                &db,
+                "test-project",
+                &resolver,
+                Some("trigger-session"),
+                &mut writer,
+                &mut reader,
+                &mut Vec::new(),
+            );
+            let updated = db.get_task(task.id).unwrap().unwrap();
+            assert_eq!(
+                updated.dispatch_failure_count, attempt as i64,
+                "counter should reach {} after attempt {}",
+                attempt, attempt
+            );
+            if attempt < MAX_DISPATCH_FAILURES {
+                assert_eq!(
+                    updated.state,
+                    TaskState::Planning,
+                    "task stays in planning while under threshold (attempt {})",
+                    attempt
+                );
+            } else {
+                assert_eq!(
+                    updated.state,
+                    TaskState::Failed,
+                    "task transitions to failed at attempt {}",
+                    attempt
+                );
+            }
+        }
+    }
+
+    /// Task #949 Layer C: when the placeholder session is set on the
+    /// task, a dispatch failure must notify it via QueueMessage in
+    /// addition to the triggering session. This is the visibility fix
+    /// for users whose tasks were filed by a session that has since
+    /// gone away.
+    #[test]
+    fn test_dispatch_failure_notifies_placeholder_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 16 active children, budget is 16");
+
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Notify placeholder",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.set_placeholder_session_id(task.id, "placeholder-sid")
+            .unwrap();
+
+        let _ = run_schedule_pass(
+            &db,
+            "test-project",
+            &resolver,
+            Some("trigger-session"),
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+
+        // Drain the writer's pending bytes into written_lines so the
+        // assertion sees the QueueMessage payload.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let remaining = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&remaining);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let queued = writer.shared.lock().unwrap().queue_message_calls.clone();
+        let targets: Vec<&str> = queued.iter().map(|(t, _, _, _)| t.as_str()).collect();
+        assert!(
+            targets.contains(&"trigger-session"),
+            "trigger session must be notified, got {:?}",
+            targets
+        );
+        assert!(
+            targets.contains(&"placeholder-sid"),
+            "placeholder session must also be notified, got {:?}",
+            targets
+        );
+    }
+
+    /// Task #949 Layer C: when the placeholder session IS the
+    /// triggering session, we don't double-notify.
+    #[test]
+    fn test_dispatch_failure_no_duplicate_when_placeholder_is_trigger() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 16 active children, budget is 16");
+
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Same session",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.set_placeholder_session_id(task.id, "shared-sid")
+            .unwrap();
+
+        let _ = run_schedule_pass(
+            &db,
+            "test-project",
+            &resolver,
+            Some("shared-sid"),
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+
+        let queued = writer.shared.lock().unwrap().queue_message_calls.clone();
+        let count_for_shared = queued
+            .iter()
+            .filter(|(t, _, _, _)| t == "shared-sid")
+            .count();
+        assert_eq!(
+            count_for_shared, 1,
+            "placeholder == trigger should produce exactly one QueueMessage, got {:?}",
+            queued
+        );
+    }
+
+    /// Task #949 Layer C: a successful dispatch must reset the
+    /// failure counter so transient failures don't accumulate across
+    /// long-running projects.
+    #[test]
+    fn test_dispatch_success_resets_failure_count() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Recovers",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        // Simulate two prior transient failures by direct DB writes.
+        db.increment_dispatch_failure(task.id).unwrap();
+        db.increment_dispatch_failure(task.id).unwrap();
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.dispatch_failure_count, 2);
+
+        // Now run a successful schedule pass (mock_io — no failure).
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let _ = run_schedule_pass(
+            &db,
+            "test-project",
+            &resolver,
+            Some("trigger"),
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+
+        // After successful dispatch the counter must be back at 0.
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.dispatch_failure_count, 0,
+            "successful dispatch should reset failure counter"
+        );
+    }
+
+    /// Task #949 Layer C: the new TasksDb helpers round-trip cleanly.
+    #[test]
+    fn test_dispatch_failure_count_helpers() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Counter",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        assert_eq!(task.dispatch_failure_count, 0);
+
+        assert_eq!(db.increment_dispatch_failure(task.id).unwrap(), 1);
+        assert_eq!(db.increment_dispatch_failure(task.id).unwrap(), 2);
+        assert_eq!(db.increment_dispatch_failure(task.id).unwrap(), 3);
+
+        let after = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(after.dispatch_failure_count, 3);
+
+        db.reset_dispatch_failure_count(task.id).unwrap();
+        let after_reset = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(after_reset.dispatch_failure_count, 0);
+
+        // Reset on already-zero is idempotent.
+        db.reset_dispatch_failure_count(task.id).unwrap();
+
+        // Unknown task increment is an error.
+        assert!(db.increment_dispatch_failure(99_999).is_err());
     }
 
     // ---------------------------------------------------------------
@@ -14104,6 +14974,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -14151,6 +15022,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -14422,6 +15294,7 @@ mod tests {
                 true,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -14538,6 +15411,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -14841,5 +15715,180 @@ mod tests {
         // happened if the watchdog had been called once per
         // stale-ready warning).
         assert_eq!(count_stuck_merging_attempts(&db, task.id), 1);
+    }
+
+    // ---- no_merge handler tests (task #942) ----
+
+    #[test]
+    fn test_handle_task_create_with_no_merge() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let mut pending = Vec::new();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "investigate slow startup",
+                "initial_state": "ready",
+                "no_merge": true,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        assert!(
+            !result.is_error,
+            "task_create with no_merge=true should succeed"
+        );
+
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].no_merge, "no_merge flag should be persisted");
+        // Even without affected_files, no_merge tasks must NOT be
+        // auto-downgraded to planning — they have no files by design.
+        assert_eq!(tasks[0].state, TaskState::Ready);
+        assert!(!tasks[0].auto_downgraded_from_ready);
+    }
+
+    #[test]
+    fn test_handle_task_create_no_merge_skips_auto_downgrade() {
+        // Regression: ready-state filing without affected_files normally
+        // routes through planning. For no_merge tasks (no files by
+        // design) this should NOT happen.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let mut pending = Vec::new();
+
+        let _ = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "audit auth module",
+                "initial_state": "ready",
+                "no_merge": true,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            tasks[0].state,
+            TaskState::Ready,
+            "no auto-downgrade for no_merge"
+        );
+    }
+
+    #[test]
+    fn test_handle_task_update_sets_no_merge_pre_dispatch() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a planning task (no branch / worktree yet).
+        let task = db
+            .create_task(
+                "test-project",
+                "some task",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "no_merge": true}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "task_update no_merge=true pre-dispatch should succeed"
+        );
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(reloaded.no_merge);
+    }
+
+    #[test]
+    fn test_handle_task_update_no_merge_rejected_after_worktree() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "task with worktree",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.set_branch(task.id, "task-99").unwrap();
+        db.set_worktree_path(task.id, "/tmp/wt-99").unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "no_merge": true}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            result.is_error,
+            "task_update no_merge=true after worktree must be rejected"
+        );
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(
+            !reloaded.no_merge,
+            "flag must remain unchanged after rejection"
+        );
     }
 }

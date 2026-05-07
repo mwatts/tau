@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::io::{AsyncBufReadExt, BufReader};
 use smol::Async;
@@ -25,7 +26,297 @@ use crate::protocol::Response;
 use crate::truncate_str;
 use crate::types::*;
 
+/// TTL for the in-memory subscription-usage cache.
+///
+/// The primary refresher is now
+/// [`super::bg_jobs::refresh_subscription_usage`], which fires every
+/// 5 minutes and pushes the new value to all connected TUIs. This TTL
+/// gates the on-demand path (`Request::GetSubscriptionUsage` from a
+/// just-reconnected client) and intentionally matches the bg job's
+/// interval: in steady state the bg job is the *only* thing hitting
+/// Anthropic's `/usage` endpoint, and reconnecting clients ride the
+/// cache. Holding ourselves to ~5 minute granularity here is what
+/// kept us inside Anthropic's account-scoped rate limit (#940).
 const USAGE_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Validate that `successor_id` (when `Some`) is a sensible link target
+/// for `session_id`. Returns `Ok(())` on success or a human-readable
+/// error message otherwise.
+///
+/// Validation rules (all must hold for the link to be accepted):
+/// * `session_id` exists.
+/// * If `successor_id.is_some()`:
+///   * the successor session id is not equal to `session_id` (no self-link),
+///   * the successor session exists,
+///   * the successor is not archived,
+///   * the successor belongs to the same project as the predecessor
+///     (cross-project successors are rejected per task 914 spec),
+///   * the resulting chain does not loop back to `session_id`
+///     (see [`crate::db::Db::would_create_successor_cycle`]).
+///
+/// Caller must hold the state lock so that the read-validate-write
+/// sequence is atomic with respect to other writers.
+pub(super) fn validate_successor_link(
+    db: &crate::db::Db,
+    session_id: &str,
+    successor_id: Option<&str>,
+) -> Result<(), String> {
+    let pred = db
+        .get_session(session_id)
+        .map_err(|e| format!("lookup predecessor: {e}"))?
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    let Some(succ_id) = successor_id else {
+        // Clearing the link only requires the predecessor exists.
+        return Ok(());
+    };
+    if succ_id == session_id {
+        return Err("successor must differ from session_id".to_string());
+    }
+    let succ = db
+        .get_session(succ_id)
+        .map_err(|e| format!("lookup successor: {e}"))?
+        .ok_or_else(|| format!("successor session not found: {succ_id}"))?;
+    if succ.archived {
+        return Err(format!("successor session is archived: {succ_id}"));
+    }
+    if pred.project_name != succ.project_name {
+        return Err(format!(
+            "successor must be in the same project (predecessor: {:?}, successor: {:?})",
+            pred.project_name, succ.project_name
+        ));
+    }
+    if db.would_create_successor_cycle(session_id, succ_id) {
+        return Err(format!(
+            "successor link would create a cycle ({session_id} -> {succ_id} -> ... -> {session_id})"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a `Request::GetSubscriptionUsage` into a `SubscriptionUsage`
+/// payload, with the on-demand caching and graceful-degradation logic
+/// the inline handler used to carry. Lifted out so it can be unit-
+/// tested without standing up a full request socket.
+///
+/// Strategy:
+/// * If the cache is fresh (within [`USAGE_CACHE_TTL_MS`]), serve it.
+/// * Otherwise, try `fetch` outside the state lock.
+/// * On fetch error, serve the (possibly stale) cache if any, else
+///   `SubscriptionUsage::default()`. Anthropic rate-limits `/usage`
+///   aggressively (#940) and the previous behaviour — surfacing the
+///   raw error as a `Response::Error` — caused the TUI to render a
+///   red banner *and* visually interrupt unrelated in-flight tool
+///   calls. Returning a usage payload (even an empty one) means no
+///   fallback path on the wire ever looks like a session error.
+///
+/// The `fetch` argument is a closure rather than a direct call to
+/// [`crate::auth::fetch_subscription_usage`] so tests can inject a
+/// canned `Result` without spinning up the network stack. Production
+/// callers pass `|tok| smol::unblock(move || fetch_subscription_usage(&tok))`.
+async fn resolve_subscription_usage<F, Fut>(
+    state: &SharedState,
+    fetch: F,
+) -> crate::auth::SubscriptionUsage
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = crate::Result<crate::auth::SubscriptionUsage>>,
+{
+    let (cache_snapshot, fresh_within_ttl) = {
+        let st = lock_state(state);
+        let now = crate::types::timestamp_ms();
+        match st.usage_cache.as_ref() {
+            Some((usage, fetched_at)) => {
+                let fresh = now.saturating_sub(*fetched_at) < USAGE_CACHE_TTL_MS;
+                (Some(usage.clone()), fresh)
+            }
+            None => (None, false),
+        }
+    };
+
+    if fresh_within_ttl {
+        return cache_snapshot.expect("fresh_within_ttl implies cache present");
+    }
+
+    // Cache empty or stale — attempt a fetch, but never propagate the
+    // error to the caller. Falls back to the cached value (if any) or
+    // a default-constructed payload.
+    let token = {
+        let st = lock_state(state);
+        st.auth.get_api_key("anthropic")
+    };
+    let fetched = match token {
+        Ok(Some(tok)) if crate::auth::is_oauth_token(&tok) => fetch(tok).await,
+        _ => Err(crate::Error::NoApiKey(
+            "subscription usage requires OAuth login".into(),
+        )),
+    };
+    match fetched {
+        Ok(usage) => {
+            let mut st = lock_state(state);
+            st.usage_cache = Some((usage.clone(), crate::types::timestamp_ms()));
+            usage
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                had_cache = cache_snapshot.is_some(),
+                "GetSubscriptionUsage: fetch failed; serving cached or default"
+            );
+            cache_snapshot.unwrap_or_default()
+        }
+    }
+}
+
+/// Atomically create a successor session inheriting the predecessor's
+/// model / cwd / system_prompt / project / child_budget, link the
+/// predecessor to it, and broadcast `Response::SessionSucceeded` on the
+/// predecessor's subscriber channel.
+///
+/// On success returns `Response::SessionCreated { session_id }` carrying
+/// the new session id. The new session is always top-level (`parent_id = None`).
+/// See task 915.
+pub(super) async fn succeed_session_impl(
+    state: &SharedState,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    session_id: &str,
+    tagline: Option<&str>,
+    caller_session_id: Option<&str>,
+) -> crate::protocol::Response {
+    use crate::protocol::Response;
+
+    // Pre-flight: load predecessor and confirm it isn't already succeeded.
+    let pred = {
+        let st = lock_state(state);
+        match st.db.get_session(session_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Response::Error {
+                    message: format!("session not found: {session_id}"),
+                };
+            }
+            Err(e) => {
+                return Response::Error {
+                    message: format!("lookup predecessor: {e}"),
+                };
+            }
+        }
+    };
+    if let Some(existing) = pred.successor_id.as_deref() {
+        // Walk to the live tip so the error message points the caller at
+        // the right session to act on.
+        let tip = {
+            let st = lock_state(state);
+            st.db.resolve_successor(session_id)
+        };
+        return Response::Error {
+            message: format!(
+                "session {session_id} is already succeeded by {existing} (live tip: {tip}). \
+                 Call succeed_session on the live tip instead."
+            ),
+        };
+    }
+
+    // Inherit predecessor config.  The successor is always top-level
+    // (`parent_id = None`) so retiring a child does not move the
+    // predecessor in the session tree.
+    let inherited_tagline = tagline.map(String::from).or_else(|| pred.tagline.clone());
+    let create_resp = create_session_impl(
+        state,
+        &Some(pred.model.id.clone()),
+        &Some(pred.model.provider.clone()),
+        &pred.system_prompt,
+        &pred.cwd,
+        &None, // top-level
+        pred.child_budget,
+        &inherited_tagline,
+        false, // auto_archive
+        true,  // notify_parent (irrelevant; top-level)
+        &pred.project_name,
+        false, // is_agent
+    );
+    let new_id = match create_resp {
+        Response::SessionCreated { ref session_id } => session_id.clone(),
+        other => return other,
+    };
+
+    // Bring up plugins for the successor and synthesise its system prompt
+    // when the predecessor didn't carry an explicit one (mirrors the
+    // CreateSession dispatch arm).
+    if pred.system_prompt.is_none() {
+        let (cwd_resolved, project_resolved) = {
+            let st = lock_state(state);
+            let stored = st.db.get_session(&new_id).ok().flatten();
+            (
+                stored.as_ref().and_then(|s| s.cwd.clone()),
+                stored.as_ref().and_then(|s| s.project_name.clone()),
+            )
+        };
+        let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
+        let mut pm = plugins.lock().expect("plugins mutex poisoned");
+        match pm.ensure_session_plugins(&new_id, cwd_str, project_resolved.as_deref(), None) {
+            Ok(failures) => {
+                for msg in &failures {
+                    super::notifications::queue_info_to_session(state, &new_id, msg);
+                }
+            }
+            Err(e) => tracing::warn!(%e, "failed to spawn successor session plugins"),
+        }
+        let tool_prompts = pm.tool_prompts(&new_id, pred.child_budget);
+        let prompt = crate::system_prompt::build(&crate::system_prompt::PromptOptions {
+            cwd: cwd_resolved,
+            tools: tool_prompts,
+            ..Default::default()
+        });
+        let st = lock_state(state);
+        if let Err(e) = st.db.update_system_prompt(&new_id, &prompt) {
+            tracing::warn!(%e, "failed to update successor system prompt");
+        }
+    }
+
+    // Validate + write the successor link under a single lock acquisition
+    // (same single-writer discipline as `Request::SetSessionSuccessor`).
+    let link_result: Result<(), String> = {
+        let st = lock_state(state);
+        match validate_successor_link(&st.db, session_id, Some(&new_id)) {
+            Ok(()) => st
+                .db
+                .set_successor(session_id, Some(&new_id))
+                .map_err(|e| e.to_string()),
+            Err(msg) => Err(msg),
+        }
+    };
+    if let Err(message) = link_result {
+        // Couldn't link — leave the orphan successor in place rather than
+        // try to clean up; the caller can archive it manually.  Surface
+        // the error so the caller knows something went wrong.
+        return Response::Error {
+            message: format!("successor created ({new_id}) but link failed: {message}"),
+        };
+    }
+
+    // Persist an info message in the predecessor explaining the handoff.
+    let info = match caller_session_id {
+        Some(caller) => format!(
+            "Session retired by {caller}; succeeded by {new_id}. Future notifications forwarded."
+        ),
+        None => format!("Session retired; succeeded by {new_id}. Future notifications forwarded."),
+    };
+    super::notifications::queue_info_to_session(state, session_id, &info);
+
+    // Broadcast SessionSucceeded on the predecessor's subscriber channel
+    // so attached TUIs auto-switch.  Use the awaiting variant so the
+    // event reaches every live subscriber before this RPC returns.
+    super::notifications::broadcast_to_subscribers_and_wait(
+        state,
+        session_id,
+        &Response::SessionSucceeded {
+            successor_id: new_id.clone(),
+        },
+    )
+    .await;
+
+    Response::SessionCreated { session_id: new_id }
+}
 
 /// Create a session (pure DB logic, no plugin setup).
 #[allow(clippy::too_many_arguments)]
@@ -229,6 +520,7 @@ pub(super) fn create_session_impl(
         notify_parent,
         project_name,
         is_agent,
+        successor_id: None,
     };
     tracing::debug!(
         session_id = %id,
@@ -361,6 +653,50 @@ pub(super) fn project_stats_impl(
     }
 }
 
+/// Look up the active task role (if any) for a session, returning a
+/// [`Response::TaskSessionRole`] suitable for sending straight back
+/// over the wire. Best-effort: if the tasks DB can't be opened or the
+/// query fails we report "no task linkage" and let the caller proceed
+/// rather than 500'ing a setup that doesn't have the tasks plugin.
+///
+/// Shared between the TCP dispatcher (`Request::GetTaskSessionRole`
+/// arm above) and the plugin-context dispatcher (see
+/// `tool_dispatch::handle_server_request`) so both paths agree on the
+/// pre-flight semantics used by `session_succeed`.
+pub(super) fn get_task_session_role_impl(session_id: &str) -> crate::protocol::Response {
+    use crate::protocol::Response;
+    match crate::tasks_db::TasksDb::open_default() {
+        Ok(db) => match db.find_active_task_role_for_session(session_id) {
+            Ok(Some((task_id, role))) => Response::TaskSessionRole {
+                is_worker: role == "worker",
+                task_id: Some(task_id),
+                role: Some(role),
+            },
+            Ok(None) => Response::TaskSessionRole {
+                is_worker: false,
+                task_id: None,
+                role: None,
+            },
+            Err(e) => {
+                tracing::warn!(%e, %session_id, "GetTaskSessionRole DB query failed");
+                Response::TaskSessionRole {
+                    is_worker: false,
+                    task_id: None,
+                    role: None,
+                }
+            }
+        },
+        Err(e) => {
+            tracing::debug!(%e, "GetTaskSessionRole: tasks DB unavailable");
+            Response::TaskSessionRole {
+                is_worker: false,
+                task_id: None,
+                role: None,
+            }
+        }
+    }
+}
+
 /// Look up a project's metadata by name. Returns
 /// [`Response::ProjectInfo`] with `project = None` when the project
 /// doesn't exist (so callers don't have to distinguish "missing" from
@@ -398,8 +734,6 @@ pub(super) fn create_schedule_impl(
     use cron::Schedule;
     use std::str::FromStr;
 
-    // Validate cron expression (cron crate expects 7-field with seconds+year,
-    // but users write standard 5-field; prepend "0 " for seconds and append " *" for year).
     let full_expr = format!("0 {} *", cron_expr);
     let schedule = match Schedule::from_str(&full_expr) {
         Ok(s) => s,
@@ -424,6 +758,77 @@ pub(super) fn create_schedule_impl(
     }
 }
 
+pub(super) fn set_cwd_impl(
+    state: &SharedState,
+    session_id: &str,
+    cwd: &str,
+    caller_session_id: Option<&str>,
+) -> crate::protocol::Response {
+    use crate::protocol::Response;
+    let result = {
+        let st = lock_state(state);
+        st.db.update_cwd(session_id, cwd)
+    };
+    match result {
+        Ok(()) => {
+            let info = match caller_session_id {
+                Some(caller) => format!("cwd changed by {caller} to {cwd}."),
+                None => format!("cwd changed to {cwd}."),
+            };
+            queue_info_to_session(state, session_id, &info);
+            Response::Ok
+        }
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+pub(super) fn reparent_children_impl(
+    state: &SharedState,
+    old_parent_id: &str,
+    new_parent_id: &str,
+) -> crate::protocol::Response {
+    use crate::protocol::Response;
+    let children: Vec<String> = {
+        let st = lock_state(state);
+        st.db
+            .get_children(old_parent_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    };
+    let result = {
+        let st = lock_state(state);
+        st.db.reparent_children(old_parent_id, new_parent_id)
+    };
+    match result {
+        Ok(()) => {
+            let info = format!("Parent session changed from {old_parent_id} to {new_parent_id}.");
+            for child_id in &children {
+                queue_info_to_session(state, child_id, &info);
+            }
+            Response::Ok
+        }
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+pub(super) fn resolve_successor_impl(
+    state: &SharedState,
+    session_id: &str,
+) -> crate::protocol::Response {
+    let resolved = {
+        let st = lock_state(state);
+        st.db.resolve_successor(session_id)
+    };
+    crate::protocol::Response::ResolvedSuccessor {
+        session_id: resolved,
+    }
+}
 pub(super) fn list_sessions_impl(
     state: &SharedState,
     include_archived: bool,
@@ -702,6 +1107,19 @@ pub(super) async fn handle_client(
                     flag.store(false, Ordering::Relaxed);
                     flag.clone()
                 };
+                // Reset (and create) the "stop after tool" flag for this
+                // session.  Tools that need to terminate the agent loop
+                // (today: only `session_succeed`) flip this flag via
+                // `PostPersistAction::StopAgentLoop`.  See task 915.
+                let stop_after_tool_flag: Arc<AtomicBool> = {
+                    let mut st = lock_state(&state);
+                    let flag = st
+                        .stop_after_tool_flags
+                        .entry(session_id.clone())
+                        .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+                    flag.store(false, Ordering::Relaxed);
+                    flag.clone()
+                };
 
                 // Mark session as live (turn actively running).
                 {
@@ -717,7 +1135,13 @@ pub(super) async fn handle_client(
                 // Without this guarantee the TUI gets stuck in Streaming
                 // mode forever when an internal error (e.g. DB write)
                 // causes the handler to bail out early via `?`.
-                let chat_result: Result<(bool, bool), crate::Error> = async {
+                //
+                // Wrap in `catch_unwind` so a panic anywhere along the
+                // path (engine, providers, plugins, executor) flows into
+                // the existing `Err` arm rather than wedging the session.
+                // See task #957.
+                let chat_result: Result<(bool, bool, bool), crate::Error> =
+                    match std::panic::AssertUnwindSafe(async {
                     // Load session
                     let session_data = {
                         let st = lock_state(&state);
@@ -925,7 +1349,8 @@ pub(super) async fn handle_client(
 
                     // Check compaction
                     let was_cancelled = cancel_flag.load(Ordering::Relaxed);
-                    if !was_cancelled {
+                    let was_succeeded = stop_after_tool_flag.load(Ordering::Relaxed);
+                    if !was_cancelled && !was_succeeded {
                         let should = {
                             let st = lock_state(&state);
                             let messages = st.db.get_messages(&session_id).unwrap_or_default();
@@ -944,9 +1369,25 @@ pub(super) async fn handle_client(
                         }
                     }
 
-                    Ok((was_cancelled, max_turns_reached))
-                }
-                .await;
+                    Ok((was_cancelled, max_turns_reached, was_succeeded))
+                })
+                .catch_unwind()
+                .await
+                {
+                    Ok(r) => r,
+                    Err(payload) => {
+                        let msg = super::agent_runner::panic_payload_to_string(&*payload);
+                        tracing::error!(
+                            session_id = %session_id,
+                            panic = %msg,
+                            "agent loop panicked (Chat handler)",
+                        );
+                        Err(crate::Error::Io(format!(
+                            "{}{}",
+                            super::agent_runner::PANIC_ERROR_PREFIX, msg
+                        )))
+                    }
+                };
 
                 // Always broadcast a terminal response so subscribers
                 // (especially the TUI) never get stuck in Streaming mode.
@@ -955,8 +1396,10 @@ pub(super) async fn handle_client(
                 // session can appear idle via another code path. See the
                 // module-level comment in notifications.rs.
                 match chat_result {
-                    Ok((true, _)) => {
-                        // Cancelled
+                    Ok((true, _, _)) => {
+                        // Cancelled (cancellation takes priority over
+                        // "succeeded" if both flags somehow fire racily —
+                        // user intent wins).
                         {
                             let st = lock_state(&state);
                             let _ = st.db.update_exit_status(&session_id, "cancelled");
@@ -965,7 +1408,22 @@ pub(super) async fn handle_client(
                         broadcast_to_subscribers_and_wait(&state, &session_id, &resp).await;
                         send(&mut writer, &resp).await.ok();
                     }
-                    Ok((false, max_turns_reached)) => {
+                    Ok((false, _, true)) => {
+                        // Agent loop ended because a tool returned
+                        // `PostPersistAction::StopAgentLoop` (today:
+                        // `session_succeed`). Emit AgentDone (NOT
+                        // Cancelled) so subscribers know the turn ended
+                        // cleanly. The successor broadcast has already
+                        // been emitted by the SucceedSession handler.
+                        {
+                            let st = lock_state(&state);
+                            let _ = st.db.update_exit_status(&session_id, "succeeded");
+                        }
+                        let resp = Response::AgentDone;
+                        broadcast_to_subscribers_and_wait(&state, &session_id, &resp).await;
+                        send(&mut writer, &resp).await.ok();
+                    }
+                    Ok((false, max_turns_reached, false)) => {
                         // Normal completion (or max turns reached)
                         {
                             let st = lock_state(&state);
@@ -992,12 +1450,18 @@ pub(super) async fn handle_client(
                         send(&mut writer, &resp).await.ok();
                     }
                     Err(e) => {
+                        let panicked = super::agent_runner::is_panic_error(&e);
+                        let exit_status = if panicked { "panicked" } else { "error" };
                         {
                             let st = lock_state(&state);
-                            let _ = st.db.update_exit_status(&session_id, "error");
+                            let _ = st.db.update_exit_status(&session_id, exit_status);
                         }
                         let err_resp = Response::Error {
-                            message: format!("agent error: {}", e),
+                            message: if panicked {
+                                format!("agent loop panicked: {}", e)
+                            } else {
+                                format!("agent error: {}", e)
+                            },
                         };
                         let done_resp = Response::AgentDone;
                         broadcast_to_subscribers(&state, &session_id, &err_resp);
@@ -1611,72 +2075,85 @@ pub(super) async fn handle_client(
                 cwd,
                 caller_session_id,
             } => {
-                let result = {
-                    let st = lock_state(&state);
-                    st.db.update_cwd(&session_id, &cwd)
-                };
-                match result {
-                    Ok(()) => {
-                        let info = match caller_session_id.as_deref() {
-                            Some(caller) => format!("cwd changed by {caller} to {cwd}."),
-                            None => format!("cwd changed to {cwd}."),
-                        };
-                        queue_info_to_session(&state, &session_id, &info);
-                        send(&mut writer, &Response::Ok).await?;
-                    }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                let resp = set_cwd_impl(&state, &session_id, &cwd, caller_session_id.as_deref());
+                send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::ReparentChildren {
                 old_parent_id,
                 new_parent_id,
             } => {
-                // Capture the affected children *before* the DB update so we
-                // know which sessions to annotate (the reparent query changes
-                // the parent pointer in-place, so after it runs a lookup by
-                // `old_parent_id` would return nothing).
-                let children: Vec<String> = {
+                let resp = reparent_children_impl(&state, &old_parent_id, &new_parent_id);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::SetSessionSuccessor {
+                session_id,
+                successor_id,
+                caller_session_id,
+            } => {
+                // Validate + write under a single lock acquisition. The state
+                // mutex is the global single-writer for `Db`, so doing the
+                // cycle check + UPDATE under one lock is sufficient — no
+                // explicit SQLite transaction needed.
+                let result: Result<Option<String>, String> = {
                     let st = lock_state(&state);
-                    st.db
-                        .get_children(&old_parent_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|s| s.id)
-                        .collect()
-                };
-                let result = {
-                    let st = lock_state(&state);
-                    st.db.reparent_children(&old_parent_id, &new_parent_id)
+                    match validate_successor_link(&st.db, &session_id, successor_id.as_deref()) {
+                        Ok(()) => match st.db.set_successor(&session_id, successor_id.as_deref()) {
+                            Ok(()) => Ok(successor_id.clone()),
+                            Err(e) => Err(e.to_string()),
+                        },
+                        Err(msg) => Err(msg),
+                    }
                 };
                 match result {
-                    Ok(()) => {
-                        let info = format!(
-                            "Parent session changed from {old_parent_id} to {new_parent_id}."
-                        );
-                        for child_id in &children {
-                            queue_info_to_session(&state, child_id, &info);
-                        }
+                    Ok(new_succ) => {
+                        let info = match (&new_succ, caller_session_id.as_deref()) {
+                            (Some(s), Some(caller)) => format!(
+                                "Session retired by {caller}; future notifications forwarded to {s}."
+                            ),
+                            (Some(s), None) => {
+                                format!("Session retired; future notifications forwarded to {s}.")
+                            }
+                            (None, Some(caller)) => format!(
+                                "Successor link cleared by {caller}; session is no longer retired."
+                            ),
+                            (None, None) => {
+                                "Successor link cleared; session is no longer retired.".to_string()
+                            }
+                        };
+                        queue_info_to_session(&state, &session_id, &info);
                         send(&mut writer, &Response::Ok).await?;
                     }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
+                    Err(message) => {
+                        send(&mut writer, &Response::Error { message }).await?;
                     }
                 }
             }
+            crate::protocol::Request::SucceedSession {
+                session_id,
+                tagline,
+                caller_session_id,
+            } => {
+                let resp = succeed_session_impl(
+                    &state,
+                    &plugins,
+                    &session_id,
+                    tagline.as_deref(),
+                    caller_session_id.as_deref(),
+                )
+                .await;
+                send(&mut writer, &resp).await?;
+            }
+
+            crate::protocol::Request::ResolveSuccessor { session_id } => {
+                let resp = resolve_successor_impl(&state, &session_id);
+                send(&mut writer, &resp).await?;
+            }
+
+            crate::protocol::Request::GetTaskSessionRole { session_id } => {
+                let resp = get_task_session_role_impl(&session_id);
+                send(&mut writer, &resp).await?;
+            }
+
             crate::protocol::Request::SetModel {
                 session_id,
                 model_id,
@@ -1796,58 +2273,11 @@ pub(super) async fn handle_client(
                 send(&mut writer, &Response::AuthStatus { providers }).await?;
             }
             crate::protocol::Request::GetSubscriptionUsage => {
-                // Check cache, fetch if stale
-                let cache_result = {
-                    let st = lock_state(&state);
-                    let now = crate::types::timestamp_ms();
-                    if let Some((ref usage, fetched_at)) = st.usage_cache {
-                        if now.saturating_sub(fetched_at) < USAGE_CACHE_TTL_MS {
-                            Some(Ok(usage.clone()))
-                        } else {
-                            None // stale
-                        }
-                    } else {
-                        None // not yet fetched
-                    }
-                };
-
-                let result = if let Some(cached) = cache_result {
-                    cached
-                } else {
-                    // Fetch outside the lock
-                    let token = {
-                        let st = lock_state(&state);
-                        st.auth.get_api_key("anthropic")
-                    };
-                    match token {
-                        Ok(Some(tok)) if crate::auth::is_oauth_token(&tok) => {
-                            smol::unblock(move || crate::auth::fetch_subscription_usage(&tok)).await
-                        }
-                        _ => Err(crate::Error::NoApiKey(
-                            "subscription usage requires OAuth login".into(),
-                        )),
-                    }
-                };
-
-                match result {
-                    Ok(usage) => {
-                        // Update cache
-                        {
-                            let mut st = lock_state(&state);
-                            st.usage_cache = Some((usage.clone(), crate::types::timestamp_ms()));
-                        }
-                        send(&mut writer, &Response::SubscriptionUsage { usage }).await?;
-                    }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                let usage = resolve_subscription_usage(&state, |tok| {
+                    smol::unblock(move || crate::auth::fetch_subscription_usage(&tok))
+                })
+                .await;
+                send(&mut writer, &Response::SubscriptionUsage { usage }).await?;
             }
             crate::protocol::Request::WaitSessions {
                 session_ids,
@@ -2809,6 +3239,7 @@ mod tests {
             all_models: vec![mk_model()],
             usage_cache: None,
             cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
             has_queued: HashMap::new(),
             subscribers: HashMap::new(),
             phases: HashMap::new(),
@@ -2820,6 +3251,51 @@ mod tests {
             bg_after_idle: HashMap::new(),
             bg_scheduler: None,
         }))
+    }
+
+    /// Build a `State` with an isolated, tempdir-backed `AuthStorage`
+    /// pre-loaded with a fake Anthropic OAuth credential. Used by
+    /// `resolve_subscription_usage` tests so the OAuth-token branch
+    /// runs (and hits our injected fetcher) without depending on the
+    /// real `~/.config/tau/auth.json`.
+    fn mk_state_with_oauth() -> (SharedState, tempfile::TempDir) {
+        let db = Db::open_memory().expect("open memory db");
+        let auth_dir = tempfile::tempdir().expect("tempdir for auth");
+        let auth = crate::auth::AuthStorage::new(auth_dir.path().join("auth.json"));
+        auth.set(
+            "anthropic",
+            AuthCredential::Oauth(crate::auth::OAuthCredentials {
+                refresh: "refresh-stub".into(),
+                access: "sk-ant-oat-test-token".into(),
+                // 1 hour in the future so `get_api_key` returns the
+                // stored token without trying to refresh it.
+                expires: crate::types::timestamp_ms() + 60 * 60 * 1000,
+            }),
+        )
+        .expect("install anthropic oauth credential");
+        let state = Arc::new(Mutex::new(State {
+            db,
+            registry: ProviderRegistry::new(),
+            auth,
+            config: crate::config::Config::default(),
+            global_aliases: HashMap::new(),
+            default_model: mk_model(),
+            all_models: vec![mk_model()],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }));
+        (state, auth_dir)
     }
 
     /// Subscribing then dropping the client socket without any broadcast
@@ -3040,5 +3516,464 @@ mod tests {
                 .expect("session row")
         };
         assert!(stored.project_name.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Task 914: validate_successor_link
+    // -----------------------------------------------------------------
+
+    /// Insert a minimal session into the test db with a controlled
+    /// `project_name` and `archived` flag so the validator's checks can
+    /// be exercised directly.
+    fn make_link_session(state: &SharedState, id: &str, project: Option<&str>, archived: bool) {
+        let st = lock_state(state);
+        st.db
+            .create_session(&crate::db::StoredSession {
+                id: id.into(),
+                model: mk_model(),
+                system_prompt: None,
+                cwd: None,
+                is_subscription: false,
+                created_at: 1000,
+                parent_id: None,
+                child_budget: 0,
+                tagline: None,
+                archived,
+                last_exit_status: None,
+                last_phase: None,
+                auto_archive: false,
+                notify_parent: true,
+                project_name: project.map(str::to_string),
+                successor_id: None,
+            })
+            .expect("create session");
+    }
+
+    #[test]
+    fn validate_successor_link_clears_when_predecessor_exists() {
+        let state = mk_state();
+        make_link_session(&state, "s_pred", Some("p"), false);
+        let st = lock_state(&state);
+        // Clearing the link is allowed when the predecessor exists.
+        assert!(validate_successor_link(&st.db, "s_pred", None).is_ok());
+        // Clearing on a missing predecessor is rejected.
+        assert!(validate_successor_link(&st.db, "s_missing", None).is_err());
+    }
+
+    #[test]
+    fn validate_successor_link_rejects_self_archived_and_cross_project() {
+        let state = mk_state();
+        make_link_session(&state, "s_pred", Some("alpha"), false);
+        make_link_session(&state, "s_succ", Some("alpha"), false);
+        make_link_session(&state, "s_succ_archived", Some("alpha"), true);
+        make_link_session(&state, "s_succ_other_proj", Some("beta"), false);
+
+        let st = lock_state(&state);
+        // Happy path.
+        assert!(validate_successor_link(&st.db, "s_pred", Some("s_succ")).is_ok());
+        // Self-link rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_pred"))
+            .expect_err("self-link must be rejected");
+        assert!(err.contains("differ"));
+        // Archived successor rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_succ_archived"))
+            .expect_err("archived successor must be rejected");
+        assert!(err.contains("archived"));
+        // Cross-project rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_succ_other_proj"))
+            .expect_err("cross-project successor must be rejected");
+        assert!(err.contains("same project"));
+        // Missing predecessor rejected.
+        let err = validate_successor_link(&st.db, "s_missing", Some("s_succ"))
+            .expect_err("missing predecessor must be rejected");
+        assert!(err.contains("session not found"));
+        // Missing successor rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_missing"))
+            .expect_err("missing successor must be rejected");
+        assert!(err.contains("successor session not found"));
+    }
+
+    #[test]
+    fn validate_successor_link_rejects_cycle() {
+        let state = mk_state();
+        make_link_session(&state, "s_a", Some("p"), false);
+        make_link_session(&state, "s_b", Some("p"), false);
+        // Establish s_b -> s_a.
+        {
+            let st = lock_state(&state);
+            st.db.set_successor("s_b", Some("s_a")).expect("set");
+        }
+        // Now attempting s_a -> s_b would close the loop.
+        let st = lock_state(&state);
+        let err = validate_successor_link(&st.db, "s_a", Some("s_b"))
+            .expect_err("cycle must be rejected");
+        assert!(err.contains("cycle"));
+    }
+
+    // -----------------------------------------------------------------
+    // Task 915: succeed_session_impl
+    // -----------------------------------------------------------------
+
+    fn mk_plugins() -> Arc<Mutex<crate::plugin::PluginManager>> {
+        Arc::new(Mutex::new(crate::plugin::PluginManager::new(
+            crate::plugin::PluginsConfig {
+                no_default_worker: true,
+                ..Default::default()
+            },
+        )))
+    }
+
+    /// Happy path: succeeding a session creates a top-level successor
+    /// inheriting model/cwd/project, links the predecessor, and
+    /// broadcasts SessionSucceeded exactly once.
+    #[test]
+    fn succeed_session_creates_top_level_successor_and_broadcasts() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            // Insert predecessor with a parent + project_name + tagline so
+            // we can verify each is propagated correctly.
+            make_link_session(&state, "s_parent", Some("p"), false);
+            make_link_session(&state, "s_pred", Some("p"), false);
+            {
+                let st = lock_state(&state);
+                let mut row = st
+                    .db
+                    .get_session("s_pred")
+                    .expect("db ok")
+                    .expect("row exists");
+                row.parent_id = Some("s_parent".into());
+                row.tagline = Some("original tagline".into());
+                // Use raw db update through delete + create to set parent_id.
+                st.db.delete_session("s_pred").expect("delete pred");
+                st.db.create_session(&row).expect("recreate pred");
+            }
+
+            // Subscribe to the predecessor so we can observe the broadcast.
+            let (tx, rx) = smol::channel::unbounded::<crate::protocol::Response>();
+            {
+                let mut st = lock_state(&state);
+                st.subscribers
+                    .entry("s_pred".to_string())
+                    .or_default()
+                    .push(tx);
+            }
+
+            let resp = succeed_session_impl(&state, &plugins, "s_pred", None, None).await;
+            let new_id = match resp {
+                crate::protocol::Response::SessionCreated { session_id } => session_id,
+                other => panic!("expected SessionCreated, got {other:?}"),
+            };
+
+            // Successor inherited model/project, has parent_id = None, and
+            // the predecessor's tagline by default.
+            let st = lock_state(&state);
+            let succ = st
+                .db
+                .get_session(&new_id)
+                .expect("db ok")
+                .expect("successor row");
+            assert!(succ.parent_id.is_none(), "successor must be top-level");
+            assert_eq!(succ.project_name.as_deref(), Some("p"));
+            assert_eq!(succ.tagline.as_deref(), Some("original tagline"));
+
+            // Predecessor.successor_id now points at the new session.
+            let pred = st
+                .db
+                .get_session("s_pred")
+                .expect("db ok")
+                .expect("pred row");
+            assert_eq!(pred.successor_id.as_deref(), Some(new_id.as_str()));
+            drop(st);
+
+            // Exactly one SessionSucceeded broadcast on the predecessor's channel.
+            let mut succeeded_count = 0;
+            while let Ok(resp) = rx.try_recv() {
+                if let crate::protocol::Response::SessionSucceeded { successor_id } = resp
+                    && successor_id == new_id
+                {
+                    succeeded_count += 1;
+                }
+            }
+            assert_eq!(
+                succeeded_count, 1,
+                "expected exactly one SessionSucceeded broadcast, saw {succeeded_count}",
+            );
+        });
+    }
+
+    /// Rejects: the predecessor is already retired (has a successor_id).
+    /// The error message should point at the live tip of the chain so the
+    /// caller knows where to re-issue the call.
+    #[test]
+    fn succeed_session_rejects_already_succeeded_predecessor() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            make_link_session(&state, "s_pred", Some("p"), false);
+            make_link_session(&state, "s_existing_succ", Some("p"), false);
+            {
+                let st = lock_state(&state);
+                st.db
+                    .set_successor("s_pred", Some("s_existing_succ"))
+                    .expect("set succ");
+            }
+            let resp = succeed_session_impl(&state, &plugins, "s_pred", None, None).await;
+            match resp {
+                crate::protocol::Response::Error { message } => {
+                    assert!(
+                        message.contains("already succeeded"),
+                        "error should mention already-succeeded: {message}",
+                    );
+                    assert!(
+                        message.contains("s_existing_succ"),
+                        "error should name the live tip: {message}",
+                    );
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        });
+    }
+
+    /// Rejects: the predecessor session id is unknown.
+    #[test]
+    fn succeed_session_rejects_missing_predecessor() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            let resp = succeed_session_impl(&state, &plugins, "s_does_not_exist", None, None).await;
+            match resp {
+                crate::protocol::Response::Error { message } => {
+                    assert!(
+                        message.contains("session not found"),
+                        "error should mention session not found: {message}",
+                    );
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        });
+    }
+
+    /// `new_tagline` arg overrides the predecessor's tagline.
+    #[test]
+    fn succeed_session_honours_new_tagline_override() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            make_link_session(&state, "s_pred", Some("p"), false);
+            {
+                let st = lock_state(&state);
+                let mut row = st
+                    .db
+                    .get_session("s_pred")
+                    .expect("db ok")
+                    .expect("row exists");
+                row.tagline = Some("old tagline".into());
+                st.db.delete_session("s_pred").expect("delete pred");
+                st.db.create_session(&row).expect("recreate pred");
+            }
+            let resp =
+                succeed_session_impl(&state, &plugins, "s_pred", Some("new tagline"), None).await;
+            let new_id = match resp {
+                crate::protocol::Response::SessionCreated { session_id } => session_id,
+                other => panic!("expected SessionCreated, got {other:?}"),
+            };
+            let st = lock_state(&state);
+            let succ = st
+                .db
+                .get_session(&new_id)
+                .expect("db ok")
+                .expect("successor row");
+            assert_eq!(succ.tagline.as_deref(), Some("new tagline"));
+        });
+    }
+
+    /// Regression for #939: `get_task_session_role_impl` must return a
+    /// `Response::TaskSessionRole` (not a generic `Error`) for sessions
+    /// with no task linkage. Both the TCP dispatcher and the
+    /// plugin-context dispatcher (`tool_dispatch::handle_server_request`)
+    /// share this helper, so this also exercises the plugin path used
+    /// by `session_succeed`'s pre-flight check.
+    ///
+    /// We don't seed the tasks DB here — the helper is best-effort and
+    /// reports "no task linkage" when the DB is unavailable or the
+    /// session isn't a task session, which is the case the bug hit.
+    #[test]
+    fn get_task_session_role_impl_returns_role_response_for_unknown_session() {
+        let resp = get_task_session_role_impl("s_does_not_exist");
+        match resp {
+            crate::protocol::Response::TaskSessionRole {
+                is_worker,
+                task_id,
+                role,
+            } => {
+                assert!(
+                    !is_worker,
+                    "unknown session must not be reported as a worker"
+                );
+                assert_eq!(task_id, None);
+                assert_eq!(role, None);
+            }
+            other => panic!(
+                "expected TaskSessionRole for unknown session, got {other:?} \
+                 — plugin-context dispatcher would fall through to the \
+                 catch-all `request not supported in plugin context` error"
+            ),
+        }
+    }
+
+    /// Helper: a usage payload with a marker utilization so equality
+    /// asserts read clearly in test failure output.
+    fn usage_with(value: f64) -> crate::auth::SubscriptionUsage {
+        crate::auth::SubscriptionUsage {
+            five_hour: Some(crate::auth::UsageBucket {
+                utilization: Some(value),
+                resets_at: Some("2026-01-01T00:00:00Z".into()),
+            }),
+            seven_day: None,
+            seven_day_sonnet: None,
+            seven_day_opus: None,
+            extra_usage: None,
+        }
+    }
+
+    /// Regression for #940: a fetch error must NOT be propagated to
+    /// the caller. With a populated cache we serve the cached value
+    /// and pretend nothing went wrong.
+    #[test]
+    fn resolve_subscription_usage_falls_back_to_stale_cache_on_error() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+
+            // Pre-populate the cache with a known value, then time-
+            // shift the fetched_at far enough into the past that the
+            // TTL has expired and the helper will try to refetch.
+            let stale = usage_with(7.0);
+            {
+                let mut st = lock_state(&state);
+                let stale_ts =
+                    crate::types::timestamp_ms().saturating_sub(USAGE_CACHE_TTL_MS + 60_000);
+                st.usage_cache = Some((stale.clone(), stale_ts));
+            }
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_clone = calls.clone();
+            let result = resolve_subscription_usage(&state, |_tok| {
+                let c = calls_clone.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(crate::Error::HttpStatus {
+                        status: 429,
+                        message: "rate limited".into(),
+                        retry_after: None,
+                    })
+                }
+            })
+            .await;
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "fetcher must be invoked when cache is stale"
+            );
+            assert_eq!(
+                result.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(7.0),
+                "stale cache value must be returned on fetch error \
+                 instead of propagating the 429"
+            );
+        });
+    }
+
+    /// Regression for #940: with NO cache and a fetch error, return a
+    /// `default()` payload (empty buckets). The TUI renders nothing
+    /// instead of a red banner.
+    #[test]
+    fn resolve_subscription_usage_returns_default_when_no_cache_and_error() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+            // Cache stays at None.
+
+            let result = resolve_subscription_usage(&state, |_tok| async {
+                Err(crate::Error::HttpStatus {
+                    status: 429,
+                    message: "rate limited".into(),
+                    retry_after: Some(60),
+                })
+            })
+            .await;
+
+            // Default = all buckets `None`.
+            assert!(
+                result.five_hour.is_none()
+                    && result.seven_day.is_none()
+                    && result.seven_day_sonnet.is_none()
+                    && result.seven_day_opus.is_none()
+                    && result.extra_usage.is_none(),
+                "empty cache + fetch error must yield SubscriptionUsage::default(), \
+                 got {result:?}"
+            );
+        });
+    }
+
+    /// Fresh cache short-circuits: the fetcher must not be called.
+    #[test]
+    fn resolve_subscription_usage_skips_fetch_when_cache_fresh() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+            let fresh = usage_with(42.0);
+            {
+                let mut st = lock_state(&state);
+                st.usage_cache = Some((fresh.clone(), crate::types::timestamp_ms()));
+            }
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_clone = calls.clone();
+            let result = resolve_subscription_usage(&state, |_tok| {
+                let c = calls_clone.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(usage_with(0.0))
+                }
+            })
+            .await;
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "fresh cache must short-circuit the fetcher"
+            );
+            assert_eq!(
+                result.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(42.0),
+                "fresh cache value must be returned verbatim"
+            );
+        });
+    }
+
+    /// On a successful fetch the helper updates the cache for next
+    /// time. (The bg job is the canonical updater, but on-demand
+    /// fetches that succeed must not let the cache stay stale.)
+    #[test]
+    fn resolve_subscription_usage_updates_cache_on_success() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+            // Cache starts empty.
+
+            let result =
+                resolve_subscription_usage(&state, |_tok| async { Ok(usage_with(13.5)) }).await;
+
+            assert_eq!(
+                result.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(13.5)
+            );
+            let st = lock_state(&state);
+            let (cached, _ts) = st.usage_cache.as_ref().expect("cache populated");
+            assert_eq!(
+                cached.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(13.5),
+                "successful fetch must populate the cache"
+            );
+        });
     }
 }

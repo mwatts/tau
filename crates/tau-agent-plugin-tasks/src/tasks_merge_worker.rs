@@ -258,6 +258,53 @@ fn run_one_job<W>(
         return;
     }
 
+    // no_merge tasks: transition straight to Done; no merge ceremony,
+    // no checklist, no worktree cleanup. Notify subscribers and archive
+    // task sessions so the placeholder subtree doesn't leak.
+    if task.no_merge {
+        match db.update_task(
+            job.task_id,
+            &TaskUpdate {
+                state: Some(TaskState::Done),
+                ..Default::default()
+            },
+            None,
+        ) {
+            Ok(updated) => {
+                crate::tasks_notify::notify_state_change(
+                    db,
+                    &updated,
+                    TaskState::Approved,
+                    None,
+                    writer,
+                    reader,
+                );
+                crate::tasks_scheduler::archive_no_merge_task_sessions(
+                    db, &updated, writer, reader,
+                );
+                // Parent-notification parity with the code-merge path:
+                // a no_merge subtask completing must wake its code
+                // (or no_merge) parent the same way a merge would.
+                crate::tasks_merge::notify_parent_of_subtask_done(db, job.task_id, writer, reader);
+                if let Err(e) =
+                    crate::tasks_merge::notify_parent_if_all_done(db, job.task_id, writer, reader)
+                {
+                    eprintln!(
+                        "tasks merge worker: notify_parent_if_all_done for no_merge task {}: {}",
+                        job.task_id, e
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "tasks merge worker: failed to transition no_merge task {} to done: {}",
+                    job.task_id, e
+                );
+            }
+        }
+        return;
+    }
+
     // Transition to merging. If the transition fails (concurrent writer,
     // invalid state machine edge) we bail out; the task keeps its
     // current state and will be retried on the next scheduler pass.
@@ -674,6 +721,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .expect("create task");
@@ -763,6 +811,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -802,6 +851,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )

@@ -25,6 +25,7 @@ pub(crate) struct State {
     pub(crate) usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
     /// Per-session cancel flags.  Set by CancelChat, cleared on Chat start.
     pub(crate) cancel_flags: HashMap<String, Arc<AtomicBool>>,
+    pub(crate) stop_after_tool_flags: HashMap<String, Arc<AtomicBool>>,
     /// Per-session flag indicating queued messages are pending.
     pub(crate) has_queued: HashMap<String, Arc<AtomicBool>>,
     /// Per-session broadcast subscribers.

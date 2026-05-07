@@ -916,6 +916,7 @@ fn queue_message_persists_across_operations() {
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     })
     .unwrap();
 
@@ -3782,6 +3783,7 @@ fn insert_stored(db: &tau_agent_lib::db::Db, id: &str, parent_id: Option<&str>, 
         notify_parent: true,
         project_name: None,
         is_agent: false,
+        successor_id: None,
     })
     .expect("create_session");
     // Append a stub `Info` message so the empty-session GC running on
@@ -4130,6 +4132,7 @@ fn seamless_restart_resumes_session_with_trailing_tool_result() {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message(sid, &Message::User(UserMessage::text("kick off")))
@@ -4233,6 +4236,7 @@ fn seamless_restart_skips_completed_session() {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message(sid, &Message::User(UserMessage::text("hi")))
@@ -4302,6 +4306,7 @@ fn seamless_restart_skips_archived_session() {
             notify_parent: true,
             project_name: None,
             is_agent: false,
+            successor_id: None,
         })
         .unwrap();
         db.append_message(sid, &Message::User(UserMessage::text("hi")))

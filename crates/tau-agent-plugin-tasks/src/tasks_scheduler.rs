@@ -489,6 +489,61 @@ fn record_skip_reason(db: &TasksDb, task: &Task, reason: &SkipReason) {
     }
 }
 
+/// Resolve a task's `merge_target` against the live repository.
+///
+/// `TasksDb::get_merge_target` is a DB-only view: for an *implicit* merge
+/// target (no explicit override) it returns the parent task's branch as
+/// recorded in the tasks DB. That branch may have been deleted by a
+/// post-merge cleanup, leaving the value pointing at a phantom ref. This
+/// helper covers that gap by walking up the ancestor chain when the
+/// candidate branch is missing, returning the first ancestor whose branch
+/// still exists in the repo, or `"main"` as the final fallback.
+///
+/// An **explicit** `merge_target` override is returned verbatim — if a
+/// user/agent set the value deliberately we don't second-guess it. The
+/// downstream `branch_exists` check in `prepare_task` still surfaces a
+/// helpful error in the typo / deleted-named-branch case.
+fn resolve_merge_target_against_repo(
+    db: &TasksDb,
+    task: &Task,
+    repo_root: &str,
+) -> tau_agent_plugin::Result<String> {
+    // Explicit override: honour it verbatim.
+    if let Some(target) = task.merge_target.as_deref() {
+        return Ok(target.to_string());
+    }
+
+    // Implicit: ask the DB for the candidate (parent.branch or "main").
+    let candidate = db.get_merge_target(task.id)?;
+    if tasks_git::branch_exists(repo_root, &candidate)? {
+        return Ok(candidate);
+    }
+
+    // Candidate branch is missing — likely a post-merge cleanup of an
+    // ancestor. Walk up the chain looking for a still-extant branch.
+    let mut cur_parent_id = task.parent_id;
+    let mut hops = 0u32;
+    const MAX_HOPS: u32 = 64; // defensive: pathological cycles
+    while let Some(pid) = cur_parent_id {
+        if hops >= MAX_HOPS {
+            break;
+        }
+        hops += 1;
+        let parent = match db.get_task(pid)? {
+            Some(p) => p,
+            None => break,
+        };
+        if let Some(br) = parent.branch.as_deref() {
+            if tasks_git::branch_exists(repo_root, br)? {
+                return Ok(br.to_string());
+            }
+        }
+        cur_parent_id = parent.parent_id;
+    }
+
+    Ok("main".to_string())
+}
+
 /// Prepare a single task for dispatch: create branch, worktree, update DB.
 fn prepare_task(
     db: &TasksDb,
@@ -499,11 +554,41 @@ fn prepare_task(
         "tasks scheduler: prepare_task starting for task {} (state={}, parent_id={:?})",
         task.id, task.state, task.parent_id
     );
+
+    // no_merge tasks: skip branch + worktree provisioning entirely. The
+    // task transitions to active in-place; the worker session will run
+    // in the project's main checkout (see `TaskPhase::cwd`). On
+    // approval the task transitions directly to `done` rather than
+    // through `merging` (handled by `merge_approved_for_caller`).
+    if task.no_merge {
+        let _ = repo_root;
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Active),
+                ..Default::default()
+            },
+            None,
+        )?;
+        eprintln!(
+            "tasks scheduler: prepare_task success for task {} (no_merge=true; skipped worktree)",
+            task.id
+        );
+        return Ok(ScheduledTask {
+            id: task.id,
+            title: task.title.clone(),
+            branch: String::new(),
+            worktree_path: String::new(),
+        });
+    }
+
     let branch = tasks_git::task_branch_name(task.id, task.parent_id);
 
     // Determine the base branch: merge target (explicit override, parent's
-    // branch, or "main").
-    let base_branch = db.get_merge_target(task.id)?;
+    // branch, or "main"). Resolves implicit targets against the live repo
+    // so a post-merge cleanup of an ancestor's branch falls back to the
+    // nearest still-extant ancestor (or "main") instead of stalling.
+    let base_branch = resolve_merge_target_against_repo(db, task, repo_root)?;
 
     // Create branch (skip if it already exists — idempotent).
     if !tasks_git::branch_exists(repo_root, &branch)? {
@@ -718,7 +803,24 @@ pub fn find_root_session(
     if last.archived {
         return None;
     }
-    Some(last.id.clone())
+    // Task 914: if the root has been retired (`successor_id` set), follow
+    // the chain to the live tip via the dedicated `ResolveSuccessor` RPC
+    // so new task-dispatched children get parented under the *current*
+    // root rather than the retired one.  We resolve here (and not inside
+    // `GetSessionAncestors`) because the ancestor walk is intentionally a
+    // literal parent-chain query for the agent-facing `session_ancestors`
+    // tool, the picker, and the e2e tests.
+    let resolved = match server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::ResolveSuccessor {
+            session_id: last.id.clone(),
+        },
+    ) {
+        Ok(tau_agent_plugin::Response::ResolvedSuccessor { session_id }) => session_id,
+        _ => last.id.clone(),
+    };
+    Some(resolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +877,12 @@ impl TaskPhase {
     ///   (reviewers read the diff — the worktree is the right place, but
     ///   they tolerate a missing worktree).
     fn cwd(&self, task: &Task, project_path: &str) -> Option<String> {
+        // no_merge tasks have no worktree by design — their worker session
+        // runs in the project root (where reads are valid; the task is
+        // not expected to write).
+        if task.no_merge {
+            return Some(project_path.to_string());
+        }
         match self {
             Self::Worker => task.worktree_path.clone(),
             Self::Planner | Self::Refiner => Some(project_path.to_string()),
@@ -1014,9 +1122,13 @@ pub(crate) fn dispatch_task_phase(
     )?;
 
     // --- 6. Initial chat --------------------------------------------------
-    let merge_target = db
-        .get_merge_target(task_id)
-        .unwrap_or_else(|_| "main".into());
+    // Resolve against the live repo so the worker prompt names a branch
+    // that actually exists when the parent has already been cleaned up.
+    let merge_target = tasks_git::get_repo_root(project_path)
+        .ok()
+        .and_then(|repo_root| resolve_merge_target_against_repo(db, task, &repo_root).ok())
+        .or_else(|| db.get_merge_target(task_id).ok())
+        .unwrap_or_else(|| "main".into());
     let project_instructions = tasks_config::load_project_instructions(
         project_path,
         Some(&task.project_name),
@@ -1505,7 +1617,12 @@ pub fn is_rebased_on_target(db: &TasksDb, task: &Task) -> tau_agent_plugin::Resu
         .as_ref()
         .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} has no worktree", task.id)))?;
 
-    let merge_target = db.get_merge_target(task.id)?;
+    // Resolve against the live repo: if the target branch was cleaned up
+    // (e.g. an ancestor task merged and its branch was deleted) we fall
+    // back to the nearest still-extant ancestor (or "main") so the rebase
+    // check produces a sensible answer instead of erroring on a phantom
+    // ref.
+    let merge_target = resolve_merge_target_against_repo(db, task, worktree)?;
 
     // Use git merge-base --is-ancestor to check if merge_target is an
     // ancestor of the task's branch.
@@ -1544,6 +1661,53 @@ pub fn merge_approved(
     merge_approved_for_caller(db, resolve_path, None, writer, reader)
 }
 
+/// Archive the worker/placeholder/role sessions of a no_merge task that
+/// just transitioned to `done`. Mirrors the archival side of
+/// [`crate::tasks_merge::merge_task`] but without the merge ceremony.
+pub(crate) fn archive_no_merge_task_sessions(
+    db: &TasksDb,
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let mut archived: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ref placeholder_sid) = task.placeholder_session_id {
+        let _ = server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::ArchiveSession {
+                session_id: placeholder_sid.clone(),
+                require_ancestor: None,
+            },
+        );
+        archived.insert(placeholder_sid.clone());
+    } else if let Ok(sessions) = db.get_sessions(task.id) {
+        for ts in &sessions {
+            let _ = server_request(
+                writer,
+                reader,
+                tau_agent_plugin::Request::ArchiveSession {
+                    session_id: ts.session_id.clone(),
+                    require_ancestor: None,
+                },
+            );
+            archived.insert(ts.session_id.clone());
+        }
+    }
+    if let Some(ref sid) = task.session_id
+        && !archived.contains(sid)
+    {
+        let _ = server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::ArchiveSession {
+                session_id: sid.clone(),
+                require_ancestor: None,
+            },
+        );
+    }
+}
+
 /// Variant of [`merge_approved`] that threads a caller session id through
 /// [`merge_one_task`] — the caller may be in the to-be-archived subtree
 /// of one of the approved tasks, in which case archival is deferred to
@@ -1560,18 +1724,84 @@ pub fn merge_approved_for_caller(
         return Ok(Vec::new());
     }
 
+    // Partition: no_merge tasks transition straight to `done` (no merge
+    // ceremony, no checklist run, no worktree cleanup needed). Code-merge
+    // tasks proceed through the normal merge_one_task path.
+    let (no_merge_tasks, code_tasks): (Vec<Task>, Vec<Task>) =
+        approved.into_iter().partition(|t| t.no_merge);
+
+    let mut attempts: Vec<MergeAttempt> = Vec::new();
+
+    for task in &no_merge_tasks {
+        let task_id = task.id;
+        let title = task.title.clone();
+        match db.update_task(
+            task_id,
+            &TaskUpdate {
+                state: Some(TaskState::Done),
+                ..Default::default()
+            },
+            None,
+        ) {
+            Ok(updated) => {
+                crate::tasks_notify::notify_state_change(
+                    db,
+                    &updated,
+                    TaskState::Approved,
+                    None,
+                    writer,
+                    reader,
+                );
+                // Archive worker / reviewer / placeholder sessions so the
+                // task's session subtree doesn't leak after completion.
+                // Mirrors the archival that `merge_task` performs for
+                // code-merge tasks.
+                archive_no_merge_task_sessions(db, &updated, writer, reader);
+                // Parent-notification parity with the code-merge path:
+                // a no_merge subtask completing must wake its code
+                // (or no_merge) parent the same way a merge would.
+                crate::tasks_merge::notify_parent_of_subtask_done(db, task_id, writer, reader);
+                if let Err(e) =
+                    crate::tasks_merge::notify_parent_if_all_done(db, task_id, writer, reader)
+                {
+                    eprintln!(
+                        "tasks scheduler: notify_parent_if_all_done for no_merge task {}: {}",
+                        task_id, e
+                    );
+                }
+                attempts.push(MergeAttempt {
+                    task_id,
+                    title,
+                    success: true,
+                    log: "no_merge task: skipped merge ceremony, transitioned to done".to_string(),
+                });
+            }
+            Err(e) => {
+                attempts.push(MergeAttempt {
+                    task_id,
+                    title,
+                    success: false,
+                    log: format!("no_merge task: failed to transition to done: {}", e),
+                });
+            }
+        }
+    }
+
+    if code_tasks.is_empty() {
+        attempts.sort_by_key(|a| a.task_id);
+        return Ok(attempts);
+    }
+
     // Group tasks by their merge target branch. Within each group, process
     // one at a time (serialized). Across groups we could parallelize, but
     // since we have a single writer/reader pair, we process sequentially.
     let mut by_target: HashMap<String, Vec<Task>> = HashMap::new();
-    for task in approved {
+    for task in code_tasks {
         let target = db
             .get_merge_target(task.id)
             .unwrap_or_else(|_| "main".into());
         by_target.entry(target).or_default().push(task);
     }
-
-    let mut attempts = Vec::new();
 
     for tasks in by_target.values() {
         for task in tasks {
@@ -2449,10 +2679,18 @@ pub fn get_status(
                 // Check merge_target branch existence (only for ready tasks).
                 if task.state == TaskState::Ready {
                     if let Some(path) = project_path {
-                        let merge_target = db
-                            .get_merge_target(task.id)
-                            .unwrap_or_else(|_| "main".into());
                         if let Ok(repo_root) = tasks_git::get_repo_root(path) {
+                            // Use the live-repo resolver so implicit
+                            // merge_targets that point at a now-deleted
+                            // ancestor branch fall back to a still-extant
+                            // ancestor (or "main"). MergeTargetNotFound
+                            // is only surfaced when even the fallback
+                            // walk can't find a branch — in practice that
+                            // means the user/agent set an explicit
+                            // override that names a missing branch.
+                            let merge_target =
+                                resolve_merge_target_against_repo(db, &task, &repo_root)
+                                    .unwrap_or_else(|_| "main".into());
                             if let Ok(false) = tasks_git::branch_exists(&repo_root, &merge_target) {
                                 wait_reasons.push(WaitReason::MergeTargetNotFound {
                                     branch: merge_target,
@@ -2717,6 +2955,7 @@ fn task_to_info_with_live(
         held: t.held,
         filed_by_project: t.filed_by_project,
         filed_by_session_id: t.filed_by_session_id,
+        no_merge: t.no_merge,
         created_at: t.created_at,
         updated_at: t.updated_at,
     }
@@ -2784,6 +3023,11 @@ pub fn task_overview_response(
         .into_iter()
         .map(|t| task_to_info_with_live(t, live_task_ids))
         .collect();
+    let recently_done: Vec<TaskInfo> = db
+        .list_recent_by_state(project, "done", recent_limit)?
+        .into_iter()
+        .map(|t| task_to_info_with_live(t, live_task_ids))
+        .collect();
     let recently_closed: Vec<TaskInfo> = db
         .list_recent_by_state(project, "closed", recent_limit)?
         .into_iter()
@@ -2797,6 +3041,7 @@ pub fn task_overview_response(
         blocked,
         held,
         recently_merged,
+        recently_done,
         recently_closed,
         inflight_count: status.inflight_count,
         max_concurrent: status.max_concurrent,
@@ -2843,6 +3088,8 @@ mod tests {
             filed_by_session_id: None,
             budget_usd: None,
             spent_usd: 0.0,
+            no_merge: false,
+            dispatch_failure_count: 0,
             created_at: 0,
             updated_at: 0,
         }
@@ -3594,6 +3841,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -3780,6 +4028,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -3849,6 +4098,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -3908,6 +4158,222 @@ mod tests {
         assert!(json.contains("all good"));
     }
 
+    // ---- no_merge merge sweep tests (task #942) ----
+
+    #[test]
+    fn test_merge_approved_no_merge_transitions_to_done() {
+        let db = TasksDb::open_memory().unwrap();
+        // Create a no_merge task and march it to approved.
+        let task = db
+            .create_task(
+                "test-project",
+                "investigate X",
+                None,
+                None,
+                None,
+                true, // skip_review
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true, // no_merge
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Approved),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].success, "no_merge merge attempt must succeed");
+        assert!(
+            attempts[0].log.contains("no_merge"),
+            "log should mention the no_merge skip path: {}",
+            attempts[0].log
+        );
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.state,
+            TaskState::Done,
+            "no_merge approved task must transition to done"
+        );
+    }
+
+    #[test]
+    fn test_merge_approved_mixed_no_merge_and_code() {
+        // A code-merge task and a no_merge task both in approved. The
+        // no_merge task transitions to done; the code task fails the
+        // merge ceremony (no real repo) and is reverted to active.
+        let db = TasksDb::open_memory().unwrap();
+        let no_merge_task = db
+            .create_task(
+                "test-project",
+                "investigation",
+                None,
+                None,
+                None,
+                true,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.update_task(
+            no_merge_task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Approved),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let code_task = db
+            .create_task(
+                "test-project",
+                "code change",
+                None,
+                None,
+                None,
+                true,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.update_task(
+            code_task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Approved),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_branch(code_task.id, "task-2").unwrap();
+        db.set_worktree_path(code_task.id, "/tmp/wt-2").unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
+        assert_eq!(attempts.len(), 2);
+
+        let no_merge_after = db.get_task(no_merge_task.id).unwrap().unwrap();
+        assert_eq!(no_merge_after.state, TaskState::Done);
+
+        // Code task is in some non-Done state (active or merging or
+        // failed depending on how the fake-resolver pipeline reacts);
+        // the assertion that matters is it never landed in Done.
+        let code_after = db.get_task(code_task.id).unwrap().unwrap();
+        assert_ne!(
+            code_after.state,
+            TaskState::Done,
+            "code-merge task must not transition to done"
+        );
+    }
+
+    #[test]
+    fn test_prepare_task_no_merge_skips_worktree() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "investigation",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true, // no_merge
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        // Pass an obviously-bogus repo_root — prepare_task must not touch git.
+        let scheduled = prepare_task(&db, &task, "/this/path/does/not/exist").unwrap();
+        assert_eq!(scheduled.id, task.id);
+        assert!(scheduled.branch.is_empty(), "no_merge: no branch created");
+        assert!(scheduled.worktree_path.is_empty(), "no_merge: no worktree");
+        let after = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(after.state, TaskState::Active);
+        assert!(after.branch.is_none(), "no_merge task must have no branch");
+        assert!(
+            after.worktree_path.is_none(),
+            "no_merge task must have no worktree"
+        );
+    }
+
+    #[test]
+    fn test_task_phase_cwd_no_merge_uses_project_root() {
+        // For no_merge tasks the worker phase should fall back to the
+        // project root (since there's no worktree).
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "investigation",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        // task.worktree_path is None (we never set it).
+        let cwd = TaskPhase::Worker.cwd(&task, "/proj/root");
+        assert_eq!(cwd.as_deref(), Some("/proj/root"));
+    }
+
     #[test]
     fn test_dispatch_replaces_stale_session_from_previous_phase() {
         let db = TasksDb::open_memory().unwrap();
@@ -3928,6 +4394,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4003,6 +4470,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4069,6 +4537,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4089,6 +4558,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4146,6 +4616,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4200,6 +4671,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4266,6 +4738,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4315,6 +4788,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4618,6 +5092,7 @@ mod tests {
                 false,
                 None,
                 true, // auto_downgraded_from_ready,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4789,6 +5264,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4806,6 +5282,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4836,6 +5313,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4890,6 +5368,7 @@ mod tests {
                 true,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4938,6 +5417,7 @@ mod tests {
                 None,
                 true,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5037,6 +5517,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -5054,6 +5535,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5380,16 +5862,52 @@ mod tests {
             turn_started_at_ms: None,
             phase_started_at_ms: None,
             project_name: None,
+            successor_id: None,
         }
     }
 
-    struct FindRootMock {
+    /// Run `find_root_session` against a canned `SessionAncestors` response.
+    fn run_find_root(
+        session_id: &str,
+        ancestors: Vec<tau_agent_plugin::SessionInfo>,
+    ) -> Option<String> {
+        run_find_root_with_successors(session_id, ancestors, std::collections::HashMap::new())
+    }
+
+    /// Run `find_root_session` against canned `SessionAncestors` and a
+    /// successor map for the `ResolveSuccessor` round-trip.  Sessions
+    /// missing from the map resolve to themselves.
+    fn run_find_root_with_successors(
+        session_id: &str,
+        ancestors: Vec<tau_agent_plugin::SessionInfo>,
+        successors: std::collections::HashMap<String, String>,
+    ) -> Option<String> {
+        use std::io::BufReader;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SuccessorAwareFindRootMock {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            ancestors,
+            successors,
+        }));
+        let mut writer = MockSuccessorAwareFindRootWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockSuccessorAwareFindRootReader {
+            shared: shared.clone(),
+        };
+        let mut reader_buf = BufReader::new(reader);
+        super::find_root_session(session_id, &mut writer, &mut reader_buf)
+    }
+
+    /// Variant of [`FindRootMock`] that also responds to `ResolveSuccessor`.
+    struct SuccessorAwareFindRootMock {
         write_buf: Vec<u8>,
         read_buf: Vec<u8>,
         ancestors: Vec<tau_agent_plugin::SessionInfo>,
+        successors: std::collections::HashMap<String, String>,
     }
 
-    impl FindRootMock {
+    impl SuccessorAwareFindRootMock {
         fn process(&mut self) {
             use tau_agent_base::plugin_protocol::{PluginMessage, PluginRequest};
             let buf = std::mem::take(&mut self.write_buf);
@@ -5398,28 +5916,49 @@ mod tests {
                 if line.trim().is_empty() {
                     continue;
                 }
-                if let Ok(PluginMessage::ServerRequest { request_id, .. }) =
-                    serde_json::from_str::<PluginMessage>(line)
-                {
-                    let resp = PluginRequest::ServerResponse {
-                        request_id,
-                        response: tau_agent_plugin::Response::SessionAncestors {
-                            sessions: self.ancestors.clone(),
-                        },
-                    };
-                    if let Ok(mut json) = serde_json::to_string(&resp) {
-                        json.push('\n');
-                        self.read_buf.extend_from_slice(json.as_bytes());
+                let Ok(PluginMessage::ServerRequest {
+                    request_id,
+                    request,
+                }) = serde_json::from_str::<PluginMessage>(line)
+                else {
+                    continue;
+                };
+                let response = match request {
+                    tau_agent_plugin::Request::ResolveSuccessor { session_id } => {
+                        let mut visited: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        visited.insert(session_id.clone());
+                        let mut current = session_id;
+                        while let Some(next) = self.successors.get(&current) {
+                            if !visited.insert(next.clone()) {
+                                break;
+                            }
+                            current = next.clone();
+                        }
+                        tau_agent_plugin::Response::ResolvedSuccessor {
+                            session_id: current,
+                        }
                     }
+                    _ => tau_agent_plugin::Response::SessionAncestors {
+                        sessions: self.ancestors.clone(),
+                    },
+                };
+                let resp = PluginRequest::ServerResponse {
+                    request_id,
+                    response,
+                };
+                if let Ok(mut json) = serde_json::to_string(&resp) {
+                    json.push('\n');
+                    self.read_buf.extend_from_slice(json.as_bytes());
                 }
             }
         }
     }
 
-    struct MockFindRootWriter {
-        shared: std::sync::Arc<std::sync::Mutex<FindRootMock>>,
+    struct MockSuccessorAwareFindRootWriter {
+        shared: std::sync::Arc<std::sync::Mutex<SuccessorAwareFindRootMock>>,
     }
-    impl std::io::Write for MockFindRootWriter {
+    impl std::io::Write for MockSuccessorAwareFindRootWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.shared.lock().unwrap().write_buf.extend_from_slice(buf);
             Ok(buf.len())
@@ -5429,10 +5968,10 @@ mod tests {
         }
     }
 
-    struct MockFindRootReader {
-        shared: std::sync::Arc<std::sync::Mutex<FindRootMock>>,
+    struct MockSuccessorAwareFindRootReader {
+        shared: std::sync::Arc<std::sync::Mutex<SuccessorAwareFindRootMock>>,
     }
-    impl std::io::Read for MockFindRootReader {
+    impl std::io::Read for MockSuccessorAwareFindRootReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let mut shared = self.shared.lock().unwrap();
             shared.process();
@@ -5447,27 +5986,6 @@ mod tests {
             shared.read_buf.drain(..n);
             Ok(n)
         }
-    }
-
-    /// Run `find_root_session` against a canned `SessionAncestors` response.
-    fn run_find_root(
-        session_id: &str,
-        ancestors: Vec<tau_agent_plugin::SessionInfo>,
-    ) -> Option<String> {
-        use std::io::BufReader;
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(FindRootMock {
-            write_buf: Vec::new(),
-            read_buf: Vec::new(),
-            ancestors,
-        }));
-        let mut writer = MockFindRootWriter {
-            shared: shared.clone(),
-        };
-        let reader = MockFindRootReader {
-            shared: shared.clone(),
-        };
-        let mut reader_buf = BufReader::new(reader);
-        super::find_root_session(session_id, &mut writer, &mut reader_buf)
     }
 
     /// Mock for `GetSessionInfo` round-trips (used by `get_session_model`
@@ -5608,6 +6126,37 @@ mod tests {
         assert_eq!(run_find_root("leaf", vec![leaf, a]), None);
     }
 
+    /// Task 914: when the resolved root has a successor set, the
+    /// successor's id is returned so new task-dispatched children attach
+    /// to the *current* root rather than the retired predecessor.
+    #[test]
+    fn test_find_root_session_follows_successor() {
+        let child = session_info("child", Some("old_root"), false);
+        let old_root = session_info("old_root", None, false);
+        let mut succ = std::collections::HashMap::new();
+        succ.insert("old_root".to_string(), "new_root".to_string());
+        assert_eq!(
+            run_find_root_with_successors("child", vec![child, old_root], succ),
+            Some("new_root".to_string()),
+        );
+    }
+
+    /// When no successor is set, the resolver returns the input id and
+    /// behaviour matches the pre-task-914 baseline.
+    #[test]
+    fn test_find_root_session_no_successor_unchanged() {
+        let child = session_info("child", Some("root"), false);
+        let root = session_info("root", None, false);
+        assert_eq!(
+            run_find_root_with_successors(
+                "child",
+                vec![child, root],
+                std::collections::HashMap::new()
+            ),
+            Some("root".to_string()),
+        );
+    }
+
     // -----------------------------------------------------------------------
     // task_overview_response
     // -----------------------------------------------------------------------
@@ -5642,6 +6191,7 @@ mod tests {
                 None,
                 /* held */ true,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5904,6 +6454,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .expect("create");
@@ -5997,6 +6548,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6173,7 +6725,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     mod phase_mock_io {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
         use std::io::{BufReader, Read, Write};
         use std::sync::{Arc, Mutex};
         use tau_agent_plugin::{PluginMessage, PluginRequest, Request, Response};
@@ -6187,6 +6739,11 @@ mod tests {
             /// Parent id returned for every `GetSessionInfo` response
             /// (the tests that care set this explicitly).
             pub session_parent_id: Option<String>,
+            /// Optional successor map for `ResolveSuccessor` responses.
+            /// Sessions absent from the map resolve to themselves.  Used
+            /// to simulate retired root sessions in `find_root_session`
+            /// tests (task 914).
+            pub successors: HashMap<String, String>,
         }
 
         impl PhaseMockShared {
@@ -6198,6 +6755,7 @@ mod tests {
                     archived_sessions: HashSet::new(),
                     written_lines: Vec::new(),
                     session_parent_id: None,
+                    successors: HashMap::new(),
                 }
             }
 
@@ -6250,6 +6808,7 @@ mod tests {
                                     turn_started_at_ms: None,
                                     phase_started_at_ms: None,
                                     project_name: None,
+                                    successor_id: None,
                                 },
                             }
                         }
@@ -6274,8 +6833,25 @@ mod tests {
                                 turn_started_at_ms: None,
                                 phase_started_at_ms: None,
                                 project_name: None,
+                                successor_id: None,
                             }],
                         },
+                        Request::ResolveSuccessor { session_id } => {
+                            let mut visited: HashSet<String> = HashSet::new();
+                            visited.insert(session_id.clone());
+                            let mut current = session_id.clone();
+                            while let Some(next) = self.successors.get(&current) {
+                                if !visited.insert(next.clone())
+                                    || self.archived_sessions.contains(next)
+                                {
+                                    break;
+                                }
+                                current = next.clone();
+                            }
+                            Response::ResolvedSuccessor {
+                                session_id: current,
+                            }
+                        }
                         _ => Response::Ok,
                     };
                     let reply = PluginRequest::ServerResponse {
@@ -6376,6 +6952,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             false,
             crate::tasks_db::FiledBy::default(),
         )
@@ -6721,6 +7298,237 @@ mod tests {
             "expected at least 4 dispatch_task_phase(...) call sites \
              (one per wrapper), found {}",
             call_sites
+        );
+    }
+    // -----------------------------------------------------------------
+    // resolve_merge_target_against_repo
+    // -----------------------------------------------------------------
+
+    /// Initialise a temp git repo with `main` and one commit — mirrors
+    /// `tasks_git::tests::init_test_repo`, kept private to this module so
+    /// the merge_target tests can drive branch creation/deletion against
+    /// a real on-disk repo.
+    fn init_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .expect("git config email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .expect("git config name");
+        std::fs::write(path.join("README.md"), "# test\n").expect("write readme");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .output()
+            .expect("git commit");
+        dir
+    }
+
+    /// Create a ready, no-files DB task and return it. Convenience wrapper
+    /// around `create_task` that picks sane defaults for the merge_target
+    /// tests.
+    fn make_merge_target_task(
+        db: &TasksDb,
+        title: &str,
+        parent_id: Option<i64>,
+        merge_target: Option<&str>,
+    ) -> Task {
+        db.create_task(
+            "test-project",
+            title,
+            None,
+            parent_id,
+            None,
+            false,
+            "ready",
+            false,
+            merge_target,
+            None,
+            false,
+            None,
+            false,
+            false,
+            crate::tasks_db::FiledBy::default(),
+        )
+        .expect("create_task")
+    }
+
+    #[test]
+    fn test_resolve_merge_target_root_task_returns_main() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+        let root = make_merge_target_task(&db, "root", None, None);
+
+        let target = resolve_merge_target_against_repo(&db, &root, repo).expect("resolve");
+        assert_eq!(target, "main");
+    }
+
+    #[test]
+    fn test_resolve_merge_target_returns_parent_branch_when_extant() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        let parent = make_merge_target_task(&db, "parent", None, None);
+        // Create a real `task-{parent.id}` branch in the repo and record
+        // it on the parent row to mirror what `prepare_task` does.
+        let parent_branch = format!("task-{}", parent.id);
+        tasks_git::create_branch(repo, &parent_branch, "main").expect("create parent branch");
+        db.set_branch(parent.id, &parent_branch)
+            .expect("set_branch");
+        let parent = db
+            .get_task(parent.id)
+            .expect("get parent")
+            .expect("parent exists");
+
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+
+        let target = resolve_merge_target_against_repo(&db, &child, repo).expect("resolve");
+        assert_eq!(target, parent_branch);
+    }
+
+    #[test]
+    fn test_resolve_merge_target_falls_back_to_main_when_parent_branch_deleted() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        let parent = make_merge_target_task(&db, "parent", None, None);
+        let parent_branch = format!("task-{}", parent.id);
+        // Record the branch on the parent row WITHOUT creating the
+        // matching ref — simulates the post-merge-cleanup scenario where
+        // the branch ref has been deleted but `tasks.branch` retains the
+        // historical record.
+        db.set_branch(parent.id, &parent_branch)
+            .expect("set_branch");
+
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+
+        let target = resolve_merge_target_against_repo(&db, &child, repo).expect("resolve");
+        assert_eq!(
+            target, "main",
+            "missing parent branch must fall back to main"
+        );
+    }
+
+    #[test]
+    fn test_resolve_merge_target_falls_back_to_grandparent_when_parent_branch_deleted() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        // Grandparent: branch exists.
+        let grandparent = make_merge_target_task(&db, "grandparent", None, None);
+        let g_branch = format!("task-{}", grandparent.id);
+        tasks_git::create_branch(repo, &g_branch, "main").expect("create gp branch");
+        db.set_branch(grandparent.id, &g_branch)
+            .expect("set_branch gp");
+
+        // Parent: branch recorded but ref missing (post-cleanup).
+        let parent = make_merge_target_task(&db, "parent", Some(grandparent.id), None);
+        let p_branch = format!("task-{}-{}", grandparent.id, parent.id);
+        db.set_branch(parent.id, &p_branch)
+            .expect("set_branch parent");
+
+        // Child: implicit merge_target.
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+
+        let target = resolve_merge_target_against_repo(&db, &child, repo).expect("resolve");
+        assert_eq!(
+            target, g_branch,
+            "walk past missing parent branch to extant grandparent branch"
+        );
+    }
+
+    #[test]
+    fn test_resolve_merge_target_honours_explicit_override_even_when_missing() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        let task = make_merge_target_task(&db, "override", None, Some("does-not-exist"));
+
+        let target = resolve_merge_target_against_repo(&db, &task, repo).expect("resolve");
+        assert_eq!(
+            target, "does-not-exist",
+            "explicit override is returned verbatim; downstream branch_exists check is what surfaces the error"
+        );
+    }
+
+    #[test]
+    fn test_prepare_task_succeeds_after_parent_branch_deletion() {
+        // End-to-end regression for the original report: child task with
+        // implicit merge_target whose parent's branch was deleted by
+        // post-merge cleanup must still dispatch (landing on "main" in
+        // the absence of any other extant ancestor branch).
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        // Parent: prepare_task creates `task-{parent.id}` rooted on main.
+        let parent = make_merge_target_task(&db, "parent", None, None);
+        let scheduled = prepare_task(&db, &parent, repo).expect("prepare parent");
+        assert_eq!(scheduled.branch, format!("task-{}", parent.id));
+
+        // Simulate the post-merge cleanup: drop the worktree row first
+        // so `git worktree remove` doesn't get in the way, then delete
+        // the branch ref via `tasks_git::delete_branch`. The DB still
+        // remembers `tasks.branch` as `task-{parent.id}`.
+        let parent_after = db
+            .get_task(parent.id)
+            .expect("get parent")
+            .expect("parent exists");
+        if let Some(wt) = parent_after.worktree_path.as_deref() {
+            tasks_git::remove_worktree(repo, wt).expect("remove worktree");
+        }
+        tasks_git::delete_branch(repo, &format!("task-{}", parent.id))
+            .expect("delete parent branch");
+        assert!(
+            !tasks_git::branch_exists(repo, &format!("task-{}", parent.id)).expect("branch_exists"),
+            "parent branch must actually be gone for this test to be meaningful"
+        );
+
+        // Child: implicit merge_target. Pre-fix this would error out;
+        // post-fix it should fall back to "main".
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+        let scheduled = prepare_task(&db, &child, repo).expect("prepare child must succeed");
+        let expected_branch = format!("task-{}-{}", parent.id, child.id);
+        assert_eq!(scheduled.branch, expected_branch);
+
+        // Confirm the child branch was rooted on `main`, not on a phantom
+        // ancestor: `main` should be an ancestor of the new child branch.
+        let merge_base = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", "main", &expected_branch])
+            .current_dir(repo)
+            .output()
+            .expect("git merge-base");
+        assert!(
+            merge_base.status.success(),
+            "new child branch must be rooted on main when the parent branch is gone"
+        );
+
+        // And the parent branch must not have been re-created as a side
+        // effect of the dispatch.
+        assert!(
+            !tasks_git::branch_exists(repo, &format!("task-{}", parent.id)).expect("branch_exists"),
+            "parent branch must not be resurrected by the fallback"
         );
     }
 }

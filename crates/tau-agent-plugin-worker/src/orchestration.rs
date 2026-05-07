@@ -451,6 +451,44 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 "After decomposition, review the created tasks with task_list to verify the structure makes sense.".into(),
             ],
         },
+        PluginToolDef {
+            name: "session_succeed".into(),
+            description: concat!(
+                "Create a fresh successor session and hand off to it. The current ",
+                "session is retired (notifications and new task dispatches ",
+                "forward to the successor) but message history is preserved ",
+                "and remains readable. Use when context has grown large enough ",
+                "that further turns will be expensive due to prompt-cache ",
+                "misses, or when reaching a natural seam in a long-running ",
+                "plan. The current agent loop terminates immediately after this ",
+                "tool returns; do not plan further tool calls in the same turn."
+            ).into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Self-contained handoff message that becomes the first user message in the successor session."
+                    },
+                    "carry_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional file paths to mention in the handoff message."
+                    },
+                    "new_tagline": {
+                        "type": "string",
+                        "description": "Optional tagline for the successor session."
+                    }
+                },
+                "required": ["summary"]
+            }),
+            prompt_snippet: Some("Use session_succeed to hand off to a fresh session when context bloat is making further turns expensive.".into()),
+            prompt_guidelines: vec![
+                "Call when context has grown large enough that further turns will be expensive due to prompt-cache misses.".into(),
+                "The summary arg becomes the first user message in the successor — make it self-contained.".into(),
+                "This tool ends the current agent loop. Do not plan further tool calls in the same turn.".into(),
+            ],
+        },
     ]
 }
 
@@ -542,36 +580,40 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert!(
-            action_values.contains(&"create"),
-            "schedule action enum should contain 'create', got {:?}",
-            action_values,
-        );
-        assert!(
-            action_values.contains(&"list"),
-            "schedule action enum should contain 'list', got {:?}",
-            action_values,
-        );
-        assert!(
-            action_values.contains(&"delete"),
-            "schedule action enum should contain 'delete', got {:?}",
-            action_values,
-        );
+        assert!(action_values.contains(&"create"));
+        assert!(action_values.contains(&"list"));
+        assert!(action_values.contains(&"delete"));
+        assert!(schedule.prompt_snippet.is_some());
+        assert_eq!(schedule.prompt_guidelines.len(), 4);
+    }
 
-        assert!(
-            schedule.prompt_snippet.is_some(),
-            "schedule should have a prompt_snippet",
-        );
+    #[test]
+    fn session_succeed_has_summary_required_and_loop_terminates_guideline() {
+        let tools = orchestration_tools();
+        let succeed = find_tool(&tools, "session_succeed");
 
+        let required = succeed
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required field");
+        assert!(required.iter().any(|v| v.as_str() == Some("summary")));
+        let props = succeed
+            .parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties field");
+        assert!(props.contains_key("summary"));
+        assert!(props.contains_key("carry_files"));
+        assert!(props.contains_key("new_tagline"));
+
+        assert!(succeed.description.to_lowercase().contains("terminates"));
         assert!(
-            !schedule.prompt_guidelines.is_empty(),
-            "schedule should have non-empty prompt_guidelines",
-        );
-        assert_eq!(
-            schedule.prompt_guidelines.len(),
-            4,
-            "schedule should have exactly 4 prompt_guidelines, got {:?}",
-            schedule.prompt_guidelines,
+            succeed
+                .prompt_guidelines
+                .iter()
+                .any(|g| g.to_lowercase().contains("ends the current agent loop")
+                    || g.to_lowercase().contains("loop will end")),
         );
     }
 

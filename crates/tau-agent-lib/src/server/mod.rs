@@ -163,6 +163,48 @@ pub fn is_running() -> bool {
     crate::paths::is_running()
 }
 
+/// Process-wide guard ensuring `install_server_panic_hook` only chains a
+/// custom hook on top of the default once even if both `run()` and
+/// `run_with_config()` execute in the same process (e.g. test harness).
+static PANIC_HOOK_INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Install a process-wide panic hook that routes panic events through
+/// `tracing::error!` so they're discoverable in the structured log even
+/// when nobody's watching stderr.  See task #957 (Layer 2).
+///
+/// The default hook is preserved and called at the end so stderr still
+/// shows the usual panic spew during local development.
+///
+/// Idempotent: the hook is installed at most once per process.
+pub(crate) fn install_server_panic_hook() {
+    PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info.location().map(|l| l.to_string()).unwrap_or_default();
+            let payload = info.payload();
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            let thread_name = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string();
+            tracing::error!(
+                location = %location,
+                thread = %thread_name,
+                backtrace = %std::backtrace::Backtrace::force_capture(),
+                panic = %msg,
+                "panic caught by global hook",
+            );
+            default_hook(info);
+        }));
+    });
+}
+
 fn prepare_socket_dir(sock: &Path) -> crate::Result<()> {
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent)
@@ -298,6 +340,8 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     };
     use state::log_stale_phases_at_startup;
 
+    install_server_panic_hook();
+
     let default_model = config
         .models
         .first()
@@ -359,6 +403,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         all_models: config.models,
         usage_cache: None,
         cancel_flags: HashMap::new(),
+        stop_after_tool_flags: HashMap::new(),
         has_queued: HashMap::new(),
         subscribers: HashMap::new(),
         phases: HashMap::new(),
@@ -533,6 +578,7 @@ pub async fn run() -> crate::Result<()> {
     // so the non-blocking appender drains on shutdown.
     let _log_guard = crate::logging::init_tracing();
     tracing::info!(pid = std::process::id(), "tau server starting");
+    install_server_panic_hook();
 
     let registry = build_registry();
     let RuntimeConfig {
@@ -586,6 +632,7 @@ pub async fn run() -> crate::Result<()> {
         all_models,
         usage_cache: None,
         cancel_flags: HashMap::new(),
+        stop_after_tool_flags: HashMap::new(),
         has_queued: HashMap::new(),
         subscribers: HashMap::new(),
         phases: HashMap::new(),

@@ -124,6 +124,57 @@ pub enum Request {
         old_parent_id: String,
         new_parent_id: String,
     },
+    /// Mark `session_id` as superseded by `successor_id`. Future
+    /// notifications / queued messages / new-child-parent-anchor lookups
+    /// targeted at `session_id` are forwarded to the resolved tip of the
+    /// successor chain.  `successor_id == None` clears the link (un-retire).
+    ///
+    /// The predecessor stays in the DB — message history is preserved
+    /// and remains readable — but it will not receive new wakeups while
+    /// a successor is set.  See task 914.
+    SetSessionSuccessor {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        successor_id: Option<String>,
+        /// Session id of the caller when invoked via an orchestration tool.
+        /// `None` when invoked by the TUI/CLI/external API.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+    },
+    /// Resolve the live tip of `session_id`'s successor chain.
+    ///
+    /// Returns [`Response::ResolvedSuccessor`].  Used by plugins (notably
+    /// the tasks plugin) to redirect notifications away from retired
+    /// sessions.  See task 914.
+    ResolveSuccessor { session_id: String },
+    /// Atomically create a new session inheriting `session_id`'s
+    /// `model` / `cwd` / `system_prompt` / `project_name` / `child_budget`,
+    /// then mark `session_id` as retired by setting its `successor_id`
+    /// to the new session's id.
+    ///
+    /// The new session is always **top-level** (`parent_id = None`) so
+    /// succession does not change the predecessor's place in the session
+    /// tree.  Returns [`Response::SessionCreated`] with the successor id
+    /// on success and broadcasts [`Response::SessionSucceeded`] on the
+    /// predecessor's subscriber channel.  See task 915.
+    SucceedSession {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tagline: Option<String>,
+        /// Session id of the caller when invoked via an orchestration tool
+        /// (e.g. `session_succeed`).  `None` when invoked via the TUI/CLI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+    },
+    /// Look up whether `session_id` is recorded as a session of any
+    /// non-terminal task and, if so, return the `(task_id, role)` it
+    /// plays.  Used by orchestration tools (today: `session_succeed`)
+    /// that must refuse to disturb a task-managed session lifecycle.
+    ///
+    /// Returns [`Response::TaskSessionRole`] always — a non-task session
+    /// yields `is_worker = false` with `task_id` / `role` set to `None`.
+    /// See task 915.
+    GetTaskSessionRole { session_id: String },
     /// Start OAuth login for a provider.
     Login { provider: String },
     /// Query authentication status.
@@ -553,6 +604,10 @@ pub enum Response {
         /// Most recently merged tasks, newest first, capped at `recent_limit`
         /// (the request's per-bucket limit).
         recently_merged: Vec<TaskInfo>,
+        /// Most recently "done" tasks (no_merge tasks that completed without
+        /// producing a code change), newest first, capped at `recent_limit`.
+        #[serde(default)]
+        recently_done: Vec<TaskInfo>,
         /// Most recently closed tasks, newest first, capped at `recent_limit`
         /// (the request's per-bucket limit; merged and closed are independent).
         recently_closed: Vec<TaskInfo>,
@@ -597,6 +652,19 @@ pub enum Response {
     AgentResumed,
     /// Agent started on demand (response to StartAgent).
     AgentStarted { session_id: String },
+    /// Resolved tip of a session's successor chain (response to
+    /// `Request::ResolveSuccessor`).
+    ResolvedSuccessor { session_id: String },
+    /// Broadcast when a session has been retired in favour of `successor_id`.
+    SessionSucceeded { successor_id: String },
+    /// Response to [`Request::GetTaskSessionRole`].
+    TaskSessionRole {
+        is_worker: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
     /// Error.
     Error { message: String },
 }
@@ -617,6 +685,19 @@ pub const SHUTTING_DOWN_ERROR: &str = "__tau_server_shutting_down__";
 /// error to the user.
 pub fn is_shutting_down_error(err: &str) -> bool {
     err == SHUTTING_DOWN_ERROR || err.contains("server is shutting down")
+}
+
+/// Returns true if `err` looks like a failure surfaced by the
+/// Anthropic subscription-usage poll path (`/v1/messages/usage` /
+/// `/api/oauth/usage`). Used by clients as defence-in-depth: the
+/// server-side handler in #940 no longer sends `Response::Error` for
+/// these failures — it falls back to a cached or default
+/// [`Response::SubscriptionUsage`] — but if a future code path were to
+/// regress and emit such an error over the wire, clients can
+/// recognize it as out-of-band and refrain from tearing down
+/// streaming UI state (in-flight tool calls, agent phase, etc.).
+pub fn is_subscription_usage_error(err: &str) -> bool {
+    err.contains("usage API")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -653,6 +734,11 @@ pub struct SessionInfo {
     /// Project name this session belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+    /// Optional successor session id.  When `Some`, this session has
+    /// been retired and notifications targeted at it are forwarded to
+    /// the resolved tip of the successor chain.  See task 914.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_id: Option<String>,
     /// Last exit status: null (never ran), "completed", "error", "cancelled", "max_turns".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_status: Option<String>,
@@ -790,6 +876,12 @@ pub struct TaskInfo {
     /// available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filed_by_session_id: Option<String>,
+    /// True when this task does not produce a code change (no_merge tasks).
+    /// The scheduler skips worktree creation and the merge ceremony; on
+    /// approval the task transitions directly to `done`. Defaults to
+    /// `false` for back-compat with older clients / serialised payloads.
+    #[serde(default)]
+    pub no_merge: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1339,6 +1431,7 @@ mod tests {
             has_live_session: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            no_merge: false,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -1412,6 +1505,32 @@ mod tests {
             Request::GetProjectInfo {
                 project_name: "tau".into(),
             },
+            Request::SetSessionSuccessor {
+                session_id: "s1".into(),
+                successor_id: Some("s2".into()),
+                caller_session_id: None,
+            },
+            Request::SetSessionSuccessor {
+                session_id: "s1".into(),
+                successor_id: None,
+                caller_session_id: Some("caller".into()),
+            },
+            Request::ResolveSuccessor {
+                session_id: "s1".into(),
+            },
+            Request::SucceedSession {
+                session_id: "s1".into(),
+                tagline: Some("continued".into()),
+                caller_session_id: Some("caller".into()),
+            },
+            Request::SucceedSession {
+                session_id: "s1".into(),
+                tagline: None,
+                caller_session_id: None,
+            },
+            Request::GetTaskSessionRole {
+                session_id: "s1".into(),
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).expect("serialize request");
@@ -1442,6 +1561,7 @@ mod tests {
                 blocked: Vec::new(),
                 held: Vec::new(),
                 recently_merged: Vec::new(),
+                recently_done: Vec::new(),
                 recently_closed: Vec::new(),
                 inflight_count: 1,
                 max_concurrent: 8,
@@ -1482,6 +1602,22 @@ mod tests {
                 }),
             },
             Response::ProjectInfo { project: None },
+            Response::ResolvedSuccessor {
+                session_id: "s1".into(),
+            },
+            Response::SessionSucceeded {
+                successor_id: "s2".into(),
+            },
+            Response::TaskSessionRole {
+                is_worker: true,
+                task_id: Some(42),
+                role: Some("worker".into()),
+            },
+            Response::TaskSessionRole {
+                is_worker: false,
+                task_id: None,
+                role: None,
+            },
         ];
         for resp in &responses {
             let json = serde_json::to_string(resp).expect("serialize response");

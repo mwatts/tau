@@ -224,6 +224,39 @@ enum ProfileAction {
         #[arg(long)]
         exclude_other: bool,
     },
+    /// Token usage and cost report (no `--clamp` — there are no
+    /// per-event durations to clamp here; the underlying SUM ignores
+    /// messages without a `$.usage` blob).
+    Tokens {
+        /// Time window lower bound (`7d`, `24h`, `30m`, `2024-01-01`,
+        /// or a raw ms timestamp). Default: 30 days ago.
+        #[arg(long)]
+        since: Option<String>,
+        /// Time window upper bound. Defaults to "now".
+        #[arg(long)]
+        until: Option<String>,
+        /// Restrict to a project.
+        #[arg(long)]
+        project: Option<String>,
+        /// Per-session breakdown for one session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Per-task breakdown (joins `task_sessions` from `tasks.db`).
+        #[arg(long)]
+        task: Option<i64>,
+        /// Restrict the rollup to one role (`worker`, `reviewer`,
+        /// `planner`, …). Only meaningful with the role / task join —
+        /// ignored for `--group-by session`.
+        #[arg(long)]
+        role: Option<String>,
+        /// Leaderboard grouping. Defaults to `role` for the project-wide
+        /// view, `session` if `--task` is set.
+        #[arg(long, value_name = "AXIS")]
+        group_by: Option<String>,
+        /// Sort axis (descending). Default: `cost`.
+        #[arg(long, default_value = "cost")]
+        sort: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -981,8 +1014,15 @@ fn maybe_auto_init() {
         return;
     }
 
-    // No .git? Not a project candidate.
+    // Reject candidates that are not inside a real git working tree.
+    // The cheap `.git` existence check is the common-case fast path; the
+    // canonical `git rev-parse --show-toplevel` probe (#949) catches the
+    // remaining edge cases (bare repos, broken `.git` files, etc.) so we
+    // never prompt the user only to fail later in `init_project`.
     if !cwd.join(".git").exists() {
+        return;
+    }
+    if tau_agent_lib::project::check_git_repo(&cwd).is_err() {
         return;
     }
 
@@ -1471,7 +1511,7 @@ async fn send_and_print(
                     tau_agent_lib::StreamEvent::ToolcallEnd { tool_call, .. } => {
                         let args_str = tool_call.arguments.to_string();
                         let preview = if args_str.len() > 100 {
-                            format!("{}...", &args_str[..100])
+                            format!("{}...", tau_agent_lib::truncate_str(&args_str, 100))
                         } else {
                             args_str
                         };
@@ -1493,7 +1533,7 @@ async fn send_and_print(
                             let p: String =
                                 content.split_whitespace().collect::<Vec<_>>().join(" ");
                             if p.len() > 100 {
-                                format!("{}...", &p[..100])
+                                format!("{}...", tau_agent_lib::truncate_str(&p, 100))
                             } else {
                                 p
                             }
@@ -2984,6 +3024,7 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
                 false,
                 None,
                 false,
+                false,
                 tau_agent_lib::tasks_db::FiledBy::default(),
             )?;
             println!("created task #{}: {}", task.id, task.title);
@@ -3154,6 +3195,75 @@ fn cmd_profile(action: ProfileAction) -> tau_agent_lib::Result<()> {
             let max_event_ms = parse_clamp(&clamp)?;
             print_session_breakdown(&db, &id, max_event_ms, exclude_other)?;
         }
+        ProfileAction::Tokens {
+            since,
+            until,
+            project,
+            session,
+            task,
+            role,
+            group_by,
+            sort,
+        } => {
+            let since_ms = match since {
+                Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
+                None => Some(default_since),
+            };
+            let until_ms = match until {
+                Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
+                None => None,
+            };
+            let sort = parse_token_sort(&sort)?;
+
+            // `--session` short-circuits to a per-session breakdown
+            // (one row, fully populated).
+            if let Some(sid) = session.as_deref() {
+                let usage = tau_agent_lib::profile::session_token_breakdown(&db, sid)?;
+                print_token_session(sid, &usage);
+                return Ok(());
+            }
+
+            // `--task` short-circuits to a per-task breakdown (one row
+            // per recorded role/session for the task).
+            if let Some(task_id) = task {
+                let tasks_db = tau_agent_lib::tasks_db::TasksDb::open_default()
+                    .map_err(|e| tau_agent_lib::Error::Io(format!("open tasks db: {}", e)))?;
+                let rows = tau_agent_lib::profile::task_token_breakdown(&db, &tasks_db, task_id)?;
+                print_token_rows(&rows, "role");
+                return Ok(());
+            }
+
+            // Otherwise: leaderboard. Default group is `role` for the
+            // project-wide view.
+            let group = group_by.as_deref().unwrap_or("role");
+            let group_by = parse_token_group_by(group)?;
+            let role_ref = role.as_deref();
+            let filter = tau_agent_lib::profile::ProfileFilter {
+                since_ms,
+                until_ms,
+                session_id: None,
+                project,
+                limit: 0,
+                max_event_ms: None,
+                exclude_other: false,
+            };
+            let tasks_db = match group_by {
+                tau_agent_lib::profile::TokenGroupBy::Session => None,
+                _ => Some(
+                    tau_agent_lib::tasks_db::TasksDb::open_default()
+                        .map_err(|e| tau_agent_lib::Error::Io(format!("open tasks db: {}", e)))?,
+                ),
+            };
+            let rows = tau_agent_lib::profile::token_leaderboard(
+                &db,
+                &filter,
+                group_by,
+                role_ref,
+                sort,
+                tasks_db.as_ref(),
+            )?;
+            print_token_rows(&rows, group);
+        }
     }
     Ok(())
 }
@@ -3260,7 +3370,7 @@ fn print_slow_events(rows: &[tau_agent_lib::profile::SlowEvent]) {
             detail
         };
         let detail = if detail.len() > 160 {
-            format!("{}…", &detail[..160])
+            format!("{}…", tau_agent_lib::truncate_str(&detail, 160))
         } else {
             detail
         };
@@ -3671,6 +3781,115 @@ async fn cmd_supervise(
         .await?;
 
     Ok(())
+}
+
+fn parse_token_sort(s: &str) -> tau_agent_lib::Result<tau_agent_lib::profile::TokenSort> {
+    use tau_agent_lib::profile::TokenSort;
+    match s.to_ascii_lowercase().as_str() {
+        "cost" => Ok(TokenSort::Cost),
+        "tokens" | "total" => Ok(TokenSort::Tokens),
+        "input" => Ok(TokenSort::Input),
+        "output" => Ok(TokenSort::Output),
+        other => Err(tau_agent_lib::Error::Parse(format!(
+            "--sort: expected one of cost|tokens|input|output, got `{}`",
+            other
+        ))),
+    }
+}
+
+fn parse_token_group_by(s: &str) -> tau_agent_lib::Result<tau_agent_lib::profile::TokenGroupBy> {
+    use tau_agent_lib::profile::TokenGroupBy;
+    match s.to_ascii_lowercase().as_str() {
+        "session" => Ok(TokenGroupBy::Session),
+        "role" => Ok(TokenGroupBy::Role),
+        "task" => Ok(TokenGroupBy::Task),
+        other => Err(tau_agent_lib::Error::Parse(format!(
+            "--group-by: expected one of session|role|task, got `{}`",
+            other
+        ))),
+    }
+}
+
+/// Format a token count compactly: `1.2K`, `34M`, `885M`, etc. Used in
+/// the leaderboard table where 9-digit raw counts blow out column
+/// widths. The exact-comma form is reserved for the per-session
+/// breakdown printer.
+fn fmt_tokens_compact(n: u64) -> String {
+    if n < 1_000 {
+        format!("{}", n)
+    } else if n < 1_000_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else if n < 1_000_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{:.2}B", n as f64 / 1_000_000_000.0)
+    }
+}
+
+fn print_token_rows(rows: &[tau_agent_lib::profile::TokenRow], group_label: &str) {
+    if rows.is_empty() {
+        println!("(no token usage in window)");
+        return;
+    }
+    let group_w = rows
+        .iter()
+        .map(|r| r.group.len())
+        .max()
+        .unwrap_or(group_label.len())
+        .max(group_label.len());
+    println!(
+        "{:<gw$}  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
+        group_label,
+        "sess",
+        "input",
+        "output",
+        "cache_r",
+        "cache_w",
+        "total",
+        "cost",
+        "models",
+        gw = group_w,
+    );
+    for r in rows {
+        let cost = if r.tokens.cost_usd.abs() < 0.005 && r.tokens.cost_usd != 0.0 {
+            // Tiny but non-zero costs render as 0.00 with 2dp; bump to
+            // 4dp so they don't disappear silently.
+            format!("${:.4}", r.tokens.cost_usd)
+        } else {
+            format!("${:.2}", r.tokens.cost_usd)
+        };
+        let models = if r.models.is_empty() {
+            "-".to_string()
+        } else {
+            r.models.join(",")
+        };
+        println!(
+            "{:<gw$}  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {}",
+            r.group,
+            r.sessions,
+            fmt_tokens_compact(r.tokens.input),
+            fmt_tokens_compact(r.tokens.output),
+            fmt_tokens_compact(r.tokens.cache_read),
+            fmt_tokens_compact(r.tokens.cache_write),
+            fmt_tokens_compact(r.tokens.total_tokens()),
+            cost,
+            models,
+            gw = group_w,
+        );
+    }
+}
+
+fn print_token_session(session_id: &str, usage: &tau_agent_lib::profile::TokenUsage) {
+    println!(
+        "session {}: input={} output={} cache_read={} cache_write={} total={} cost=${:.4}",
+        session_id,
+        format_u64_commas(usage.input),
+        format_u64_commas(usage.output),
+        format_u64_commas(usage.cache_read),
+        format_u64_commas(usage.cache_write),
+        format_u64_commas(usage.total_tokens()),
+        usage.cost_usd,
+    );
 }
 
 #[cfg(test)]
