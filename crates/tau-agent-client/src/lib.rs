@@ -133,7 +133,8 @@ impl Client {
                 | Response::StreamAppended { .. }
                 | Response::StreamEvents { .. }
                 | Response::StreamClosed { .. }
-                | Response::StreamListing { .. } => true,
+                | Response::StreamListing { .. }
+                | Response::StreamForked { .. } => true,
                 // Live push from StreamSubscribe — not terminal; more may follow.
                 Response::StreamEventPush { .. } => false,
             };

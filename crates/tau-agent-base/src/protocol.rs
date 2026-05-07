@@ -536,6 +536,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         type_filter: Option<String>,
     },
+    /// Fork a stream, copying events up to (and including) `up_to_offset`
+    /// from `source_id` into a new stream `dest_id`.
+    StreamFork {
+        /// Source stream to fork from.
+        source_id: String,
+        /// Copy events up to and including this offset.
+        up_to_offset: String,
+        /// Destination stream id to create.
+        dest_id: String,
+        /// Optional tags to apply to the destination stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<HashMap<String, String>>,
+    },
 }
 
 /// Attachments to a `Request::Chat` message.
@@ -807,6 +820,11 @@ pub enum Response {
     StreamListing {
         /// Metadata for each matching stream.
         streams: Vec<StreamMetaWire>,
+    },
+    /// Stream was forked (response to [`Request::StreamFork`]).
+    StreamForked {
+        /// The id of the newly created destination stream.
+        id: String,
     },
 
     /// Error.

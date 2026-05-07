@@ -241,3 +241,79 @@ async fn list_streams() {
     assert!(ids.contains(&"list-s1"), "list-s1 not in list");
     assert!(ids.contains(&"list-s2"), "list-s2 not in list");
 }
+
+#[tokio::test]
+async fn fork_stream_copies_events() {
+    let app = test_app();
+
+    // 1. Create source stream.
+    let req = Request::builder()
+        .method(Method::PUT)
+        .uri("/v1/streams/fork-src")
+        .body(Body::empty())
+        .unwrap();
+    let resp = oneshot(app.clone(), req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // 2. Append 3 events, capturing the offset of event 2.
+    let mut offset_event2 = String::new();
+    for (i, payload) in [b"event-1".as_ref(), b"event-2".as_ref(), b"event-3".as_ref()]
+        .iter()
+        .enumerate()
+    {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/streams/fork-src")
+            .body(Body::from(payload.to_vec()))
+            .unwrap();
+        let resp = oneshot(app.clone(), req).await;
+        assert_eq!(resp.status(), StatusCode::OK, "append {} should be 200", i + 1);
+        if i == 1 {
+            offset_event2 = resp
+                .headers()
+                .get("stream-offset")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+        }
+    }
+    assert!(!offset_event2.is_empty(), "offset of event 2 must be captured");
+
+    // 3. POST /v1/streams/fork-src/fork with dest_id and up_to_offset = offset of event 2.
+    let fork_body = serde_json::json!({
+        "dest_id": "fork-dest",
+        "up_to_offset": offset_event2,
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/streams/fork-src/fork")
+        .header("content-type", "application/json")
+        .body(Body::from(fork_body.to_string()))
+        .unwrap();
+    let resp = oneshot(app.clone(), req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "fork should return 201");
+    assert_eq!(
+        resp.headers().get("stream-id").and_then(|v| v.to_str().ok()),
+        Some("fork-dest"),
+        "stream-id header should be fork-dest",
+    );
+
+    // 4. GET /v1/streams/fork-dest and verify 2 events.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/streams/fork-dest")
+        .body(Body::empty())
+        .unwrap();
+    let resp = oneshot(app.clone(), req).await;
+    assert_eq!(resp.status(), StatusCode::OK, "read fork-dest should be 200");
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 65536)
+        .await
+        .unwrap();
+    // Response is NDJSON — count newline-delimited JSON objects.
+    let event_count = body_bytes
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .count();
+    assert_eq!(event_count, 2, "fork-dest should contain exactly 2 events");
+}

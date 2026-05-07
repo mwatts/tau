@@ -3254,6 +3254,10 @@ pub(super) async fn handle_client(
                 let resp = dispatch_stream_list(&state, type_filter.as_deref());
                 send(&mut writer, &resp).await?;
             }
+            crate::protocol::Request::StreamFork { source_id, up_to_offset, dest_id, tags } => {
+                let resp = dispatch_stream_fork(&state, &source_id, &up_to_offset, &dest_id, tags);
+                send(&mut writer, &resp).await?;
+            }
         }
     }
 
@@ -3415,6 +3419,32 @@ fn dispatch_stream_list(
         }
         Err(e) => crate::protocol::Response::Error {
             message: format!("stream list failed: {e}"),
+        },
+    }
+}
+
+/// Dispatch `StreamFork`.
+fn dispatch_stream_fork(
+    state: &super::state::SharedState,
+    source_id: &str,
+    up_to_offset: &str,
+    dest_id: &str,
+    tags: Option<std::collections::HashMap<String, String>>,
+) -> crate::protocol::Response {
+    use tau_streams::{Offset, StreamId};
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    let source = StreamId(source_id.to_owned());
+    let up_to = Offset(up_to_offset.to_owned());
+    let dest = StreamId(dest_id.to_owned());
+    match ds.fork(&source, &up_to, &dest, tags) {
+        Ok(_meta) => crate::protocol::Response::StreamForked {
+            id: dest_id.to_owned(),
+        },
+        Err(e) => crate::protocol::Response::Error {
+            message: e.to_string(),
         },
     }
 }

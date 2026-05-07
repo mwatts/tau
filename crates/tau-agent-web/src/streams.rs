@@ -41,6 +41,7 @@ pub fn stream_routes() -> Router<Arc<AppState>> {
                 .head(head_stream)
                 .delete(delete_stream),
         )
+        .route("/v1/streams/{id}/fork", axum::routing::post(fork_stream))
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +404,50 @@ pub async fn list_streams(
                 serde_json::to_string(&items).unwrap_or_default(),
             )
                 .into_response()
+        }
+        Err(e) => stream_error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/streams/{id}/fork  — fork stream
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct ForkRequest {
+    dest_id: String,
+    up_to_offset: String,
+    #[serde(default)]
+    tags: Option<HashMap<String, String>>,
+}
+
+async fn fork_stream(
+    Path(source_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<ForkRequest>,
+) -> Response {
+    let ds = match require_streams(&state) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+
+    let source = StreamId(source_id);
+    let up_to = Offset(body.up_to_offset);
+    let dest = StreamId(body.dest_id.clone());
+
+    match ds.fork(&source, &up_to, &dest, body.tags) {
+        Ok(meta) => {
+            let mut resp_headers = meta_headers(&meta);
+            resp_headers.insert(
+                "content-type",
+                HeaderValue::from_static("application/json"),
+            );
+            let body_json = serde_json::json!({
+                "id": meta.id.0,
+                "state": format!("{:?}", meta.state).to_lowercase(),
+                "created_at": meta.created_at,
+            });
+            (StatusCode::CREATED, resp_headers, body_json.to_string()).into_response()
         }
         Err(e) => stream_error_response(e),
     }
