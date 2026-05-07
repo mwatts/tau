@@ -15,6 +15,10 @@ description = "Web UI server for tau agent"
 name = "tau-web"
 path = "src/main.rs"
 
+[lib]
+name = "tau_agent_web"
+path = "src/lib.rs"
+
 [dependencies]
 tau-agent-base.workspace = true
 serde_json.workspace = true
@@ -28,3 +32,12 @@ rand = "0.10"
 hex = "0.4"
 mime_guess = "2"
 futures-util = "0.3"
+tau-streams.workspace = true
+rusqlite = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tau-streams.workspace = true
+serde_json.workspace = true

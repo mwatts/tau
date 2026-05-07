@@ -4302,17 +4302,22 @@ dependencies = [
 name = "tau-agent-web"
 version = "0.1.1"
 dependencies = [
+ "async-stream",
  "axum",
  "clap",
  "futures-util",
  "hex",
  "mime_guess",
  "rand 0.10.1",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",
  "tau-agent-base",
+ "tau-streams",
  "tokio",
+ "tokio-stream",
+ "tower",
  "tower-http",
 ]
 
