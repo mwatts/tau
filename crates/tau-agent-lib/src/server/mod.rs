@@ -414,6 +414,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         next_msg_id: 0,
         bg_after_idle: HashMap::new(),
         bg_scheduler: None,
+        streams: None,
     }));
 
     log_stale_phases_at_startup(&state);
@@ -643,6 +644,7 @@ pub async fn run() -> crate::Result<()> {
         next_msg_id: 0,
         bg_after_idle: HashMap::new(),
         bg_scheduler: None,
+        streams: None,
     }));
 
     log_stale_phases_at_startup(&state);

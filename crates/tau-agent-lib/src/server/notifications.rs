@@ -56,6 +56,43 @@ use crate::protocol::Response;
 use crate::truncate_str;
 use crate::types::*;
 
+// ---------------------------------------------------------------------------
+// Stream hub bridge (Task 20)
+// ---------------------------------------------------------------------------
+
+/// Forward raw event bytes to the durable-stream hub for `session_id`.
+///
+/// This is the integration point between the existing broadcast system and
+/// the durable-stream layer.  Today it is a utility stub; when
+/// `agent_runner` starts producing typed [`crate::stream_events::SessionEvent`]
+/// values directly, those writes will route through here so every agent
+/// event is durably recorded **and** delivered to live HTTP/SSE subscribers
+/// in the same call.
+///
+/// # Behaviour when streams are not configured
+///
+/// If `State::streams` is `None` (the server was started without a streams
+/// database path) this function is a no-op.  Callers do not need to guard
+/// against the absence of the store.
+///
+/// # Future integration
+///
+/// The full bridge will be wired once `agent_runner` emits stream events:
+///
+/// ```rust,ignore
+/// let event = SessionEvent::AssistantMessage { content: text.clone(), model };
+/// let bytes  = event.to_ndjson_bytes("server");
+/// notify_stream_hub(&state, session_id, &bytes);
+/// ```
+pub(super) fn notify_stream_hub(state: &SharedState, session_id: &str, data: &[u8]) {
+    let st = lock_state(state);
+    if let Some(ref ds) = st.streams {
+        let stream_id = tau_streams::StreamId(format!("session-{session_id}"));
+        let offset = tau_streams::OffsetGenerator::new().next();
+        ds.hub().notify(&stream_id, offset, data.to_vec());
+    }
+}
+
 /// Queue a message for delivery to a target session.
 /// Persists immediately and sets the has_queued flag for in-flight agent loops.
 ///
@@ -588,6 +625,7 @@ mod tests {
             next_msg_id: 0,
             bg_after_idle: HashMap::new(),
             bg_scheduler: None,
+            streams: None,
         }))
     }
 

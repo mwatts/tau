@@ -446,6 +446,7 @@ mod tests {
             next_msg_id: 0,
             bg_after_idle: HashMap::new(),
             bg_scheduler: None,
+            streams: None,
         }));
         let shutdown = ShutdownHandle::new();
         let sched = BgTaskScheduler::new(state.clone(), shutdown.clone());

@@ -9,6 +9,10 @@ use crate::protocol::{ChatAttachment, Response};
 use crate::provider::ProviderRegistry;
 use crate::types::Model;
 
+/// Convenience type alias for the durable-stream backend used by the server.
+pub(crate) type ServerDurableStream =
+    tau_streams::DurableStream<tau_streams::SqliteStore>;
+
 pub(crate) struct State {
     pub(crate) db: Db,
     pub(crate) registry: ProviderRegistry,
@@ -79,6 +83,13 @@ pub(crate) struct State {
     /// exit reclaims the memory; we accept the cycle rather than
     /// pollute every call site with `Weak::upgrade`.
     pub(crate) bg_scheduler: Option<Arc<super::bg_tasks::BgTaskScheduler>>,
+    /// Durable stream store for session event persistence.
+    ///
+    /// `None` until the server is configured with a streams database path.
+    /// When `None`, all stream-related requests return an error response rather
+    /// than panicking, so the server degrades gracefully on deployments that
+    /// have not yet enabled streams.
+    pub(crate) streams: Option<Arc<ServerDurableStream>>,
 }
 
 pub(crate) type SharedState = Arc<Mutex<State>>;

@@ -3202,10 +3202,219 @@ pub(super) async fn handle_client(
                 })
                 .detach();
             }
+
+            // -------------------------------------------------------------------
+            // Durable stream requests
+            // -------------------------------------------------------------------
+            crate::protocol::Request::StreamCreate { id, content_type, tags } => {
+                let resp = dispatch_stream_create(&state, &id, content_type.as_deref(), tags);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::StreamAppend {
+                id,
+                data,
+                producer_id,
+                producer_epoch,
+                producer_seq,
+            } => {
+                let resp = dispatch_stream_append(
+                    &state,
+                    &id,
+                    data.as_bytes().to_vec(),
+                    producer_id.as_deref(),
+                    producer_epoch,
+                    producer_seq,
+                );
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::StreamRead { id, offset, limit } => {
+                let resp = dispatch_stream_read(&state, &id, offset.as_deref(), limit);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::StreamSubscribe { .. } => {
+                // Live subscription via UDS is not yet implemented.
+                // Clients should use the SSE/HTTP endpoint for live delivery.
+                send(
+                    &mut writer,
+                    &Response::Error {
+                        message: "stream subscribe not yet implemented via UDS; \
+                                  use the SSE/HTTP endpoint for live delivery"
+                            .to_string(),
+                    },
+                )
+                .await?;
+            }
+            crate::protocol::Request::StreamClose { id } => {
+                let resp = dispatch_stream_close(&state, &id);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::StreamList { type_filter } => {
+                let resp = dispatch_stream_list(&state, type_filter.as_deref());
+                send(&mut writer, &resp).await?;
+            }
         }
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stream dispatch helpers (Task 19)
+// ---------------------------------------------------------------------------
+
+/// Return an error response when the durable-stream store is not configured.
+fn stream_not_configured() -> crate::protocol::Response {
+    crate::protocol::Response::Error {
+        message: "durable streams not configured on this server".to_string(),
+    }
+}
+
+/// Dispatch `StreamCreate`.
+fn dispatch_stream_create(
+    state: &super::state::SharedState,
+    id: &str,
+    _content_type: Option<&str>,
+    tags: Option<std::collections::HashMap<String, String>>,
+) -> crate::protocol::Response {
+    use tau_streams::StreamId;
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    let stream_id = StreamId(id.to_string());
+    match ds.create(&stream_id, tags) {
+        Ok(_) => crate::protocol::Response::StreamCreated { id: id.to_string() },
+        Err(e) => crate::protocol::Response::Error {
+            message: format!("stream create failed: {e}"),
+        },
+    }
+}
+
+/// Dispatch `StreamAppend`.
+fn dispatch_stream_append(
+    state: &super::state::SharedState,
+    id: &str,
+    data: Vec<u8>,
+    producer_id: Option<&str>,
+    producer_epoch: Option<u64>,
+    producer_seq: Option<u64>,
+) -> crate::protocol::Response {
+    use tau_streams::{
+        StreamId,
+        types::{AppendRequest, ProducerEpoch, ProducerId, ProducerSeq},
+    };
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    let req = AppendRequest {
+        data,
+        producer_id: producer_id.map(|s| ProducerId(s.to_string())),
+        epoch: producer_epoch.map(ProducerEpoch),
+        seq: producer_seq.map(ProducerSeq),
+    };
+    match ds.append(&StreamId(id.to_string()), req) {
+        Ok(result) => crate::protocol::Response::StreamAppended {
+            offset: result.offset.0,
+            next_offset: result.next_offset.0,
+            deduplicated: result.deduplicated,
+        },
+        Err(e) => crate::protocol::Response::Error {
+            message: format!("stream append failed: {e}"),
+        },
+    }
+}
+
+/// Dispatch `StreamRead`.
+fn dispatch_stream_read(
+    state: &super::state::SharedState,
+    id: &str,
+    offset: Option<&str>,
+    limit: Option<usize>,
+) -> crate::protocol::Response {
+    use tau_streams::{Offset, StreamId};
+
+    let offset = match offset {
+        None | Some("-1") => Offset::beginning(),
+        Some(o) => Offset(o.to_string()),
+    };
+    let limit = limit.unwrap_or(100);
+
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    match ds.read(&StreamId(id.to_string()), &offset, limit) {
+        Ok(result) => {
+            let events = result
+                .events
+                .into_iter()
+                .map(|ev| crate::protocol::StreamEventWire {
+                    offset: ev.offset.0,
+                    data: String::from_utf8_lossy(&ev.data).into_owned(),
+                    created_at: ev.created_at,
+                })
+                .collect();
+            crate::protocol::Response::StreamEvents {
+                events,
+                next_offset: result.next_offset.0,
+                up_to_date: result.up_to_date,
+                closed: result.stream_closed,
+            }
+        }
+        Err(e) => crate::protocol::Response::Error {
+            message: format!("stream read failed: {e}"),
+        },
+    }
+}
+
+/// Dispatch `StreamClose`.
+fn dispatch_stream_close(
+    state: &super::state::SharedState,
+    id: &str,
+) -> crate::protocol::Response {
+    use tau_streams::StreamId;
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    match ds.close(&StreamId(id.to_string())) {
+        Ok(_) => crate::protocol::Response::StreamClosed { id: id.to_string() },
+        Err(e) => crate::protocol::Response::Error {
+            message: format!("stream close failed: {e}"),
+        },
+    }
+}
+
+/// Dispatch `StreamList`.
+fn dispatch_stream_list(
+    state: &super::state::SharedState,
+    type_filter: Option<&str>,
+) -> crate::protocol::Response {
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    let tag_filter = type_filter.map(|t| ("type", t));
+    match ds.list(tag_filter) {
+        Ok(metas) => {
+            let streams = metas
+                .into_iter()
+                .map(|m| crate::protocol::StreamMetaWire {
+                    id: m.id.0,
+                    content_type: m.content_type.to_string(),
+                    state: format!("{:?}", m.state).to_lowercase(),
+                    created_at: m.created_at,
+                    closed_at: m.closed_at,
+                    tags: m.tags,
+                })
+                .collect();
+            crate::protocol::Response::StreamListing { streams }
+        }
+        Err(e) => crate::protocol::Response::Error {
+            message: format!("stream list failed: {e}"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -3257,6 +3466,7 @@ mod tests {
             next_msg_id: 0,
             bg_after_idle: HashMap::new(),
             bg_scheduler: None,
+            streams: None,
         }))
     }
 
@@ -3301,6 +3511,7 @@ mod tests {
             next_msg_id: 0,
             bg_after_idle: HashMap::new(),
             bg_scheduler: None,
+            streams: None,
         }));
         (state, auth_dir)
     }

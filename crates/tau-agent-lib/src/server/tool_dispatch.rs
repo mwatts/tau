@@ -893,7 +893,14 @@ pub(super) async fn handle_server_request(
         | Request::DeleteAgent { .. }
         | Request::PauseAgent { .. }
         | Request::ResumeAgent { .. }
-        | Request::StartAgent { .. } => Response::Error {
+        | Request::StartAgent { .. }
+        // Stream requests — not available in plugin context; use server API.
+        | Request::StreamCreate { .. }
+        | Request::StreamAppend { .. }
+        | Request::StreamRead { .. }
+        | Request::StreamSubscribe { .. }
+        | Request::StreamClose { .. }
+        | Request::StreamList { .. } => Response::Error {
             message: format!(
                 "{} is intentionally not supported in plugin context",
                 request_variant_name(req),
@@ -970,6 +977,12 @@ fn request_variant_name(req: &crate::protocol::Request) -> &'static str {
         Request::PauseAgent { .. } => "Request::PauseAgent",
         Request::ResumeAgent { .. } => "Request::ResumeAgent",
         Request::StartAgent { .. } => "Request::StartAgent",
+        Request::StreamCreate { .. } => "Request::StreamCreate",
+        Request::StreamAppend { .. } => "Request::StreamAppend",
+        Request::StreamRead { .. } => "Request::StreamRead",
+        Request::StreamSubscribe { .. } => "Request::StreamSubscribe",
+        Request::StreamClose { .. } => "Request::StreamClose",
+        Request::StreamList { .. } => "Request::StreamList",
     }
 }
 
@@ -1031,6 +1044,7 @@ mod tests {
             next_msg_id: 0,
             bg_after_idle: HashMap::new(),
             bg_scheduler: None,
+            streams: None,
         }))
     }
 
