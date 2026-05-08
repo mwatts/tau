@@ -150,6 +150,46 @@ pub(super) fn emit_task_event(
     }
 }
 
+/// Create a coordination stream for a group. Returns the stream id, or None
+/// if streams are not configured.
+pub(super) fn create_coordination_group(
+    state: &SharedState,
+    group_id: &str,
+) -> Option<tau_streams::StreamId> {
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else { return None };
+    let stream_id = tau_streams::StreamId(format!("coord-{group_id}"));
+    let _ = ds.create(&stream_id, {
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("type".to_string(), "coordination".to_string());
+        tags.insert("group_id".to_string(), group_id.to_string());
+        Some(tags)
+    });
+    Some(stream_id)
+}
+
+/// Emit a coordination event to a group's stream.
+pub(super) fn emit_coordination_event(
+    state: &SharedState,
+    group_id: &str,
+    event: crate::stream_events::CoordinationEvent,
+    source: &str,
+) {
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else { return };
+    let stream_id = tau_streams::StreamId(format!("coord-{group_id}"));
+    let data = event.to_ndjson_bytes(source);
+    let req = tau_streams::AppendRequest {
+        data,
+        producer_id: Some(tau_streams::ProducerId(source.to_owned())),
+        epoch: None,
+        seq: None,
+    };
+    if let Err(e) = ds.append(&stream_id, req) {
+        tracing::warn!(group_id, %e, "failed to emit coordination event");
+    }
+}
+
 /// Queue a message for delivery to a target session.
 /// Persists immediately and sets the has_queued flag for in-flight agent loops.
 ///
