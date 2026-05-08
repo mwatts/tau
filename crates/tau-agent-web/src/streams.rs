@@ -449,13 +449,38 @@ pub async fn head_stream(
             (StatusCode::GONE, "stream deleted").into_response()
         }
         Ok(meta) => {
-            let mut resp_headers = meta_headers(&meta);
+            let mut headers = HeaderMap::new();
+            // Content-Type
+            headers.insert(
+                "content-type",
+                HeaderValue::from_str(meta.content_type.as_mime())
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            );
+            // Stream-Next-Offset
             if let Some(ref next) = meta.next_offset {
                 if let Ok(v) = HeaderValue::from_str(&next.0) {
-                    resp_headers.insert("stream-next-offset", v);
+                    headers.insert("stream-next-offset", v);
                 }
             }
-            (StatusCode::OK, resp_headers).into_response()
+            // Stream-Closed (presence header — only when true)
+            if meta.state == StreamState::Closed {
+                headers.insert("stream-closed", HeaderValue::from_static("true"));
+            }
+            // Stream-TTL
+            if let Some(ttl) = meta.ttl {
+                if let Ok(v) = HeaderValue::from_str(&ttl.as_secs().to_string()) {
+                    headers.insert("stream-ttl", v);
+                }
+            }
+            // Stream-Expires-At
+            if let Some(expires) = meta.expires_at {
+                if let Ok(v) = HeaderValue::from_str(&expires.to_string()) {
+                    headers.insert("stream-expires-at", v);
+                }
+            }
+            // Cache-Control
+            headers.insert("cache-control", HeaderValue::from_static("no-store"));
+            (StatusCode::OK, headers).into_response()
         }
         Err(e) => stream_error_response(e),
     }
