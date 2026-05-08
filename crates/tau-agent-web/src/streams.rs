@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Router;
@@ -42,6 +42,24 @@ pub fn stream_routes() -> Router<Arc<AppState>> {
                 .delete(delete_stream),
         )
         .route("/v1/streams/{id}/fork", axum::routing::post(fork_stream))
+        .layer(axum::middleware::from_fn(security_headers_middleware))
+}
+
+async fn security_headers_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("cross-origin"),
+    );
+    response
 }
 
 // ---------------------------------------------------------------------------
