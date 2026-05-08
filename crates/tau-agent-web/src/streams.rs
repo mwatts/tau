@@ -187,16 +187,12 @@ pub async fn create_stream(
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize, Default)]
-pub struct AppendQuery {
-    pub producer_id: Option<String>,
-    pub epoch: Option<u64>,
-    pub seq: Option<u64>,
-}
+pub struct AppendQuery {}
 
 pub async fn append_or_close(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
-    Query(query): Query<AppendQuery>,
+    Query(_query): Query<AppendQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -226,15 +222,40 @@ pub async fn append_or_close(
         };
     }
 
+    // §5.2.1: Parse producer identity from HTTP headers (not query params).
+    let producer_id = headers
+        .get("producer-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let producer_epoch = headers
+        .get("producer-epoch")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let producer_seq = headers
+        .get("producer-seq")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    // All three must be present together or none.
+    let has_any = producer_id.is_some() || producer_epoch.is_some() || producer_seq.is_some();
+    let has_all = producer_id.is_some() && producer_epoch.is_some() && producer_seq.is_some();
+    if has_any && !has_all {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Producer-Id, Producer-Epoch, and Producer-Seq must all be provided together",
+        )
+            .into_response();
+    }
+
+    let has_producer = producer_id.is_some();
+
     // Build the append request (used for both append-only and append-and-close).
     let req = AppendRequest {
         data: body.to_vec(),
-        producer_id: query.producer_id.map(ProducerId),
-        epoch: query.epoch.map(ProducerEpoch),
-        seq: query.seq.map(ProducerSeq),
+        producer_id: producer_id.map(ProducerId),
+        epoch: producer_epoch.map(ProducerEpoch),
+        seq: producer_seq.map(ProducerSeq),
     };
-
-    let has_producer = req.producer_id.is_some();
 
     // §5.2: Stream-Closed: true with a non-empty body → atomic append-and-close.
     let append_result = if is_close {
@@ -257,6 +278,19 @@ pub async fn append_or_close(
             }
             if is_close {
                 resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
+            }
+            // §5.2.1: Echo producer headers on success.
+            if has_producer {
+                if let Some(epoch) = producer_epoch {
+                    if let Ok(v) = HeaderValue::from_str(&epoch.to_string()) {
+                        resp_headers.insert("producer-epoch", v);
+                    }
+                }
+                if let Some(seq) = producer_seq {
+                    if let Ok(v) = HeaderValue::from_str(&seq.to_string()) {
+                        resp_headers.insert("producer-seq", v);
+                    }
+                }
             }
             // §5.2: with producer headers → 200 OK (idempotent producer, new data)
             //       without producer headers → 204 No Content
