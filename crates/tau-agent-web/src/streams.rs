@@ -552,19 +552,21 @@ pub async fn read_stream(
                         if result.up_to_date {
                             resp_headers.insert(
                                 "cache-control",
-                                HeaderValue::from_static("public, max-age=31536000, immutable"),
+                                HeaderValue::from_static("public, max-age=60, stale-while-revalidate=300"),
                             );
                         }
 
-                        let closed_suffix = if result.stream_closed && result.up_to_date { ":c" } else { "" };
-                        let etag = format!("\"{}:{}:{}{}\"", stream_id.0, offset.0, result.next_offset.0, closed_suffix);
-                        if let Ok(v) = HeaderValue::from_str(&etag) {
-                            resp_headers.insert("etag", v);
-                        }
+                        if !offset.is_now() {
+                            let closed_suffix = if result.stream_closed && result.up_to_date { ":c" } else { "" };
+                            let etag = format!("\"{}:{}:{}{}\"", stream_id.0, offset.0, result.next_offset.0, closed_suffix);
+                            if let Ok(v) = HeaderValue::from_str(&etag) {
+                                resp_headers.insert("etag", v);
+                            }
 
-                        if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
-                            if inm == etag {
-                                return StatusCode::NOT_MODIFIED.into_response();
+                            if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+                                if inm == etag {
+                                    return StatusCode::NOT_MODIFIED.into_response();
+                                }
                             }
                         }
 
@@ -600,19 +602,21 @@ pub async fn read_stream(
                     if result.up_to_date {
                         resp_headers.insert(
                             "cache-control",
-                            HeaderValue::from_static("public, max-age=31536000, immutable"),
+                            HeaderValue::from_static("public, max-age=60, stale-while-revalidate=300"),
                         );
                     }
 
-                    let closed_suffix = if result.stream_closed && result.up_to_date { ":c" } else { "" };
-                    let etag = format!("\"{}:{}:{}{}\"", stream_id.0, offset.0, result.next_offset.0, closed_suffix);
-                    if let Ok(v) = HeaderValue::from_str(&etag) {
-                        resp_headers.insert("etag", v);
-                    }
+                    if !offset.is_now() {
+                        let closed_suffix = if result.stream_closed && result.up_to_date { ":c" } else { "" };
+                        let etag = format!("\"{}:{}:{}{}\"", stream_id.0, offset.0, result.next_offset.0, closed_suffix);
+                        if let Ok(v) = HeaderValue::from_str(&etag) {
+                            resp_headers.insert("etag", v);
+                        }
 
-                    if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
-                        if inm == etag {
-                            return StatusCode::NOT_MODIFIED.into_response();
+                        if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+                            if inm == etag {
+                                return StatusCode::NOT_MODIFIED.into_response();
+                            }
                         }
                     }
 

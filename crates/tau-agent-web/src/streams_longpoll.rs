@@ -133,7 +133,7 @@ fn build_read_response(result: tau_streams::ReadResult, client_cursor: Option<u6
     if result.up_to_date {
         builder = builder.header(
             "cache-control",
-            "public, max-age=31536000, immutable",
+            "public, max-age=60, stale-while-revalidate=300",
         );
     }
 
