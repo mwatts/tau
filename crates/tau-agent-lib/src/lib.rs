@@ -22,6 +22,7 @@ pub mod prompt_optimizer;
 pub mod prompt_promoter;
 pub mod stream_db;
 pub mod stream_events;
+pub mod stream_rebuild;
 pub mod worker;
 
 /// Re-export of the server's chat-attachment helpers so CLI/TUI clients
