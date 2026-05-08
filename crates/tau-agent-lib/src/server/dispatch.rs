@@ -3467,6 +3467,14 @@ pub(super) async fn handle_client(
                 let resp = dispatch_stream_fork(&state, &source_id, &up_to_offset, &dest_id, tags);
                 send(&mut writer, &resp).await?;
             }
+            crate::protocol::Request::StreamRegisterProducer { stream_id, producer_id } => {
+                let resp = dispatch_stream_register_producer(&state, &stream_id, &producer_id);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::StreamListProducers { stream_id } => {
+                let resp = dispatch_stream_list_producers(&state, &stream_id);
+                send(&mut writer, &resp).await?;
+            }
         }
     }
 
@@ -3652,6 +3660,56 @@ fn dispatch_stream_fork(
         Ok(_meta) => crate::protocol::Response::StreamForked {
             id: dest_id.to_owned(),
         },
+        Err(e) => crate::protocol::Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn dispatch_stream_register_producer(
+    state: &super::state::SharedState,
+    stream_id: &str,
+    producer_id: &str,
+) -> crate::protocol::Response {
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    let sid = tau_streams::StreamId(stream_id.to_owned());
+    let pid = tau_streams::ProducerId(producer_id.to_owned());
+    match ds.register_producer(&sid, &pid) {
+        Ok(epoch) => crate::protocol::Response::StreamProducerRegistered {
+            producer_id: producer_id.to_owned(),
+            epoch: epoch.0,
+        },
+        Err(e) => crate::protocol::Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn dispatch_stream_list_producers(
+    state: &super::state::SharedState,
+    stream_id: &str,
+) -> crate::protocol::Response {
+    let st = lock_state(state);
+    let Some(ref ds) = st.streams else {
+        return stream_not_configured();
+    };
+    let sid = tau_streams::StreamId(stream_id.to_owned());
+    match ds.list_producers(&sid) {
+        Ok(producers) => {
+            let wires: Vec<crate::protocol::StreamProducerWire> = producers
+                .into_iter()
+                .map(|p| crate::protocol::StreamProducerWire {
+                    producer_id: p.producer_id.0,
+                    epoch: p.epoch.0,
+                    registered_at: p.registered_at,
+                    last_append_at: p.last_append_at,
+                })
+                .collect();
+            crate::protocol::Response::StreamProducers { producers: wires }
+        }
         Err(e) => crate::protocol::Response::Error {
             message: e.to_string(),
         },

@@ -903,7 +903,9 @@ pub(super) async fn handle_server_request(
         | Request::StreamSubscribe { .. }
         | Request::StreamClose { .. }
         | Request::StreamList { .. }
-        | Request::StreamFork { .. } => Response::Error {
+        | Request::StreamFork { .. }
+        | Request::StreamRegisterProducer { .. }
+        | Request::StreamListProducers { .. } => Response::Error {
             message: format!(
                 "{} is intentionally not supported in plugin context",
                 request_variant_name(req),
@@ -987,6 +989,8 @@ fn request_variant_name(req: &crate::protocol::Request) -> &'static str {
         Request::StreamClose { .. } => "Request::StreamClose",
         Request::StreamList { .. } => "Request::StreamList",
         Request::StreamFork { .. } => "Request::StreamFork",
+        Request::StreamRegisterProducer { .. } => "Request::StreamRegisterProducer",
+        Request::StreamListProducers { .. } => "Request::StreamListProducers",
     }
 }
 

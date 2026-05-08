@@ -134,7 +134,9 @@ impl Client {
                 | Response::StreamEvents { .. }
                 | Response::StreamClosed { .. }
                 | Response::StreamListing { .. }
-                | Response::StreamForked { .. } => true,
+                | Response::StreamForked { .. }
+                | Response::StreamProducerRegistered { .. }
+                | Response::StreamProducers { .. } => true,
                 // Live push from StreamSubscribe — not terminal; more may follow.
                 Response::StreamEventPush { .. } => false,
             };

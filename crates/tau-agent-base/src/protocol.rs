@@ -549,6 +549,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tags: Option<HashMap<String, String>>,
     },
+    /// Register a producer on a stream, returning a fencing epoch.
+    StreamRegisterProducer {
+        stream_id: String,
+        producer_id: String,
+    },
+    /// List all registered producers on a stream.
+    StreamListProducers {
+        stream_id: String,
+    },
 }
 
 /// Attachments to a `Request::Chat` message.
@@ -825,6 +834,15 @@ pub enum Response {
     StreamForked {
         /// The id of the newly created destination stream.
         id: String,
+    },
+    /// Producer registered on a stream (response to [`Request::StreamRegisterProducer`]).
+    StreamProducerRegistered {
+        producer_id: String,
+        epoch: u64,
+    },
+    /// List of producers on a stream (response to [`Request::StreamListProducers`]).
+    StreamProducers {
+        producers: Vec<StreamProducerWire>,
     },
 
     /// Error.
@@ -1285,6 +1303,15 @@ pub struct StreamEventWire {
     pub data: String,
     /// Unix timestamp (microseconds) when the event was stored.
     pub created_at: i64,
+}
+
+/// Producer registration info returned by [`Response::StreamProducers`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamProducerWire {
+    pub producer_id: String,
+    pub epoch: u64,
+    pub registered_at: i64,
+    pub last_append_at: Option<i64>,
 }
 
 /// Stream metadata returned by [`Response::StreamListing`].
