@@ -279,6 +279,20 @@ pub fn handle_task_create(
                     tags: tags_vec,
                 },
             );
+            {
+                let st = super::state::lock_state(state);
+                let tags_str = task.tags.as_ref().map(|v| v.to_string());
+                let _ = st.db.upsert_task_index(
+                    task.id,
+                    &format!("task-{}", task.id),
+                    &task.title,
+                    task.state.as_str(),
+                    task.priority,
+                    Some(&task.project_name),
+                    task.session_id.as_deref(),
+                    tags_str.as_deref(),
+                );
+            }
             Response::TaskUpdated {
                 task: task_to_info(task),
             }
@@ -344,6 +358,20 @@ pub fn handle_task_update(
                     }),
                 },
             );
+            {
+                let st = super::state::lock_state(state);
+                let tags_str = task.tags.as_ref().map(|v| v.to_string());
+                let _ = st.db.upsert_task_index(
+                    task.id,
+                    &format!("task-{}", task.id),
+                    &task.title,
+                    task.state.as_str(),
+                    task.priority,
+                    Some(&task.project_name),
+                    task.session_id.as_deref(),
+                    tags_str.as_deref(),
+                );
+            }
             Response::TaskUpdated {
                 task: task_to_info(task),
             }
@@ -452,6 +480,20 @@ pub fn handle_task_assign(
                         agent_name: agent_name.map(String::from),
                     },
                 );
+                {
+                    let st = super::state::lock_state(state);
+                    let tags_str = result.task.tags.as_ref().map(|v| v.to_string());
+                    let _ = st.db.upsert_task_index(
+                        result.task.id,
+                        &format!("task-{}", result.task.id),
+                        &result.task.title,
+                        result.task.state.as_str(),
+                        result.task.priority,
+                        Some(&result.task.project_name),
+                        result.task.session_id.as_deref(),
+                        tags_str.as_deref(),
+                    );
+                }
             }
             Response::TaskUpdated {
                 task: task_to_info(result.task),
