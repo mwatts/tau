@@ -310,7 +310,11 @@ impl StreamStore for SqliteStore {
         drop(conn);
 
         if rows_changed == 0 {
-            let existing = self.head(id)?;
+            let existing = match self.head(id) {
+                Ok(meta) => meta,
+                Err(StreamError::Deleted(_)) => return Err(StreamError::AlreadyExists(id.clone())),
+                Err(e) => return Err(e),
+            };
             if existing.content_type != *content_type {
                 return Err(StreamError::AlreadyExists(id.clone()));
             }

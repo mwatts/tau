@@ -229,15 +229,25 @@ pub async fn create_stream(
             .map(|s| Offset(s.to_owned()))
             .unwrap_or_else(Offset::now);
 
+        // Check if dest stream already exists to determine 200 vs 201.
+        let fork_already_exists = ds.head(&stream_id).is_ok();
+
         return match ds.fork(&source_id, &fork_offset, &stream_id, Some(&content_type), tags, &opts) {
             Ok(meta) => {
+                let status = if fork_already_exists { StatusCode::OK } else { StatusCode::CREATED };
                 let mut resp_headers = meta_headers(&meta);
-                resp_headers.insert("content-type", HeaderValue::from_static("application/json"));
                 resp_headers.insert(
-                    "location",
-                    HeaderValue::from_str(&format!("/v1/streams/{}", meta.id.0))
-                        .unwrap_or(HeaderValue::from_static("/")),
+                    "content-type",
+                    HeaderValue::from_str(meta.content_type.as_mime())
+                        .unwrap_or(HeaderValue::from_static("application/octet-stream")),
                 );
+                if !fork_already_exists {
+                    resp_headers.insert(
+                        "location",
+                        HeaderValue::from_str(&format!("/v1/streams/{}", meta.id.0))
+                            .unwrap_or(HeaderValue::from_static("/")),
+                    );
+                }
                 if let Some(ref next) = meta.next_offset {
                     if let Ok(v) = HeaderValue::from_str(&next.0) {
                         resp_headers.insert("stream-next-offset", v);
@@ -251,25 +261,35 @@ pub async fn create_stream(
                     "state": format!("{:?}", meta.state).to_lowercase(),
                     "created_at": meta.created_at,
                 });
-                (StatusCode::CREATED, resp_headers, body.to_string()).into_response()
+                (status, resp_headers, body.to_string()).into_response()
+            }
+            Err(StreamError::Deleted(_)) => {
+                (StatusCode::CONFLICT, "source stream is deleted or soft-deleted").into_response()
             }
             Err(e) => stream_error_response(e),
         };
     }
 
+    // Check if stream already exists to determine 200 vs 201.
+    let already_exists = ds.head(&stream_id).is_ok();
+
     match ds.create(&stream_id, &content_type, tags, &opts) {
         Ok(meta) => {
+            let status = if already_exists { StatusCode::OK } else { StatusCode::CREATED };
             let mut resp_headers = meta_headers(&meta);
             resp_headers.insert(
                 "content-type",
-                HeaderValue::from_static("application/json"),
+                HeaderValue::from_str(meta.content_type.as_mime())
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
             );
-            // Location header per spec: point to the newly created stream resource.
-            resp_headers.insert(
-                "location",
-                HeaderValue::from_str(&format!("/v1/streams/{}", meta.id.0))
-                    .unwrap_or(HeaderValue::from_static("/")),
-            );
+            if !already_exists {
+                // Location header per spec: point to the newly created stream resource.
+                resp_headers.insert(
+                    "location",
+                    HeaderValue::from_str(&format!("/v1/streams/{}", meta.id.0))
+                        .unwrap_or(HeaderValue::from_static("/")),
+                );
+            }
             // Return the tail offset so clients know where to start reading.
             if let Some(ref next) = meta.next_offset {
                 if let Ok(v) = HeaderValue::from_str(&next.0) {
@@ -284,7 +304,7 @@ pub async fn create_stream(
                 "state": format!("{:?}", meta.state).to_lowercase(),
                 "created_at": meta.created_at,
             });
-            (StatusCode::CREATED, resp_headers, body.to_string()).into_response()
+            (status, resp_headers, body.to_string()).into_response()
         }
         Err(e) => stream_error_response(e),
     }
