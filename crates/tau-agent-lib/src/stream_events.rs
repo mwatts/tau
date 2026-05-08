@@ -275,6 +275,36 @@ impl CoordinationEvent {
 }
 
 // ---------------------------------------------------------------------------
+// InboxEvent
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InboxEvent {
+    Message { content: String, sender_info: String },
+    Drained { count: usize },
+}
+
+pub type InboxEnvelope = StreamEnvelope<InboxEvent>;
+
+impl InboxEvent {
+    #[must_use]
+    pub fn wrap(self, source: impl Into<String>) -> InboxEnvelope {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        StreamEnvelope { v: 1, ts, source: source.into(), event: self }
+    }
+
+    #[must_use]
+    pub fn to_ndjson_bytes(&self, source: impl Into<String>) -> Vec<u8> {
+        let envelope = self.clone().wrap(source);
+        serde_json::to_vec(&envelope).expect("InboxEnvelope serialization is infallible")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -499,6 +529,20 @@ mod tests {
         for event in &events {
             let json = serde_json::to_string(event).expect("serialize");
             let decoded: CoordinationEvent = serde_json::from_str(&json).expect("deserialize");
+            let rejson = serde_json::to_string(&decoded).expect("re-serialize");
+            assert_eq!(json, rejson);
+        }
+    }
+
+    #[test]
+    fn inbox_events_roundtrip() {
+        let events: Vec<InboxEvent> = vec![
+            InboxEvent::Message { content: "hello".into(), sender_info: "child:s1".into() },
+            InboxEvent::Drained { count: 3 },
+        ];
+        for event in &events {
+            let json = serde_json::to_string(event).expect("serialize");
+            let decoded: InboxEvent = serde_json::from_str(&json).expect("deserialize");
             let rejson = serde_json::to_string(&decoded).expect("re-serialize");
             assert_eq!(json, rejson);
         }
