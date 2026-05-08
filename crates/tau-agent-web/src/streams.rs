@@ -240,6 +240,25 @@ pub async fn append_or_close(
         };
     }
 
+    // §5.2: Reject empty body unless Stream-Closed: true is present.
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty body requires Stream-Closed: true").into_response();
+    }
+
+    // §5.2: Validate Content-Type matches the stream's configured type.
+    if let Some(req_ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
+        let req_content_type = tau_streams::ContentType::from_mime(req_ct);
+        match ds.head(&stream_id) {
+            Ok(meta) => {
+                if req_content_type != meta.content_type {
+                    return (StatusCode::CONFLICT, "content-type mismatch with stream")
+                        .into_response();
+                }
+            }
+            Err(e) => return stream_error_response(e),
+        }
+    }
+
     // §5.2.1: Parse producer identity from HTTP headers (not query params).
     let producer_id = headers
         .get("producer-id")
