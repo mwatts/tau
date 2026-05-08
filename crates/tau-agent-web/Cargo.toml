@@ -36,6 +36,7 @@ tau-streams.workspace = true
 rusqlite = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = "0.3"
+chrono = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

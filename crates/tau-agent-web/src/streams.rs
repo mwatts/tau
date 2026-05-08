@@ -206,7 +206,11 @@ pub async fn create_stream(
     let expires_at = headers
         .get("stream-expires-at")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i64>().ok());
+        .and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_micros())
+        });
 
     if ttl.is_some() && expires_at.is_some() {
         return (StatusCode::BAD_REQUEST, "cannot set both Stream-TTL and Stream-Expires-At").into_response();
@@ -672,7 +676,10 @@ pub async fn head_stream(
             }
             // Stream-Expires-At
             if let Some(expires) = meta.expires_at {
-                if let Ok(v) = HeaderValue::from_str(&expires.to_string()) {
+                let rfc3339 = chrono::DateTime::from_timestamp_micros(expires)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| expires.to_string());
+                if let Ok(v) = HeaderValue::from_str(&rfc3339) {
                     headers.insert("stream-expires-at", v);
                 }
             }
