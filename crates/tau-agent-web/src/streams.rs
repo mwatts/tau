@@ -343,11 +343,17 @@ pub async fn append_or_close(
         .unwrap_or(false);
 
     if is_close && body.is_empty() {
-        // §5.3: close-only — return 204 No Content with Stream-Closed: true.
+        // §5.3: close-only — return 204 No Content with Stream-Closed: true
+        // and Stream-Next-Offset so clients can resume after the final event.
         return match ds.close(&stream_id) {
-            Ok(_meta) => {
+            Ok(meta) => {
                 let mut resp_headers = HeaderMap::new();
                 resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
+                if let Some(ref next) = meta.next_offset {
+                    if let Ok(v) = HeaderValue::from_str(&next.0) {
+                        resp_headers.insert("stream-next-offset", v);
+                    }
+                }
                 (StatusCode::NO_CONTENT, resp_headers).into_response()
             }
             Err(e) => stream_error_response(e),
