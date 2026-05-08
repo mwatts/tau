@@ -159,6 +159,12 @@ pub async fn create_stream(
                 "content-type",
                 HeaderValue::from_static("application/json"),
             );
+            // Location header per spec: point to the newly created stream resource.
+            resp_headers.insert(
+                "location",
+                HeaderValue::from_str(&format!("/v1/streams/{}", meta.id.0))
+                    .unwrap_or(HeaderValue::from_static("/")),
+            );
             // Return the tail offset so clients know where to start reading.
             if let Some(ref next) = meta.next_offset {
                 if let Ok(v) = HeaderValue::from_str(&next.0) {
@@ -226,6 +232,8 @@ pub async fn append_or_close(
         seq: query.seq.map(ProducerSeq),
     };
 
+    let has_producer = req.producer_id.is_some();
+
     match ds.append(&stream_id, req) {
         Ok(result) => {
             if result.deduplicated {
@@ -238,7 +246,14 @@ pub async fn append_or_close(
             if let Ok(v) = HeaderValue::from_str(&result.next_offset.0) {
                 resp_headers.insert("stream-next-offset", v);
             }
-            (StatusCode::OK, resp_headers).into_response()
+            // §5.2: with producer headers → 200 OK (idempotent producer, new data)
+            //       without producer headers → 204 No Content
+            let status = if has_producer {
+                StatusCode::OK
+            } else {
+                StatusCode::NO_CONTENT
+            };
+            (status, resp_headers).into_response()
         }
         Err(e) => stream_error_response(e),
     }
