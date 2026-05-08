@@ -366,6 +366,7 @@ pub async fn read_stream(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReadQuery>,
+    headers: HeaderMap,
 ) -> Response {
     let stream_id = StreamId(id);
     let offset = query
@@ -421,6 +422,18 @@ pub async fn read_stream(
                             "cache-control",
                             HeaderValue::from_static("public, max-age=31536000, immutable"),
                         );
+                    }
+
+                    let closed_suffix = if result.stream_closed && result.up_to_date { ":c" } else { "" };
+                    let etag = format!("\"{}:{}:{}{}\"", stream_id.0, offset.0, result.next_offset.0, closed_suffix);
+                    if let Ok(v) = HeaderValue::from_str(&etag) {
+                        resp_headers.insert("etag", v);
+                    }
+
+                    if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+                        if inm == etag {
+                            return StatusCode::NOT_MODIFIED.into_response();
+                        }
                     }
 
                     (StatusCode::OK, resp_headers, lines).into_response()

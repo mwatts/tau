@@ -41,12 +41,12 @@ pub async fn handle_long_poll(
     };
 
     if !result.events.is_empty() {
-        return build_read_response(result, client_cursor);
+        return build_read_response(result, client_cursor, &stream_id.0, &offset.0);
     }
 
     if result.stream_closed {
         // Stream is done; return the empty result immediately with the closed header.
-        return build_read_response(result, client_cursor);
+        return build_read_response(result, client_cursor, &stream_id.0, &offset.0);
     }
 
     // No data yet — subscribe and wait.
@@ -56,14 +56,14 @@ pub async fn handle_long_poll(
         Ok(Ok(LiveEvent::Data { .. })) | Ok(Ok(LiveEvent::Closed)) => {
             // New event (or close): re-read from the store.
             match ds.read(&stream_id, &offset, limit) {
-                Ok(r) => build_read_response(r, client_cursor),
+                Ok(r) => build_read_response(r, client_cursor, &stream_id.0, &offset.0),
                 Err(e) => stream_error_response(e),
             }
         }
         Ok(Err(_lagged)) => {
             // Broadcast lagged — re-read anyway.
             match ds.read(&stream_id, &offset, limit) {
-                Ok(r) => build_read_response(r, client_cursor),
+                Ok(r) => build_read_response(r, client_cursor, &stream_id.0, &offset.0),
                 Err(e) => stream_error_response(e),
             }
         }
@@ -89,7 +89,7 @@ pub async fn handle_long_poll(
     }
 }
 
-fn build_read_response(result: tau_streams::ReadResult, client_cursor: Option<u64>) -> Response {
+fn build_read_response(result: tau_streams::ReadResult, client_cursor: Option<u64>, stream_id: &str, start_offset: &str) -> Response {
     use axum::body::Body;
     use axum::http::Response as HttpResponse;
 
@@ -106,6 +106,9 @@ fn build_read_response(result: tau_streams::ReadResult, client_cursor: Option<u6
 
     let cursor_val = tau_streams::generate_cursor(client_cursor);
 
+    let closed_suffix = if result.stream_closed && result.up_to_date { ":c" } else { "" };
+    let etag = format!("\"{}:{}:{}{}\"", stream_id, start_offset, result.next_offset.0, closed_suffix);
+
     let mut builder = HttpResponse::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/x-ndjson")
@@ -116,7 +119,8 @@ fn build_read_response(result: tau_streams::ReadResult, client_cursor: Option<u6
         .header(
             "stream-cursor",
             HeaderValue::from_str(&cursor_val).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
+        )
+        .header("etag", HeaderValue::from_str(&etag).unwrap_or_else(|_| HeaderValue::from_static("")));
 
     // Presence headers: only insert when true (§5.6)
     if result.up_to_date {
