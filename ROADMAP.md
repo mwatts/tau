@@ -196,13 +196,19 @@ the foundational data primitive for agent loops.
 - [x] StreamSubscribe live delivery over UDS (catch-up + broadcast bridge)
 - [x] Bridge existing Subscribe to durable stream hub
 
-### Future
+### Phases 8-9 (implemented)
 
-- [ ] Multiplayer: multi-writer coordination protocol (epoch-fenced multi-producer on same stream)
-- [ ] Approach B: streams replace storage wholesale (see design spec)
+- [x] Multiplayer: multi-writer coordination protocol (epoch-fenced multi-producer on same stream)
+- [x] Approach B: StreamDb dual-write wrapper (streams replace storage wholesale via Deref pattern)
+- [x] StreamDb: `append_message()` dual-write (legacy table + SessionEvent to session stream)
+- [x] StreamDb: `create_session()` dual-write (legacy table + stream creation + SessionMeta event)
+- [x] StreamDb: `queue_message()` dual-write (legacy table + InboxEvent to inbox stream)
+- [x] InboxEvent enum for agent-to-agent messaging streams
+- [x] TaskEvent hooks at server dispatch points (create/update/assign with task_index upsert)
+- [x] Stream rebuild utilities (rebuild_task_index, rebuild_session_index)
 
 **Spec:** `docs/superpowers/specs/2026-05-06-durable-streams-design.md`
-**Plans:** `docs/superpowers/plans/2026-05-06-durable-streams.md`, `docs/superpowers/plans/2026-05-07-durable-streams-phases-5-7.md`
+**Plans:** `docs/superpowers/plans/2026-05-06-durable-streams.md`, `docs/superpowers/plans/2026-05-07-durable-streams-phases-5-7.md`, `docs/superpowers/plans/2026-05-07-streams-multiwriter-and-approach-b.md`
 
 ---
 
