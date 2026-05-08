@@ -74,8 +74,15 @@ pub(crate) fn stream_error_response(err: StreamError) -> Response {
         StreamError::AlreadyExists(_) => {
             (StatusCode::CONFLICT, err.to_string()).into_response()
         }
-        StreamError::AlreadyClosed(_) => {
-            (StatusCode::CONFLICT, err.to_string()).into_response()
+        StreamError::AlreadyClosed(_, ref next_offset) => {
+            let mut headers = HeaderMap::new();
+            headers.insert("stream-closed", HeaderValue::from_static("true"));
+            if let Some(off) = next_offset {
+                if let Ok(v) = HeaderValue::from_str(&off.0) {
+                    headers.insert("stream-next-offset", v);
+                }
+            }
+            (StatusCode::CONFLICT, headers, err.to_string()).into_response()
         }
         StreamError::Deleted(_) => {
             (StatusCode::GONE, err.to_string()).into_response()

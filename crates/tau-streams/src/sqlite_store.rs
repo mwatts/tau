@@ -231,7 +231,17 @@ impl StreamStore for SqliteStore {
         let state_str = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
 
         match state_str.as_str() {
-            "closed" => return Err(StreamError::AlreadyClosed(id.clone())),
+            "closed" => {
+                let tail: Option<String> = conn
+                    .query_row(
+                        "SELECT MAX(offset) FROM stream_events WHERE stream_id = ?1",
+                        params![id.0],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                return Err(StreamError::AlreadyClosed(id.clone(), tail.map(Offset)));
+            }
             "deleted" => return Err(StreamError::Deleted(id.clone())),
             _ => {}
         }
@@ -489,7 +499,11 @@ impl StreamStore for SqliteStore {
         let state_str = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
 
         match state_str.as_str() {
-            "closed" => return Err(StreamError::AlreadyClosed(id.clone())),
+            "closed" => {
+                // Idempotent: return current metadata without error.
+                drop(conn);
+                return self.head(id);
+            }
             "deleted" => return Err(StreamError::Deleted(id.clone())),
             _ => {}
         }
@@ -509,6 +523,76 @@ impl StreamStore for SqliteStore {
         drop(conn);
 
         row_to_meta(row.0, &row.1, &row.2, row.3, row.4, row.5, row.6, &row.7).map_err(StreamError::Storage)
+    }
+
+    fn append_and_close(&self, id: &StreamId, req: AppendRequest) -> Result<AppendResult> {
+        // Run the append first (which validates state, fencing, and dedup).
+        // If the stream is already closed we may still return a dedup result.
+        let state_row: Option<String> = {
+            let conn = self.conn.lock().expect("mutex poisoned");
+            conn.query_row(
+                "SELECT state FROM streams WHERE id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+
+        let state_str = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+
+        match state_str.as_str() {
+            "deleted" => return Err(StreamError::Deleted(id.clone())),
+            "closed" => {
+                // Only allow dedup match on an already-closed stream.
+                if let Some(ref pid) = req.producer_id {
+                    #[expect(
+                        clippy::cast_possible_wrap,
+                        reason = "epoch/seq are far below i64::MAX in practice"
+                    )]
+                    let epoch_val: i64 = req.epoch.map_or(0, |e| e.0 as i64);
+                    #[expect(
+                        clippy::cast_possible_wrap,
+                        reason = "epoch/seq are far below i64::MAX in practice"
+                    )]
+                    let seq_val: i64 = req.seq.map_or(0, |s| s.0 as i64);
+
+                    let conn = self.conn.lock().expect("mutex poisoned");
+                    let existing: Option<String> = conn
+                        .query_row(
+                            "SELECT offset FROM stream_events
+                             WHERE stream_id = ?1 AND producer_id = ?2 AND epoch = ?3 AND seq = ?4",
+                            params![id.0, pid.0, epoch_val, seq_val],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+
+                    if let Some(existing_offset) = existing {
+                        let offset = Offset(existing_offset);
+                        return Ok(AppendResult {
+                            next_offset: offset.clone(),
+                            offset,
+                            deduplicated: true,
+                        });
+                    }
+                }
+                return Err(StreamError::AlreadyClosed(id.clone(), None));
+            }
+            _ => {}
+        }
+
+        // Append to the open stream.
+        let result = self.append(id, req)?;
+
+        // Close the stream.
+        let now = now_micros();
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute(
+            "UPDATE streams SET state = 'closed', closed_at = ?1 WHERE id = ?2",
+            params![now, id.0],
+        )?;
+        drop(conn);
+
+        Ok(result)
     }
 
     fn delete(&self, id: &StreamId) -> Result<()> {
@@ -732,8 +816,63 @@ mod tests {
         let meta = s.close(&id).expect("close");
         assert_eq!(meta.state, StreamState::Closed);
 
-        let err = s.close(&id).expect_err("re-close");
-        assert!(matches!(err, StreamError::AlreadyClosed(_)));
+        // §5.3: closing an already-closed stream is idempotent.
+        let meta2 = s.close(&id).expect("re-close should succeed");
+        assert_eq!(meta2.state, StreamState::Closed);
+    }
+
+    #[test]
+    fn close_already_closed_is_idempotent() {
+        let s = store();
+        let id = stream_id("close-idemp");
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
+        s.close(&id).unwrap();
+        let meta = s.close(&id).expect("second close should succeed");
+        assert_eq!(meta.state, StreamState::Closed);
+    }
+
+    #[test]
+    fn append_and_close_atomic() {
+        let s = store();
+        let id = stream_id("append-close");
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
+        let result = s
+            .append_and_close(
+                &id,
+                AppendRequest {
+                    data: b"final".to_vec(),
+                    producer_id: None,
+                    epoch: None,
+                    seq: None,
+                },
+            )
+            .expect("append_and_close");
+        assert!(!result.deduplicated);
+        let head = s.head(&id).unwrap();
+        assert_eq!(head.state, StreamState::Closed);
+        let read = s.read(&id, &Offset::beginning(), 100).unwrap();
+        assert_eq!(read.events.len(), 1);
+        assert!(read.stream_closed);
+    }
+
+    #[test]
+    fn append_and_close_on_already_closed_errors() {
+        let s = store();
+        let id = stream_id("append-close-fail");
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
+        s.close(&id).unwrap();
+        let err = s
+            .append_and_close(
+                &id,
+                AppendRequest {
+                    data: b"too late".to_vec(),
+                    producer_id: None,
+                    epoch: None,
+                    seq: None,
+                },
+            )
+            .expect_err("should fail");
+        assert!(matches!(err, StreamError::AlreadyClosed(..)));
     }
 
     #[test]
@@ -816,7 +955,7 @@ mod tests {
                 },
             )
             .expect_err("append to closed");
-        assert!(matches!(err, StreamError::AlreadyClosed(_)));
+        assert!(matches!(err, StreamError::AlreadyClosed(..)));
     }
 
     #[test]

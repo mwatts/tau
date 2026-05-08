@@ -15,7 +15,7 @@ pub enum StreamError {
 
     /// The stream has already been closed and cannot be closed again.
     #[error("stream already closed: {0}")]
-    AlreadyClosed(StreamId),
+    AlreadyClosed(StreamId, Option<Offset>),
 
     /// The stream has been deleted and can no longer be accessed.
     #[error("stream deleted: {0}")]
