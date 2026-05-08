@@ -90,16 +90,17 @@ fn build_read_response(result: tau_streams::ReadResult) -> Response {
             "stream-next-offset",
             HeaderValue::from_str(&result.next_offset.0).unwrap_or_else(|_| HeaderValue::from_static("")),
         )
-        .header(
-            "stream-up-to-date",
-            if result.up_to_date { "true" } else { "false" },
-        )
-        .header(
-            "stream-closed",
-            if result.stream_closed { "true" } else { "false" },
-        );
+    ;
 
-    if result.up_to_date && !result.stream_closed {
+    // Presence headers: only insert when true (§5.6)
+    if result.up_to_date {
+        builder = builder.header("stream-up-to-date", "true");
+    }
+    if result.stream_closed && result.up_to_date {
+        builder = builder.header("stream-closed", "true");
+    }
+
+    if result.up_to_date {
         builder = builder.header(
             "cache-control",
             "public, max-age=31536000, immutable",

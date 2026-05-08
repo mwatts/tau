@@ -214,27 +214,36 @@ pub async fn append_or_close(
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    if is_close {
+    if is_close && body.is_empty() {
+        // §5.3: close-only — return 204 No Content with Stream-Closed: true.
         return match ds.close(&stream_id) {
-            Ok(meta) => {
-                let resp_headers = meta_headers(&meta);
-                (StatusCode::OK, resp_headers).into_response()
+            Ok(_meta) => {
+                let mut resp_headers = HeaderMap::new();
+                resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
+                (StatusCode::NO_CONTENT, resp_headers).into_response()
             }
             Err(e) => stream_error_response(e),
         };
     }
 
-    // Append request.
+    // Build the append request (used for both append-only and append-and-close).
     let req = AppendRequest {
         data: body.to_vec(),
-        producer_id: query.producer_id.map(|s| ProducerId(s)),
+        producer_id: query.producer_id.map(ProducerId),
         epoch: query.epoch.map(ProducerEpoch),
         seq: query.seq.map(ProducerSeq),
     };
 
     let has_producer = req.producer_id.is_some();
 
-    match ds.append(&stream_id, req) {
+    // §5.2: Stream-Closed: true with a non-empty body → atomic append-and-close.
+    let append_result = if is_close {
+        ds.append_and_close(&stream_id, req)
+    } else {
+        ds.append(&stream_id, req)
+    };
+
+    match append_result {
         Ok(result) => {
             if result.deduplicated {
                 return StatusCode::NO_CONTENT.into_response();
@@ -245,6 +254,9 @@ pub async fn append_or_close(
             }
             if let Ok(v) = HeaderValue::from_str(&result.next_offset.0) {
                 resp_headers.insert("stream-next-offset", v);
+            }
+            if is_close {
+                resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
             }
             // §5.2: with producer headers → 200 OK (idempotent producer, new data)
             //       without producer headers → 204 No Content
@@ -313,16 +325,13 @@ pub async fn read_stream(
                     if let Ok(v) = HeaderValue::from_str(&result.next_offset.0) {
                         resp_headers.insert("stream-next-offset", v);
                     }
-                    resp_headers.insert(
-                        "stream-up-to-date",
-                        HeaderValue::from_static(if result.up_to_date { "true" } else { "false" }),
-                    );
-                    resp_headers.insert(
-                        "stream-closed",
-                        HeaderValue::from_static(
-                            if result.stream_closed { "true" } else { "false" },
-                        ),
-                    );
+                    // Presence headers: only insert when true (§5.6)
+                    if result.up_to_date {
+                        resp_headers.insert("stream-up-to-date", HeaderValue::from_static("true"));
+                    }
+                    if result.stream_closed && result.up_to_date {
+                        resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
+                    }
                     resp_headers.insert(
                         "content-type",
                         HeaderValue::from_static("application/x-ndjson"),
