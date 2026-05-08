@@ -107,7 +107,7 @@ pub(super) fn emit_system_event(state: &SharedState, event: crate::stream_events
         tags.insert("type".to_string(), "system".to_string());
         tags.insert("daemon_id".to_string(), daemon_id.clone());
         Some(tags)
-    });
+    }, &tau_streams::CreateOptions::default());
     let data = event.to_ndjson_bytes(&daemon_id);
     let req = tau_streams::AppendRequest {
         data,
@@ -138,7 +138,7 @@ pub(super) fn emit_task_event(
         tags.insert("type".to_string(), "task".to_string());
         tags.insert("task_id".to_string(), task_id.to_string());
         Some(tags)
-    });
+    }, &tau_streams::CreateOptions::default());
     let data = event.to_ndjson_bytes("server");
     let req = tau_streams::AppendRequest {
         data,
@@ -166,7 +166,7 @@ pub(super) fn create_coordination_group(
         tags.insert("type".to_string(), "coordination".to_string());
         tags.insert("group_id".to_string(), group_id.to_string());
         Some(tags)
-    });
+    }, &tau_streams::CreateOptions::default());
     Some(stream_id)
 }
 

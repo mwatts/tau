@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -20,8 +21,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Router;
 use tau_streams::{
-    AppendRequest, ContentType, DurableStream, Offset, ProducerEpoch, ProducerId, ProducerSeq,
-    SqliteStore, StreamError, StreamId, StreamMeta, StreamSeq, StreamState,
+    AppendRequest, ContentType, CreateOptions, DurableStream, Offset, ProducerEpoch, ProducerId,
+    ProducerSeq, SqliteStore, StreamError, StreamId, StreamMeta, StreamSeq, StreamState,
 };
 
 use crate::routes::AppState;
@@ -190,7 +191,30 @@ pub async fn create_stream(
         .and_then(|v| v.to_str().ok())
         .map_or(ContentType::OctetStream, ContentType::from_mime);
 
-    match ds.create(&stream_id, &content_type, tags) {
+    let ttl = headers
+        .get("stream-ttl")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs);
+
+    let expires_at = headers
+        .get("stream-expires-at")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+
+    if ttl.is_some() && expires_at.is_some() {
+        return (StatusCode::BAD_REQUEST, "cannot set both Stream-TTL and Stream-Expires-At").into_response();
+    }
+
+    let closed = headers
+        .get("stream-closed")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let opts = CreateOptions { ttl, expires_at, closed };
+
+    match ds.create(&stream_id, &content_type, tags, &opts) {
         Ok(meta) => {
             let mut resp_headers = meta_headers(&meta);
             resp_headers.insert(
@@ -208,6 +232,9 @@ pub async fn create_stream(
                 if let Ok(v) = HeaderValue::from_str(&next.0) {
                     resp_headers.insert("stream-next-offset", v);
                 }
+            }
+            if meta.state == StreamState::Closed {
+                resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
             }
             let body = serde_json::json!({
                 "id": meta.id.0,

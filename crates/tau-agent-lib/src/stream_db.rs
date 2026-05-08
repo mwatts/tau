@@ -64,7 +64,7 @@ impl StreamDb {
             if let Some(ref project) = session.project_name {
                 tags.insert("project".to_string(), project.clone());
             }
-            let _ = ds.create(&stream_id, &tau_streams::ContentType::NdJson, Some(tags));
+            let _ = ds.create(&stream_id, &tau_streams::ContentType::NdJson, Some(tags), &tau_streams::CreateOptions::default());
 
             let meta_event = crate::stream_events::SessionEvent::SessionMeta {
                 key: "created".to_string(),
@@ -96,7 +96,7 @@ impl StreamDb {
                 tags.insert("type".to_string(), "inbox".to_string());
                 tags.insert("session_id".to_string(), target.to_string());
                 Some(tags)
-            });
+            }, &tau_streams::CreateOptions::default());
             let event = crate::stream_events::InboxEvent::Message {
                 content: content.to_string(),
                 sender_info: sender_info.to_string(),

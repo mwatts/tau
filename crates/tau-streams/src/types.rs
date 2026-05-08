@@ -295,6 +295,21 @@ pub struct ReadResult {
 }
 
 // ---------------------------------------------------------------------------
+// CreateOptions
+// ---------------------------------------------------------------------------
+
+/// Options for stream creation beyond content type and tags.
+#[derive(Debug, Clone, Default)]
+pub struct CreateOptions {
+    /// Optional TTL for events in the stream.
+    pub ttl: Option<Duration>,
+    /// Unix timestamp (microseconds) after which the stream expires.
+    pub expires_at: Option<i64>,
+    /// If true, create the stream already closed.
+    pub closed: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

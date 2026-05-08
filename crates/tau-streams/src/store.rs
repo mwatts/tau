@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     error::Result,
-    types::{AppendRequest, AppendResult, ContentType, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
+    types::{AppendRequest, AppendResult, ContentType, CreateOptions, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
 };
 
 /// Backend storage for durable streams.
@@ -21,6 +21,7 @@ pub trait StreamStore {
         id: &StreamId,
         content_type: &ContentType,
         tags: Option<HashMap<String, String>>,
+        opts: &CreateOptions,
     ) -> Result<StreamMeta>;
 
     /// Appends an event to an open stream.
@@ -53,11 +54,28 @@ pub trait StreamStore {
 
     /// Closes a stream, preventing further appends.
     ///
+    /// Idempotent: closing an already-closed stream succeeds and returns the
+    /// current metadata unchanged.
+    ///
     /// # Errors
     ///
     /// - [`crate::error::StreamError::NotFound`] — stream does not exist.
-    /// - [`crate::error::StreamError::AlreadyClosed`] — stream is already closed.
     fn close(&self, id: &StreamId) -> Result<StreamMeta>;
+
+    /// Atomically appends an event and closes the stream in a single operation.
+    ///
+    /// When the stream is already closed but `req` matches an existing producer
+    /// dedup key, returns the deduplicated result.  If the stream is already
+    /// closed and no dedup match is found, returns
+    /// [`crate::error::StreamError::AlreadyClosed`].
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::StreamError::NotFound`] — stream does not exist.
+    /// - [`crate::error::StreamError::AlreadyClosed`] — stream is closed and no dedup match.
+    /// - [`crate::error::StreamError::Deleted`] — stream has been deleted.
+    /// - [`crate::error::StreamError::ProducerFenced`] — producer epoch is stale.
+    fn append_and_close(&self, id: &StreamId, req: AppendRequest) -> Result<AppendResult>;
 
     /// Deletes a stream and removes all its events.
     ///

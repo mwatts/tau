@@ -3506,7 +3506,7 @@ fn dispatch_stream_create(
     };
     let stream_id = StreamId(id.to_string());
     let ct = content_type.map_or(ContentType::OctetStream, ContentType::from_mime);
-    match ds.create(&stream_id, &ct, tags) {
+    match ds.create(&stream_id, &ct, tags, &tau_streams::CreateOptions::default()) {
         Ok(_) => crate::protocol::Response::StreamCreated { id: id.to_string() },
         Err(e) => crate::protocol::Response::Error {
             message: format!("stream create failed: {e}"),
