@@ -7,9 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use tau_streams::{LiveEvent, Offset, StreamId};
+use tau_streams::{LiveEvent, Offset, StreamId, StreamState};
 use tokio::time::timeout;
 
 use crate::routes::AppState;
@@ -64,7 +64,21 @@ pub async fn handle_long_poll(
                 Err(e) => stream_error_response(e),
             }
         }
-        Err(_timeout) => StatusCode::NO_CONTENT.into_response(),
+        Err(_timeout) => {
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("stream-up-to-date", HeaderValue::from_static("true"));
+            if let Ok(meta) = ds.head(&stream_id) {
+                if let Some(ref next) = meta.next_offset {
+                    if let Ok(v) = HeaderValue::from_str(&next.0) {
+                        resp_headers.insert("stream-next-offset", v);
+                    }
+                }
+                if meta.state == StreamState::Closed {
+                    resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
+                }
+            }
+            (StatusCode::NO_CONTENT, resp_headers).into_response()
+        }
     }
 }
 
