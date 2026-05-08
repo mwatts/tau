@@ -20,6 +20,7 @@ pub mod tool_prompt_overrides;
 pub mod prompt_metrics;
 pub mod prompt_optimizer;
 pub mod prompt_promoter;
+pub mod stream_db;
 pub mod stream_events;
 pub mod worker;
 
