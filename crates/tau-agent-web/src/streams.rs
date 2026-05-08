@@ -42,7 +42,6 @@ pub fn stream_routes() -> Router<Arc<AppState>> {
                 .head(head_stream)
                 .delete(delete_stream),
         )
-        .route("/v1/streams/{id}/fork", axum::routing::post(fork_stream))
         .layer(axum::middleware::from_fn(security_headers_middleware))
 }
 
@@ -213,6 +212,47 @@ pub async fn create_stream(
         .unwrap_or(false);
 
     let opts = CreateOptions { ttl, expires_at, closed };
+
+    let forked_from = headers
+        .get("stream-forked-from")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+
+    if let Some(source_path) = forked_from {
+        let source_id = StreamId(source_path);
+        let fork_offset = headers
+            .get("stream-fork-offset")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| Offset(s.to_owned()))
+            .unwrap_or_else(Offset::now);
+
+        return match ds.fork(&source_id, &fork_offset, &stream_id, Some(&content_type), tags, &opts) {
+            Ok(meta) => {
+                let mut resp_headers = meta_headers(&meta);
+                resp_headers.insert("content-type", HeaderValue::from_static("application/json"));
+                resp_headers.insert(
+                    "location",
+                    HeaderValue::from_str(&format!("/v1/streams/{}", meta.id.0))
+                        .unwrap_or(HeaderValue::from_static("/")),
+                );
+                if let Some(ref next) = meta.next_offset {
+                    if let Ok(v) = HeaderValue::from_str(&next.0) {
+                        resp_headers.insert("stream-next-offset", v);
+                    }
+                }
+                if meta.state == StreamState::Closed {
+                    resp_headers.insert("stream-closed", HeaderValue::from_static("true"));
+                }
+                let body = serde_json::json!({
+                    "id": meta.id.0,
+                    "state": format!("{:?}", meta.state).to_lowercase(),
+                    "created_at": meta.created_at,
+                });
+                (StatusCode::CREATED, resp_headers, body.to_string()).into_response()
+            }
+            Err(e) => stream_error_response(e),
+        };
+    }
 
     match ds.create(&stream_id, &content_type, tags, &opts) {
         Ok(meta) => {
@@ -613,46 +653,3 @@ pub async fn list_streams(
     }
 }
 
-// ---------------------------------------------------------------------------
-// POST /v1/streams/{id}/fork  — fork stream
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Deserialize)]
-struct ForkRequest {
-    dest_id: String,
-    up_to_offset: String,
-    #[serde(default)]
-    tags: Option<HashMap<String, String>>,
-}
-
-async fn fork_stream(
-    Path(source_id): Path<String>,
-    State(state): State<Arc<AppState>>,
-    axum::Json(body): axum::Json<ForkRequest>,
-) -> Response {
-    let ds = match require_streams(&state) {
-        Ok(d) => d,
-        Err(r) => return r,
-    };
-
-    let source = StreamId(source_id);
-    let up_to = Offset(body.up_to_offset);
-    let dest = StreamId(body.dest_id.clone());
-
-    match ds.fork(&source, &up_to, &dest, body.tags) {
-        Ok(meta) => {
-            let mut resp_headers = meta_headers(&meta);
-            resp_headers.insert(
-                "content-type",
-                HeaderValue::from_static("application/json"),
-            );
-            let body_json = serde_json::json!({
-                "id": meta.id.0,
-                "state": format!("{:?}", meta.state).to_lowercase(),
-                "created_at": meta.created_at,
-            });
-            (StatusCode::CREATED, resp_headers, body_json.to_string()).into_response()
-        }
-        Err(e) => stream_error_response(e),
-    }
-}

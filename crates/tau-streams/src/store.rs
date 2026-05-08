@@ -95,11 +95,11 @@ pub trait StreamStore {
     /// Returns a storage error if the underlying query fails.
     fn list(&self, tag_filter: Option<(&str, &str)>) -> Result<Vec<StreamMeta>>;
 
-    /// Creates a new stream by copying events from `source` up to and
-    /// including `up_to` offset into `dest`.
+    /// Creates a new stream that stitches reads from `source` up to `fork_offset`
+    /// with the fork's own events, sharing the source's offset space.
     ///
-    /// The destination stream is created with `tags` if provided.
-    /// Events are re-appended with fresh offsets in the destination.
+    /// The destination stream is created with `content_type` (inherited from source
+    /// when `None`) and optional `tags`.
     ///
     /// # Errors
     ///
@@ -107,9 +107,11 @@ pub trait StreamStore {
     fn fork(
         &self,
         source: &StreamId,
-        up_to: &Offset,
+        fork_offset: &Offset,
         dest: &StreamId,
+        content_type: Option<&ContentType>,
         tags: Option<HashMap<String, String>>,
+        opts: &CreateOptions,
     ) -> Result<StreamMeta>;
 
     /// Registers a producer on a stream, returning its new epoch.

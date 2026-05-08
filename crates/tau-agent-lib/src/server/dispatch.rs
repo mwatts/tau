@@ -3658,7 +3658,7 @@ fn dispatch_stream_fork(
     let source = StreamId(source_id.to_owned());
     let up_to = Offset(up_to_offset.to_owned());
     let dest = StreamId(dest_id.to_owned());
-    match ds.fork(&source, &up_to, &dest, tags) {
+    match ds.fork(&source, &up_to, &dest, None, tags, &tau_streams::CreateOptions::default()) {
         Ok(_meta) => crate::protocol::Response::StreamForked {
             id: dest_id.to_owned(),
         },

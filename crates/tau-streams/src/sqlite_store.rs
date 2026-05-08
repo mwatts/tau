@@ -84,7 +84,11 @@ impl SqliteStore {
                 ttl_seconds  INTEGER,
                 expires_at   INTEGER,
                 tags_json    TEXT NOT NULL DEFAULT '{}',
-                last_seq     TEXT
+                last_seq     TEXT,
+                forked_from  TEXT,
+                fork_offset  TEXT,
+                ref_count    INTEGER NOT NULL DEFAULT 0,
+                soft_deleted INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS stream_events (
@@ -175,6 +179,107 @@ fn row_to_meta(
 }
 
 // ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+impl SqliteStore {
+    fn read_forked(
+        &self,
+        fork_id: &StreamId,
+        source_id: &StreamId,
+        fork_offset: &str,
+        read_offset: &Offset,
+        limit: usize,
+        stream_closed: bool,
+    ) -> Result<ReadResult> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        if read_offset.is_now() {
+            let tail: Option<String> = conn
+                .query_row(
+                    "SELECT MAX(offset) FROM (
+                        SELECT offset FROM stream_events WHERE stream_id = ?1 AND offset <= ?2
+                        UNION ALL
+                        SELECT offset FROM stream_events WHERE stream_id = ?3
+                    ) sub",
+                    params![source_id.0, fork_offset, fork_id.0],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            drop(conn);
+            return Ok(ReadResult {
+                events: vec![],
+                next_offset: tail.map_or_else(Offset::now, Offset),
+                up_to_date: true,
+                stream_closed,
+            });
+        }
+
+        let after_offset = if read_offset.is_beginning() {
+            String::new()
+        } else {
+            read_offset.0.clone()
+        };
+
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let mut stmt = conn.prepare(
+            "SELECT offset, data, created_at FROM (
+                SELECT offset, data, created_at FROM stream_events
+                WHERE stream_id = ?1 AND offset <= ?2 AND offset > ?3
+                UNION ALL
+                SELECT offset, data, created_at FROM stream_events
+                WHERE stream_id = ?4 AND offset > ?3
+            ) sub
+            ORDER BY offset ASC
+            LIMIT ?5",
+        )?;
+
+        let events: Vec<crate::types::StreamEvent> = stmt
+            .query_map(
+                params![source_id.0, fork_offset, after_offset, fork_id.0, limit_i64],
+                |r| {
+                    Ok(crate::types::StreamEvent {
+                        offset: Offset(r.get(0)?),
+                        data: r.get(1)?,
+                        created_at: r.get(2)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        let next_offset = events
+            .last()
+            .map_or_else(|| read_offset.clone(), |e| e.offset.clone());
+
+        let has_more: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT offset FROM stream_events
+                    WHERE stream_id = ?1 AND offset <= ?2 AND offset > ?3
+                    UNION ALL
+                    SELECT offset FROM stream_events
+                    WHERE stream_id = ?4 AND offset > ?3
+                ) sub LIMIT 1",
+                params![source_id.0, fork_offset, next_offset.0, fork_id.0],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        drop(conn);
+
+        Ok(ReadResult {
+            events,
+            next_offset,
+            up_to_date: !has_more,
+            stream_closed,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StreamStore impl
 // ---------------------------------------------------------------------------
 
@@ -240,15 +345,19 @@ impl StreamStore for SqliteStore {
         let conn = self.conn.lock().expect("mutex poisoned");
 
         // Load stream state.
-        let state_row: Option<String> = conn
+        let state_row: Option<(String, i64)> = conn
             .query_row(
-                "SELECT state FROM streams WHERE id = ?1",
+                "SELECT state, soft_deleted FROM streams WHERE id = ?1",
                 params![id.0],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
 
-        let state_str = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+        let (state_str, soft_deleted) = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+
+        if soft_deleted == 1 {
+            return Err(StreamError::Deleted(id.clone()));
+        }
 
         match state_str.as_str() {
             "closed" => {
@@ -433,25 +542,38 @@ impl StreamStore for SqliteStore {
     fn read(&self, id: &StreamId, offset: &Offset, limit: usize) -> Result<ReadResult> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
-        let state_row: Option<String> = conn
+        let state_row: Option<(String, Option<String>, Option<String>, i64)> = conn
             .query_row(
-                "SELECT state FROM streams WHERE id = ?1",
+                "SELECT state, forked_from, fork_offset, soft_deleted FROM streams WHERE id = ?1",
                 params![id.0],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
 
-        let state_str = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+        let (state_str, forked_from, fork_offset_col, soft_deleted) =
+            state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+
+        if soft_deleted == 1 {
+            return Err(StreamError::Deleted(id.clone()));
+        }
 
         if state_str == "deleted" {
             return Err(StreamError::Deleted(id.clone()));
         }
 
         let stream_closed = state_str == "closed";
+        drop(conn);
+
+        if let (Some(source_id_str), Some(fork_off_str)) = (forked_from, fork_offset_col) {
+            let source_id = StreamId(source_id_str);
+            let fork_off = fork_off_str;
+            return self.read_forked(id, &source_id, &fork_off, offset, limit, stream_closed);
+        }
+
+        let conn = self.conn.lock().expect("mutex poisoned");
 
         // "now" sentinel — return empty result immediately.
         if offset.is_now() {
-            // Return the latest stored offset so the caller can resume from here.
             let latest: Option<String> = conn
                 .query_row(
                     "SELECT MAX(offset) FROM stream_events WHERE stream_id = ?1",
@@ -474,7 +596,7 @@ impl StreamStore for SqliteStore {
         // "beginning" sentinel reads from offset "" (everything), otherwise
         // we read strictly after the provided offset string.
         let after_offset = if offset.is_beginning() {
-            String::new() // Empty string is lexicographically less than any real offset.
+            String::new()
         } else {
             offset.0.clone()
         };
@@ -507,7 +629,6 @@ impl StreamStore for SqliteStore {
             .last()
             .map_or_else(|| offset.clone(), |e| e.offset.clone());
 
-        // Are we at the tail?
         let has_more: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM stream_events
@@ -531,17 +652,21 @@ impl StreamStore for SqliteStore {
     fn head(&self, id: &StreamId) -> Result<StreamMeta> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
-        let row: Option<(String, String, String, i64, Option<i64>, Option<i64>, Option<i64>, String)> = conn
+        let row: Option<(String, String, String, i64, Option<i64>, Option<i64>, Option<i64>, String, i64)> = conn
             .query_row(
-                "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json
+                "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json, soft_deleted
                  FROM streams WHERE id = ?1",
                 params![id.0],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
             )
             .optional()?;
 
-        let (sid, ct, state, created, closed, ttl_secs, expires, tags_json) =
+        let (sid, ct, state, created, closed, ttl_secs, expires, tags_json, soft_deleted) =
             row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+
+        if soft_deleted == 1 {
+            return Err(StreamError::Deleted(id.clone()));
+        }
 
         // Query the tail offset for the stream.
         let tail: Option<String> = conn
@@ -563,19 +688,22 @@ impl StreamStore for SqliteStore {
     fn close(&self, id: &StreamId) -> Result<StreamMeta> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
-        let state_row: Option<String> = conn
+        let state_row: Option<(String, i64)> = conn
             .query_row(
-                "SELECT state FROM streams WHERE id = ?1",
+                "SELECT state, soft_deleted FROM streams WHERE id = ?1",
                 params![id.0],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
 
-        let state_str = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+        let (state_str, soft_deleted) = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+
+        if soft_deleted == 1 {
+            return Err(StreamError::Deleted(id.clone()));
+        }
 
         match state_str.as_str() {
             "closed" => {
-                // Idempotent: return current metadata without error.
                 drop(conn);
                 return self.head(id);
             }
@@ -601,19 +729,21 @@ impl StreamStore for SqliteStore {
     }
 
     fn append_and_close(&self, id: &StreamId, req: AppendRequest) -> Result<AppendResult> {
-        // Run the append first (which validates state, fencing, and dedup).
-        // If the stream is already closed we may still return a dedup result.
-        let state_row: Option<String> = {
+        let state_row: Option<(String, i64)> = {
             let conn = self.conn.lock().expect("mutex poisoned");
             conn.query_row(
-                "SELECT state FROM streams WHERE id = ?1",
+                "SELECT state, soft_deleted FROM streams WHERE id = ?1",
                 params![id.0],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
         };
 
-        let state_str = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+        let (state_str, soft_deleted) = state_row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+
+        if soft_deleted == 1 {
+            return Err(StreamError::Deleted(id.clone()));
+        }
 
         match state_str.as_str() {
             "deleted" => return Err(StreamError::Deleted(id.clone())),
@@ -673,28 +803,56 @@ impl StreamStore for SqliteStore {
     fn delete(&self, id: &StreamId) -> Result<()> {
         let conn = self.conn.lock().expect("mutex poisoned");
 
-        let exists: bool = conn
+        let row: Option<(i64, i64, Option<String>)> = conn
             .query_row(
-                "SELECT 1 FROM streams WHERE id = ?1",
+                "SELECT ref_count, soft_deleted, forked_from FROM streams WHERE id = ?1",
                 params![id.0],
-                |_| Ok(true),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()?
-            .is_some();
+            .optional()?;
 
-        if !exists {
-            return Err(StreamError::NotFound(id.clone()));
+        let (ref_count, already_soft, forked_from) =
+            row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
+
+        if already_soft == 1 {
+            return Ok(());
         }
 
-        // Remove events first (foreign key constraint), then mark stream deleted.
-        conn.execute(
-            "DELETE FROM stream_events WHERE stream_id = ?1",
-            params![id.0],
-        )?;
-        conn.execute(
-            "UPDATE streams SET state = 'deleted' WHERE id = ?1",
-            params![id.0],
-        )?;
+        if ref_count > 0 {
+            conn.execute(
+                "UPDATE streams SET soft_deleted = 1, state = 'deleted' WHERE id = ?1",
+                params![id.0],
+            )?;
+        } else {
+            conn.execute("DELETE FROM stream_events WHERE stream_id = ?1", params![id.0])?;
+            conn.execute("DELETE FROM stream_producers WHERE stream_id = ?1", params![id.0])?;
+            conn.execute("DELETE FROM streams WHERE id = ?1", params![id.0])?;
+
+            if let Some(ref source_id) = forked_from {
+                conn.execute(
+                    "UPDATE streams SET ref_count = ref_count - 1 WHERE id = ?1",
+                    params![source_id],
+                )?;
+                let source_row: Option<(i64, i64)> = conn
+                    .query_row(
+                        "SELECT ref_count, soft_deleted FROM streams WHERE id = ?1",
+                        params![source_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((0, 1)) = source_row {
+                    conn.execute(
+                        "DELETE FROM stream_events WHERE stream_id = ?1",
+                        params![source_id],
+                    )?;
+                    conn.execute(
+                        "DELETE FROM stream_producers WHERE stream_id = ?1",
+                        params![source_id],
+                    )?;
+                    conn.execute("DELETE FROM streams WHERE id = ?1", params![source_id])?;
+                }
+            }
+        }
         drop(conn);
 
         Ok(())
@@ -710,7 +868,7 @@ impl StreamStore for SqliteStore {
             let mut stmt = conn.prepare(
                 "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json
                  FROM streams
-                 WHERE state != 'deleted' AND tags_json LIKE ?1",
+                 WHERE state != 'deleted' AND soft_deleted = 0 AND tags_json LIKE ?1",
             )?;
             stmt.query_map(params![pattern], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
@@ -719,7 +877,7 @@ impl StreamStore for SqliteStore {
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json
-                 FROM streams WHERE state != 'deleted'",
+                 FROM streams WHERE state != 'deleted' AND soft_deleted = 0",
             )?;
             stmt.query_map(params![], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
@@ -740,29 +898,57 @@ impl StreamStore for SqliteStore {
     fn fork(
         &self,
         source: &StreamId,
-        up_to: &Offset,
+        fork_offset: &Offset,
         dest: &StreamId,
+        content_type: Option<&ContentType>,
         tags: Option<HashMap<String, String>>,
+        opts: &CreateOptions,
     ) -> Result<StreamMeta> {
-        // Verify the source exists by calling head — returns NotFound if absent.
         let source_meta = self.head(source)?;
-        self.create(dest, &source_meta.content_type, tags, &CreateOptions::default())?;
-        let read = self.read(source, &Offset::beginning(), usize::MAX)?;
-        for event in read.events {
-            if event.offset > *up_to {
-                break;
+
+        let ct = match content_type {
+            Some(ct) if *ct != source_meta.content_type => {
+                return Err(StreamError::AlreadyExists(dest.clone()));
             }
-            self.append(
-                dest,
-                AppendRequest {
-                    data: event.data,
-                    producer_id: None,
-                    epoch: None,
-                    seq: None,
-                    stream_seq: None,
-                },
-            )?;
+            Some(ct) => ct.clone(),
+            None => source_meta.content_type.clone(),
+        };
+
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let now = now_micros();
+
+        let fork_off = if fork_offset.is_now() {
+            source_meta.next_offset.as_ref().map_or(String::new(), |o| o.0.clone())
+        } else if fork_offset.is_beginning() {
+            String::new()
+        } else {
+            fork_offset.0.clone()
+        };
+
+        let tags_json = serde_json::to_string(&tags.unwrap_or_default())
+            .unwrap_or_else(|_| "{}".to_owned());
+        let state_str = if opts.closed { "closed" } else { "open" };
+        let closed_at: Option<i64> = if opts.closed { Some(now) } else { None };
+        #[expect(clippy::cast_possible_wrap, reason = "TTL seconds fit in i64")]
+        let ttl_secs: Option<i64> = opts.ttl.map(|d| d.as_secs() as i64);
+
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO streams (id, content_type, state, created_at, closed_at, ttl_seconds, expires_at, tags_json, forked_from, fork_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![dest.0, ct.as_mime(), state_str, now, closed_at, ttl_secs, opts.expires_at, tags_json, source.0, fork_off],
+        )?;
+
+        if rows == 0 {
+            drop(conn);
+            return self.head(dest);
         }
+
+        conn.execute(
+            "UPDATE streams SET ref_count = ref_count + 1 WHERE id = ?1",
+            params![source.0],
+        )?;
+        drop(conn);
+
         self.head(dest)
     }
 
@@ -966,11 +1152,11 @@ mod tests {
 
         s.delete(&id).expect("delete");
 
-        // Read should fail with Deleted.
+        // Hard-delete (no forks): row is gone, read returns NotFound.
         let err = s
             .read(&id, &Offset::beginning(), 100)
             .expect_err("read deleted");
-        assert!(matches!(err, StreamError::Deleted(_)));
+        assert!(matches!(err, StreamError::NotFound(_)));
     }
 
     #[test]
@@ -1167,7 +1353,7 @@ mod tests {
         }).expect("append 3");
 
         let dest = StreamId("fork-dest".to_owned());
-        let meta = store.fork(&src, &r2.offset, &dest, None).expect("fork");
+        let meta = store.fork(&src, &r2.offset, &dest, None, None, &CreateOptions::default()).expect("fork");
         assert_eq!(meta.id.0, "fork-dest");
 
         let read = store.read(&dest, &Offset::beginning(), 100).expect("read fork");
@@ -1175,7 +1361,6 @@ mod tests {
         assert_eq!(read.events[0].data, b"event-1");
         assert_eq!(read.events[1].data, b"event-2");
 
-        // Suppress unused warning
         let _ = r1;
     }
 
@@ -1184,7 +1369,7 @@ mod tests {
         let store = SqliteStore::open_in_memory().expect("store");
         let src = StreamId("nope".to_owned());
         let dest = StreamId("fork-dest".to_owned());
-        let result = store.fork(&src, &Offset::beginning(), &dest, None);
+        let result = store.fork(&src, &Offset::beginning(), &dest, None, None, &CreateOptions::default());
         assert!(result.is_err(), "fork of nonexistent source should fail");
     }
 
@@ -1194,10 +1379,48 @@ mod tests {
         let src = StreamId("empty-src".to_owned());
         store.create(&src, &ContentType::OctetStream, None, &CreateOptions::default()).expect("create");
         let dest = StreamId("fork-empty".to_owned());
-        let meta = store.fork(&src, &Offset::now(), &dest, None).expect("fork");
+        let meta = store.fork(&src, &Offset::now(), &dest, None, None, &CreateOptions::default()).expect("fork");
         assert_eq!(meta.id.0, "fork-empty");
         let read = store.read(&dest, &Offset::beginning(), 100).expect("read");
         assert_eq!(read.events.len(), 0);
+    }
+
+    #[test]
+    fn fork_shares_offset_space() {
+        let s = store();
+        let src = stream_id("src-shared");
+        s.create(&src, &ContentType::OctetStream, None, &CreateOptions::default()).unwrap();
+        let r1 = append(&s, &src, b"event-1");
+        let r2 = append(&s, &src, b"event-2");
+
+        let dest = stream_id("fork-shared");
+        s.fork(&src, &r2.offset, &dest, None, None, &CreateOptions::default()).unwrap();
+
+        let read = s.read(&dest, &Offset::beginning(), 100).unwrap();
+        assert_eq!(read.events.len(), 2);
+        assert_eq!(read.events[0].offset, r1.offset);
+        assert_eq!(read.events[1].offset, r2.offset);
+    }
+
+    #[test]
+    fn soft_delete_with_forks() {
+        let s = store();
+        let src = stream_id("src-soft");
+        s.create(&src, &ContentType::OctetStream, None, &CreateOptions::default()).unwrap();
+        append(&s, &src, b"data");
+
+        let dest = stream_id("fork-soft");
+        s.fork(&src, &Offset::now(), &dest, None, None, &CreateOptions::default()).unwrap();
+
+        s.delete(&src).unwrap();
+
+        assert!(matches!(s.head(&src), Err(StreamError::Deleted(_))));
+
+        let read = s.read(&dest, &Offset::beginning(), 100).unwrap();
+        assert_eq!(read.events.len(), 1);
+
+        s.delete(&dest).unwrap();
+        assert!(matches!(s.head(&src), Err(StreamError::NotFound(_))));
     }
 
     // -----------------------------------------------------------------------

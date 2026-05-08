@@ -151,8 +151,8 @@ impl<S: StreamStore> DurableStream<S> {
         self.store.list(tag_filter)
     }
 
-    /// Creates a new stream by copying events from `source` up to and
-    /// including `up_to` offset into `dest`.
+    /// Creates a new stream that stitches reads from `source` up to `fork_offset`
+    /// with the fork's own events, sharing the source's offset space.
     ///
     /// # Errors
     ///
@@ -161,11 +161,13 @@ impl<S: StreamStore> DurableStream<S> {
     pub fn fork(
         &self,
         source: &StreamId,
-        up_to: &Offset,
+        fork_offset: &Offset,
         dest: &StreamId,
+        content_type: Option<&ContentType>,
         tags: Option<HashMap<String, String>>,
+        opts: &CreateOptions,
     ) -> Result<StreamMeta> {
-        self.store.fork(source, up_to, dest, tags)
+        self.store.fork(source, fork_offset, dest, content_type, tags, opts)
     }
 
     /// Registers a producer on a stream, returning its new epoch.
