@@ -100,6 +100,10 @@ impl<S: StreamStore> DurableStream<S> {
     /// Closes the stream in the store and sends a [`crate::hub::LiveEvent::Closed`]
     /// event to all live subscribers.
     ///
+    /// Idempotent: closing an already-closed stream succeeds and returns the
+    /// current metadata unchanged. The hub is still notified so late subscribers
+    /// receive the `Closed` signal.
+    ///
     /// # Errors
     ///
     /// Propagates any error from the underlying store.
@@ -107,6 +111,25 @@ impl<S: StreamStore> DurableStream<S> {
         let meta = self.store.close(id)?;
         self.hub.close_stream(id);
         Ok(meta)
+    }
+
+    /// Atomically appends an event and closes the stream in a single operation,
+    /// then notifies live subscribers.
+    ///
+    /// If the append is a duplicate, the hub is **not** notified for the data
+    /// event. The stream-closed notification is always sent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from the underlying store.
+    pub fn append_and_close(&self, id: &StreamId, req: AppendRequest) -> Result<AppendResult> {
+        let data_for_hub = req.data.clone();
+        let result = self.store.append_and_close(id, req)?;
+        if !result.deduplicated {
+            self.hub.notify(id, result.offset.clone(), data_for_hub);
+        }
+        self.hub.close_stream(id);
+        Ok(result)
     }
 
     /// Deletes the stream.
@@ -201,6 +224,7 @@ mod tests {
                 producer_id: None,
                 epoch: None,
                 seq: None,
+                stream_seq: None,
             },
         )
         .expect("append");
@@ -234,6 +258,7 @@ mod tests {
             producer_id: Some(ProducerId("p".to_owned())),
             epoch: Some(ProducerEpoch(1)),
             seq: Some(ProducerSeq(0)),
+            stream_seq: None,
         };
 
         // First append — real; should notify.

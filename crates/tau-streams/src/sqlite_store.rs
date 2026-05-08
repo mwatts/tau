@@ -83,7 +83,8 @@ impl SqliteStore {
                 closed_at    INTEGER,
                 ttl_seconds  INTEGER,
                 expires_at   INTEGER,
-                tags_json    TEXT NOT NULL DEFAULT '{}'
+                tags_json    TEXT NOT NULL DEFAULT '{}',
+                last_seq     TEXT
             );
 
             CREATE TABLE IF NOT EXISTS stream_events (
@@ -322,6 +323,54 @@ impl StreamStore for SqliteStore {
                     deduplicated: true,
                 });
             }
+
+            // Check for sequence gap (seq must be exactly lastSeq + 1 for same epoch)
+            let last_producer_seq: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(seq) FROM stream_events
+                     WHERE stream_id = ?1 AND producer_id = ?2 AND epoch = ?3",
+                    params![id.0, pid.0, epoch_val],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            if let Some(last) = last_producer_seq {
+                let expected = last + 1;
+                if seq_val != expected {
+                    if seq_val > expected {
+                        #[expect(
+                            clippy::cast_sign_loss,
+                            reason = "values came from u64; sign loss is not possible"
+                        )]
+                        return Err(StreamError::ProducerSequenceGap {
+                            expected: expected as u64,
+                            received: seq_val as u64,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Stream-Seq validation (§5.2): reject if received <= last accepted.
+        if let Some(ref seq) = req.stream_seq {
+            let last: Option<String> = conn
+                .query_row(
+                    "SELECT last_seq FROM streams WHERE id = ?1",
+                    params![id.0],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            if let Some(ref last_val) = last {
+                if seq.0 <= *last_val {
+                    return Err(StreamError::SequenceRegression {
+                        received: seq.0.clone(),
+                        last: last_val.clone(),
+                    });
+                }
+            }
         }
 
         let offset = self.offset_gen.next();
@@ -345,6 +394,13 @@ impl StreamStore for SqliteStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![offset.0, id.0, req.data, now, producer_id, epoch, seq],
         )?;
+
+        if let Some(ref seq) = req.stream_seq {
+            conn.execute(
+                "UPDATE streams SET last_seq = ?1 WHERE id = ?2",
+                params![seq.0, id.0],
+            )?;
+        }
         drop(conn);
 
         let next = self.offset_gen.next();
@@ -684,6 +740,7 @@ impl StreamStore for SqliteStore {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )?;
         }
@@ -753,7 +810,7 @@ impl StreamStore for SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ProducerEpoch, ProducerId, ProducerSeq};
+    use crate::types::{ProducerEpoch, ProducerId, ProducerSeq, StreamSeq};
 
     fn store() -> SqliteStore {
         SqliteStore::open_in_memory().expect("in-memory store")
@@ -772,6 +829,7 @@ mod tests {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )
             .expect("append failed")
@@ -844,6 +902,7 @@ mod tests {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )
             .expect("append_and_close");
@@ -869,6 +928,7 @@ mod tests {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )
             .expect_err("should fail");
@@ -952,6 +1012,7 @@ mod tests {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )
             .expect_err("append to closed");
@@ -983,6 +1044,7 @@ mod tests {
             producer_id: Some(pid.clone()),
             epoch: Some(ProducerEpoch(1)),
             seq: Some(ProducerSeq(0)),
+            stream_seq: None,
         };
 
         let r1 = s.append(&id, req()).expect("first append");
@@ -1013,6 +1075,7 @@ mod tests {
                 producer_id: Some(pid.clone()),
                 epoch: Some(ProducerEpoch(5)),
                 seq: Some(ProducerSeq(0)),
+                stream_seq: None,
             },
         )
         .expect("epoch 5 append");
@@ -1026,6 +1089,7 @@ mod tests {
                     producer_id: Some(pid.clone()),
                     epoch: Some(ProducerEpoch(3)),
                     seq: Some(ProducerSeq(0)),
+                    stream_seq: None,
                 },
             )
             .expect_err("should be fenced");
@@ -1072,13 +1136,13 @@ mod tests {
         store.create(&src, &ContentType::OctetStream, None).expect("create src");
 
         let r1 = store.append(&src, AppendRequest {
-            data: b"event-1".to_vec(), producer_id: None, epoch: None, seq: None,
+            data: b"event-1".to_vec(), producer_id: None, epoch: None, seq: None, stream_seq: None,
         }).expect("append 1");
         let r2 = store.append(&src, AppendRequest {
-            data: b"event-2".to_vec(), producer_id: None, epoch: None, seq: None,
+            data: b"event-2".to_vec(), producer_id: None, epoch: None, seq: None, stream_seq: None,
         }).expect("append 2");
         let _r3 = store.append(&src, AppendRequest {
-            data: b"event-3".to_vec(), producer_id: None, epoch: None, seq: None,
+            data: b"event-3".to_vec(), producer_id: None, epoch: None, seq: None, stream_seq: None,
         }).expect("append 3");
 
         let dest = StreamId("fork-dest".to_owned());
@@ -1167,6 +1231,7 @@ mod tests {
             producer_id: Some(pid_a.clone()),
             epoch: Some(epoch_a),
             seq: Some(ProducerSeq(0)),
+            stream_seq: None,
         }).expect("a writes");
 
         store.append(&id, AppendRequest {
@@ -1174,6 +1239,7 @@ mod tests {
             producer_id: Some(pid_b.clone()),
             epoch: Some(epoch_b),
             seq: Some(ProducerSeq(0)),
+            stream_seq: None,
         }).expect("b writes");
 
         // Re-register writer-a bumps epoch, fencing old
@@ -1186,6 +1252,7 @@ mod tests {
             producer_id: Some(pid_a.clone()),
             epoch: Some(epoch_a),
             seq: Some(ProducerSeq(1)),
+            stream_seq: None,
         });
         assert!(matches!(fenced, Err(crate::error::StreamError::ProducerFenced { .. })));
 
@@ -1195,6 +1262,7 @@ mod tests {
             producer_id: Some(pid_a),
             epoch: Some(epoch_a2),
             seq: Some(ProducerSeq(0)),
+            stream_seq: None,
         }).expect("new epoch");
 
         // writer-b unaffected
@@ -1203,6 +1271,7 @@ mod tests {
             producer_id: Some(pid_b),
             epoch: Some(epoch_b),
             seq: Some(ProducerSeq(1)),
+            stream_seq: None,
         }).expect("b still works");
 
         let read = store.read(&id, &Offset::beginning(), 100).expect("read");
@@ -1281,5 +1350,48 @@ mod tests {
             Some(last.offset),
             "next_offset should equal the last appended offset"
         );
+    }
+
+    #[test]
+    fn stream_seq_rejects_regression() {
+        let s = store();
+        let id = stream_id("seq-test");
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
+        s.append(&id, AppendRequest {
+            data: b"a".to_vec(),
+            producer_id: None, epoch: None, seq: None,
+            stream_seq: Some(StreamSeq("002".to_owned())),
+        }).unwrap();
+
+        let err = s.append(&id, AppendRequest {
+            data: b"b".to_vec(),
+            producer_id: None, epoch: None, seq: None,
+            stream_seq: Some(StreamSeq("001".to_owned())),
+        }).expect_err("should reject");
+        assert!(matches!(err, StreamError::SequenceRegression { .. }));
+    }
+
+    #[test]
+    fn producer_sequence_gap_detected() {
+        let s = store();
+        let id = stream_id("gap-test");
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
+        let pid = ProducerId("p".to_owned());
+        s.append(&id, AppendRequest {
+            data: b"seq0".to_vec(),
+            producer_id: Some(pid.clone()),
+            epoch: Some(ProducerEpoch(0)),
+            seq: Some(ProducerSeq(0)),
+            stream_seq: None,
+        }).unwrap();
+
+        let err = s.append(&id, AppendRequest {
+            data: b"seq5".to_vec(),
+            producer_id: Some(pid),
+            epoch: Some(ProducerEpoch(0)),
+            seq: Some(ProducerSeq(5)),
+            stream_seq: None,
+        }).expect_err("should detect gap");
+        assert!(matches!(err, StreamError::ProducerSequenceGap { expected: 1, received: 5 }));
     }
 }

@@ -40,6 +40,7 @@ impl StreamDb {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 };
                 if let Err(e) = ds.append(&stream_id, req) {
                     tracing::warn!(session_id, %e, "stream append failed (legacy write succeeded)");
@@ -76,7 +77,7 @@ impl StreamDb {
             };
             let data = meta_event.to_ndjson_bytes("server");
             let _ = ds.append(&stream_id, tau_streams::AppendRequest {
-                data, producer_id: None, epoch: None, seq: None,
+                data, producer_id: None, epoch: None, seq: None, stream_seq: None,
             });
         }
         Ok(())
@@ -102,7 +103,7 @@ impl StreamDb {
             };
             let data = event.to_ndjson_bytes("server");
             let _ = ds.append(&stream_id, tau_streams::AppendRequest {
-                data, producer_id: None, epoch: None, seq: None,
+                data, producer_id: None, epoch: None, seq: None, stream_seq: None,
             });
         }
         Ok(())

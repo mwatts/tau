@@ -114,6 +114,7 @@ pub(super) fn emit_system_event(state: &SharedState, event: crate::stream_events
         producer_id: Some(tau_streams::ProducerId(daemon_id)),
         epoch: None,
         seq: None,
+        stream_seq: None,
     };
     if let Err(e) = ds.append(&stream_id, req) {
         tracing::warn!(%e, "failed to emit system event");
@@ -144,6 +145,7 @@ pub(super) fn emit_task_event(
         producer_id: None,
         epoch: None,
         seq: None,
+        stream_seq: None,
     };
     if let Err(e) = ds.append(&stream_id, req) {
         tracing::warn!(task_id, %e, "failed to emit task event");
@@ -184,6 +186,7 @@ pub(super) fn emit_coordination_event(
         producer_id: Some(tau_streams::ProducerId(source.to_owned())),
         epoch: None,
         seq: None,
+        stream_seq: None,
     };
     if let Err(e) = ds.append(&stream_id, req) {
         tracing::warn!(group_id, %e, "failed to emit coordination event");

@@ -3536,6 +3536,7 @@ fn dispatch_stream_append(
         producer_id: producer_id.map(|s| ProducerId(s.to_string())),
         epoch: producer_epoch.map(ProducerEpoch),
         seq: producer_seq.map(ProducerSeq),
+        stream_seq: None,
     };
     match ds.append(&StreamId(id.to_string()), req) {
         Ok(result) => crate::protocol::Response::StreamAppended {

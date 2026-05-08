@@ -35,6 +35,20 @@ pub enum StreamError {
         expected: u64,
     },
 
+    /// Stream-Seq regression: received value is <= the last accepted value.
+    #[error("sequence regression: received {received} <= last {last}")]
+    SequenceRegression {
+        received: String,
+        last: String,
+    },
+
+    /// Producer sequence gap: expected contiguous sequence but got a gap.
+    #[error("producer sequence gap: expected {expected}, received {received}")]
+    ProducerSequenceGap {
+        expected: u64,
+        received: u64,
+    },
+
     /// An underlying `SQLite` storage error.
     #[error("storage error: {0}")]
     Storage(#[from] rusqlite::Error),

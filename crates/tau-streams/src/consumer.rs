@@ -262,6 +262,7 @@ mod tests {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )
             .expect("append hist1");
@@ -273,6 +274,7 @@ mod tests {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )
             .expect("append hist2");
@@ -375,6 +377,7 @@ mod tests {
                     producer_id: None,
                     epoch: None,
                     seq: None,
+                    stream_seq: None,
                 },
             )
             .expect("append");

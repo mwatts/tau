@@ -21,7 +21,7 @@ use axum::routing::{get, put};
 use axum::Router;
 use tau_streams::{
     AppendRequest, ContentType, DurableStream, Offset, ProducerEpoch, ProducerId, ProducerSeq,
-    SqliteStore, StreamError, StreamId, StreamMeta, StreamState,
+    SqliteStore, StreamError, StreamId, StreamMeta, StreamSeq, StreamState,
 };
 
 use crate::routes::AppState;
@@ -92,6 +92,19 @@ pub(crate) fn stream_error_response(err: StreamError) -> Response {
         }
         StreamError::ProducerFenced { .. } => {
             (StatusCode::FORBIDDEN, err.to_string()).into_response()
+        }
+        StreamError::SequenceRegression { .. } => {
+            (StatusCode::CONFLICT, err.to_string()).into_response()
+        }
+        StreamError::ProducerSequenceGap { expected, received } => {
+            let mut headers = HeaderMap::new();
+            if let Ok(v) = HeaderValue::from_str(&expected.to_string()) {
+                headers.insert("producer-expected-seq", v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&received.to_string()) {
+                headers.insert("producer-received-seq", v);
+            }
+            (StatusCode::CONFLICT, headers, err.to_string()).into_response()
         }
         StreamError::Storage(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
@@ -280,6 +293,11 @@ pub async fn append_or_close(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
+    let stream_seq = headers
+        .get("stream-seq")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| StreamSeq(s.to_owned()));
+
     // All three must be present together or none.
     let has_any = producer_id.is_some() || producer_epoch.is_some() || producer_seq.is_some();
     let has_all = producer_id.is_some() && producer_epoch.is_some() && producer_seq.is_some();
@@ -299,6 +317,7 @@ pub async fn append_or_close(
         producer_id: producer_id.map(ProducerId),
         epoch: producer_epoch.map(ProducerEpoch),
         seq: producer_seq.map(ProducerSeq),
+        stream_seq,
     };
 
     // §5.2: Stream-Closed: true with a non-empty body → atomic append-and-close.

@@ -105,6 +105,11 @@ pub struct ProducerEpoch(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProducerSeq(pub u64);
 
+/// Application-layer sequence number for cross-restart ordering (§5.2).
+/// Opaque string; compared lexicographically.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StreamSeq(pub String);
+
 /// Information about a registered producer on a stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProducerInfo {
@@ -246,6 +251,8 @@ pub struct AppendRequest {
     pub epoch: Option<ProducerEpoch>,
     /// Per-epoch sequence number; required when `producer_id` is set.
     pub seq: Option<ProducerSeq>,
+    /// Optional application-layer sequence for cross-restart ordering (§5.2).
+    pub stream_seq: Option<StreamSeq>,
 }
 
 /// Result of a successful append operation.
