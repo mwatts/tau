@@ -205,8 +205,21 @@ impl StreamStore for SqliteStore {
         drop(conn);
 
         if rows_changed == 0 {
-            // Idempotent: return existing metadata.
-            return self.head(id);
+            let existing = self.head(id)?;
+            if existing.content_type != *content_type {
+                return Err(StreamError::AlreadyExists(id.clone()));
+            }
+            let existing_closed = existing.state == StreamState::Closed;
+            if existing_closed != opts.closed {
+                return Err(StreamError::AlreadyExists(id.clone()));
+            }
+            if opts.ttl.is_some() && existing.ttl != opts.ttl {
+                return Err(StreamError::AlreadyExists(id.clone()));
+            }
+            if opts.expires_at.is_some() && existing.expires_at != opts.expires_at {
+                return Err(StreamError::AlreadyExists(id.clone()));
+            }
+            return Ok(existing);
         }
 
         let state = if opts.closed { StreamState::Closed } else { StreamState::Open };
@@ -1308,9 +1321,9 @@ mod tests {
             .expect("create with NdJson");
         assert_eq!(meta.content_type, ContentType::NdJson);
 
-        // Idempotent second call — returns existing row with correct type.
+        // Idempotent second call with same config — returns existing row with correct type.
         let meta2 = s
-            .create(&id, &ContentType::OctetStream, None, &CreateOptions::default())
+            .create(&id, &ContentType::NdJson, None, &CreateOptions::default())
             .expect("idempotent create");
         assert_eq!(meta2.content_type, ContentType::NdJson, "idempotent create must not overwrite content_type");
     }
@@ -1419,5 +1432,36 @@ mod tests {
         let opts = CreateOptions { closed: true, ..Default::default() };
         let meta = s.create(&id, &ContentType::OctetStream, None, &opts).unwrap();
         assert_eq!(meta.state, StreamState::Closed);
+    }
+
+    #[test]
+    fn idempotent_create_matching_config() {
+        let s = store();
+        let id = stream_id("idemp");
+        let opts = CreateOptions::default();
+        s.create(&id, &ContentType::Json, None, &opts).unwrap();
+        let meta2 = s.create(&id, &ContentType::Json, None, &opts).expect("same config should succeed");
+        assert_eq!(meta2.content_type, ContentType::Json);
+    }
+
+    #[test]
+    fn create_conflict_on_content_type_mismatch() {
+        let s = store();
+        let id = stream_id("conflict");
+        let opts = CreateOptions::default();
+        s.create(&id, &ContentType::Json, None, &opts).unwrap();
+        let err = s.create(&id, &ContentType::OctetStream, None, &opts).expect_err("should conflict");
+        assert!(matches!(err, StreamError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn create_conflict_on_closure_mismatch() {
+        let s = store();
+        let id = stream_id("close-conflict");
+        s.create(&id, &ContentType::OctetStream, None, &CreateOptions::default()).unwrap();
+        let err = s
+            .create(&id, &ContentType::OctetStream, None, &CreateOptions { closed: true, ..Default::default() })
+            .expect_err("should conflict");
+        assert!(matches!(err, StreamError::AlreadyExists(_)));
     }
 }
