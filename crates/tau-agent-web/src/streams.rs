@@ -106,6 +106,9 @@ pub(crate) fn stream_error_response(err: StreamError) -> Response {
             }
             (StatusCode::CONFLICT, headers, err.to_string()).into_response()
         }
+        StreamError::InvalidInput(_) => {
+            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+        }
         StreamError::Storage(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
@@ -477,6 +480,46 @@ pub async fn read_stream(
 
             match ds.read(&stream_id, &offset, limit) {
                 Ok(result) => {
+                    // Check if this is a JSON-mode stream and return a JSON array.
+                    let meta = ds.head(&stream_id).ok();
+                    let is_json = meta
+                        .as_ref()
+                        .map_or(false, |m| m.content_type == ContentType::Json);
+
+                    if is_json {
+                        let messages: Vec<serde_json::Value> = result
+                            .events
+                            .iter()
+                            .filter_map(|ev| serde_json::from_slice(&ev.data).ok())
+                            .collect();
+                        let body =
+                            serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_owned());
+
+                        let mut resp_headers = HeaderMap::new();
+                        resp_headers
+                            .insert("content-type", HeaderValue::from_static("application/json"));
+                        if let Ok(v) = HeaderValue::from_str(&result.next_offset.0) {
+                            resp_headers.insert("stream-next-offset", v);
+                        }
+                        if result.up_to_date {
+                            resp_headers.insert(
+                                "stream-up-to-date",
+                                HeaderValue::from_static("true"),
+                            );
+                        }
+                        if result.stream_closed && result.up_to_date {
+                            resp_headers
+                                .insert("stream-closed", HeaderValue::from_static("true"));
+                        }
+                        if result.up_to_date {
+                            resp_headers.insert(
+                                "cache-control",
+                                HeaderValue::from_static("public, max-age=31536000, immutable"),
+                            );
+                        }
+                        return (StatusCode::OK, resp_headers, body).into_response();
+                    }
+
                     let mut lines = String::new();
                     for ev in &result.events {
                         let line = serde_json::json!({

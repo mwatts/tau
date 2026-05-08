@@ -49,6 +49,10 @@ pub enum StreamError {
         received: u64,
     },
 
+    /// Invalid input data (e.g., malformed JSON for JSON-mode streams).
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     /// An underlying `SQLite` storage error.
     #[error("storage error: {0}")]
     Storage(#[from] rusqlite::Error),

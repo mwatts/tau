@@ -13,6 +13,7 @@ pub mod cursor;
 pub mod durable_stream;
 pub mod error;
 pub mod hub;
+pub mod json_mode;
 pub mod offset;
 pub mod sqlite_store;
 pub mod store;

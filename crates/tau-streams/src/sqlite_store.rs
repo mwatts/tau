@@ -501,6 +501,67 @@ impl StreamStore for SqliteStore {
             }
         }
 
+        // JSON mode: flatten array into individual messages (§7.1)
+        {
+            let content_type_str: String = conn.query_row(
+                "SELECT content_type FROM streams WHERE id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )?;
+
+            if content_type_str == "application/json" {
+                let messages = crate::json_mode::flatten_json_messages(&req.data)
+                    .map_err(|msg| StreamError::InvalidInput(msg.to_owned()))?;
+
+                let mut last_offset = None;
+                for msg in &messages {
+                    let data = serde_json::to_vec(msg).unwrap_or_default();
+                    let json_offset = self.offset_gen.next();
+                    let now = now_micros();
+                    #[expect(
+                        clippy::cast_possible_wrap,
+                        reason = "epoch/seq are far below i64::MAX in practice"
+                    )]
+                    let epoch: Option<i64> = req.epoch.map(|e| e.0 as i64);
+                    #[expect(
+                        clippy::cast_possible_wrap,
+                        reason = "epoch/seq are far below i64::MAX in practice"
+                    )]
+                    let seq: Option<i64> = req.seq.map(|s| s.0 as i64);
+                    conn.execute(
+                        "INSERT INTO stream_events (offset, stream_id, data, created_at, producer_id, epoch, seq)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            json_offset.0,
+                            id.0,
+                            data,
+                            now,
+                            req.producer_id.as_ref().map(|p| p.0.as_str()),
+                            epoch,
+                            seq
+                        ],
+                    )?;
+                    last_offset = Some(json_offset);
+                }
+
+                if let Some(ref seq) = req.stream_seq {
+                    conn.execute(
+                        "UPDATE streams SET last_seq = ?1 WHERE id = ?2",
+                        params![seq.0, id.0],
+                    )?;
+                }
+                drop(conn);
+
+                let last = last_offset.expect("at least one message");
+                let next = self.offset_gen.next();
+                return Ok(AppendResult {
+                    next_offset: next,
+                    offset: last,
+                    deduplicated: false,
+                });
+            }
+        }
+
         let offset = self.offset_gen.next();
         let now = now_micros();
 
@@ -1675,6 +1736,55 @@ mod tests {
         s.create(&id, &ContentType::Json, None, &opts).unwrap();
         let err = s.create(&id, &ContentType::OctetStream, None, &opts).expect_err("should conflict");
         assert!(matches!(err, StreamError::AlreadyExists(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON-mode tests (§7.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_stream_stores_individual_messages() {
+        let s = store();
+        let id = stream_id("json-store");
+        s.create(&id, &ContentType::Json, None, &CreateOptions::default()).unwrap();
+        s.append(&id, AppendRequest {
+            data: br#"[{"x":1},{"x":2}]"#.to_vec(),
+            producer_id: None, epoch: None, seq: None, stream_seq: None,
+        }).unwrap();
+
+        let result = s.read(&id, &Offset::beginning(), 100).unwrap();
+        assert_eq!(result.events.len(), 2);
+
+        let v0: serde_json::Value = serde_json::from_slice(&result.events[0].data).unwrap();
+        assert_eq!(v0["x"], 1);
+        let v1: serde_json::Value = serde_json::from_slice(&result.events[1].data).unwrap();
+        assert_eq!(v1["x"], 2);
+    }
+
+    #[test]
+    fn json_stream_single_object() {
+        let s = store();
+        let id = stream_id("json-single");
+        s.create(&id, &ContentType::Json, None, &CreateOptions::default()).unwrap();
+        s.append(&id, AppendRequest {
+            data: br#"{"msg":"hello"}"#.to_vec(),
+            producer_id: None, epoch: None, seq: None, stream_seq: None,
+        }).unwrap();
+
+        let result = s.read(&id, &Offset::beginning(), 100).unwrap();
+        assert_eq!(result.events.len(), 1);
+    }
+
+    #[test]
+    fn json_stream_rejects_empty_array() {
+        let s = store();
+        let id = stream_id("json-empty");
+        s.create(&id, &ContentType::Json, None, &CreateOptions::default()).unwrap();
+        let err = s.append(&id, AppendRequest {
+            data: b"[]".to_vec(),
+            producer_id: None, epoch: None, seq: None, stream_seq: None,
+        }).expect_err("should reject empty array");
+        assert!(matches!(err, StreamError::InvalidInput(_)));
     }
 
     #[test]
