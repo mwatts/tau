@@ -437,6 +437,20 @@ impl StreamStore for SqliteStore {
                 }
             }
 
+            // New epoch (or first-ever append for this producer) must start at seq 0.
+            if current_epoch.is_none() && seq_val != 0 {
+                return Err(StreamError::InvalidInput(format!(
+                    "first append for producer must start at seq 0, got {seq_val}"
+                )));
+            }
+            if let Some(current) = current_epoch {
+                if epoch_val > current && seq_val != 0 {
+                    return Err(StreamError::InvalidInput(format!(
+                        "new epoch must start at seq 0, got {seq_val}"
+                    )));
+                }
+            }
+
             // Check for existing duplicate (same producer_id + epoch + seq).
             let existing: Option<String> = conn
                 .query_row(

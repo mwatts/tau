@@ -90,8 +90,12 @@ pub(crate) fn stream_error_response(err: StreamError) -> Response {
         StreamError::OffsetExpired(_) => {
             (StatusCode::GONE, err.to_string()).into_response()
         }
-        StreamError::ProducerFenced { .. } => {
-            (StatusCode::FORBIDDEN, err.to_string()).into_response()
+        StreamError::ProducerFenced { expected, .. } => {
+            let mut headers = HeaderMap::new();
+            if let Ok(v) = HeaderValue::from_str(&expected.to_string()) {
+                headers.insert("producer-epoch", v);
+            }
+            (StatusCode::FORBIDDEN, headers, err.to_string()).into_response()
         }
         StreamError::SequenceRegression { .. } => {
             (StatusCode::CONFLICT, err.to_string()).into_response()
@@ -355,9 +359,11 @@ pub async fn append_or_close(
         return (StatusCode::BAD_REQUEST, "empty body requires Stream-Closed: true").into_response();
     }
 
-    // §5.2: Validate Content-Type matches the stream's configured type.
-    if let Some(req_ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
-        let req_content_type = tau_streams::ContentType::from_mime(req_ct);
+    // §5.2: Validate Content-Type: if provided, must match stream's type.
+    // If absent and body present, require the Content-Type header.
+    let req_ct = headers.get("content-type").and_then(|v| v.to_str().ok());
+    if let Some(ct_str) = req_ct {
+        let req_content_type = tau_streams::ContentType::from_mime(ct_str);
         match ds.head(&stream_id) {
             Ok(meta) => {
                 if req_content_type != meta.content_type {
@@ -367,6 +373,9 @@ pub async fn append_or_close(
             }
             Err(e) => return stream_error_response(e),
         }
+    } else {
+        return (StatusCode::BAD_REQUEST, "Content-Type header required when body is present")
+            .into_response();
     }
 
     // §5.2.1: Parse producer identity from HTTP headers (not query params).
@@ -374,6 +383,9 @@ pub async fn append_or_close(
         .get("producer-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
+    if producer_id.as_ref().map_or(false, |s| s.is_empty()) {
+        return (StatusCode::BAD_REQUEST, "Producer-Id must not be empty").into_response();
+    }
     let producer_epoch = headers
         .get("producer-epoch")
         .and_then(|v| v.to_str().ok())
