@@ -169,6 +169,7 @@ fn row_to_meta(
         }),
         expires_at,
         tags,
+        next_offset: None,
     })
 }
 
@@ -180,18 +181,20 @@ impl StreamStore for SqliteStore {
     fn create(
         &self,
         id: &StreamId,
+        content_type: &ContentType,
         tags: Option<HashMap<String, String>>,
     ) -> Result<StreamMeta> {
         let conn = self.conn.lock().expect("mutex poisoned");
         let now = now_micros();
         let tags_json = serde_json::to_string(&tags.unwrap_or_default())
             .unwrap_or_else(|_| "{}".to_owned());
+        let mime = content_type.as_mime();
 
         // INSERT OR IGNORE for idempotent create.
         let rows_changed = conn.execute(
             "INSERT OR IGNORE INTO streams (id, content_type, state, created_at, tags_json)
-             VALUES (?1, 'application/octet-stream', 'open', ?2, ?3)",
-            params![id.0, now, tags_json],
+             VALUES (?1, ?2, 'open', ?3, ?4)",
+            params![id.0, mime, now, tags_json],
         )?;
         drop(conn);
 
@@ -202,13 +205,14 @@ impl StreamStore for SqliteStore {
 
         Ok(StreamMeta {
             id: id.clone(),
-            content_type: ContentType::OctetStream,
+            content_type: content_type.clone(),
             state: StreamState::Open,
             created_at: now,
             closed_at: None,
             ttl: None,
             expires_at: None,
             tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+            next_offset: None,
         })
     }
 
@@ -450,12 +454,25 @@ impl StreamStore for SqliteStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
             )
             .optional()?;
-        drop(conn);
 
         let (sid, ct, state, created, closed, ttl_secs, expires, tags_json) =
             row.ok_or_else(|| StreamError::NotFound(id.clone()))?;
 
-        row_to_meta(sid, &ct, &state, created, closed, ttl_secs, expires, &tags_json).map_err(StreamError::Storage)
+        // Query the tail offset for the stream.
+        let tail: Option<String> = conn
+            .query_row(
+                "SELECT MAX(offset) FROM stream_events WHERE stream_id = ?1",
+                params![id.0],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        drop(conn);
+
+        let mut meta = row_to_meta(sid, &ct, &state, created, closed, ttl_secs, expires, &tags_json)
+            .map_err(StreamError::Storage)?;
+        meta.next_offset = Some(tail.map_or_else(Offset::now, Offset));
+        Ok(meta)
     }
 
     fn close(&self, id: &StreamId) -> Result<StreamMeta> {
@@ -569,8 +586,8 @@ impl StreamStore for SqliteStore {
         tags: Option<HashMap<String, String>>,
     ) -> Result<StreamMeta> {
         // Verify the source exists by calling head — returns NotFound if absent.
-        self.head(source)?;
-        self.create(dest, tags)?;
+        let source_meta = self.head(source)?;
+        self.create(dest, &source_meta.content_type, tags)?;
         let read = self.read(source, &Offset::beginning(), usize::MAX)?;
         for event in read.events {
             if event.offset > *up_to {
@@ -682,7 +699,7 @@ mod tests {
     fn create_and_head() {
         let s = store();
         let id = stream_id("my-stream");
-        let meta = s.create(&id, None).expect("create");
+        let meta = s.create(&id, &ContentType::OctetStream, None).expect("create");
         assert_eq!(meta.id, id);
         assert_eq!(meta.state, StreamState::Open);
 
@@ -694,8 +711,8 @@ mod tests {
     fn create_is_idempotent() {
         let s = store();
         let id = stream_id("dup");
-        let meta1 = s.create(&id, None).expect("first create");
-        let meta2 = s.create(&id, None).expect("second create should succeed");
+        let meta1 = s.create(&id, &ContentType::OctetStream, None).expect("first create");
+        let meta2 = s.create(&id, &ContentType::OctetStream, None).expect("second create should succeed");
         assert_eq!(meta1.id, meta2.id);
         assert_eq!(meta2.state, StreamState::Open);
     }
@@ -711,7 +728,7 @@ mod tests {
     fn close_and_reclose() {
         let s = store();
         let id = stream_id("closeable");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
         let meta = s.close(&id).expect("close");
         assert_eq!(meta.state, StreamState::Closed);
 
@@ -723,7 +740,7 @@ mod tests {
     fn delete_removes_events() {
         let s = store();
         let id = stream_id("deletable");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
         append(&s, &id, b"event1");
         append(&s, &id, b"event2");
 
@@ -740,7 +757,7 @@ mod tests {
     fn append_and_read() {
         let s = store();
         let id = stream_id("appendable");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
 
         append(&s, &id, b"hello");
         append(&s, &id, b"world");
@@ -757,7 +774,7 @@ mod tests {
     fn read_with_offset_resumes() {
         let s = store();
         let id = stream_id("resume");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
 
         append(&s, &id, b"a");
         let r1 = append(&s, &id, b"b");
@@ -773,7 +790,7 @@ mod tests {
     fn read_now_returns_empty() {
         let s = store();
         let id = stream_id("now-test");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
         append(&s, &id, b"pre-existing");
 
         let result = s.read(&id, &Offset::now(), 100).expect("read");
@@ -785,7 +802,7 @@ mod tests {
     fn append_to_closed_fails() {
         let s = store();
         let id = stream_id("closed-append");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
         s.close(&id).unwrap();
 
         let err = s
@@ -806,7 +823,7 @@ mod tests {
     fn read_closed_returns_data() {
         let s = store();
         let id = stream_id("closed-readable");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
         append(&s, &id, b"event");
         s.close(&id).unwrap();
 
@@ -819,7 +836,7 @@ mod tests {
     fn producer_dedup() {
         let s = store();
         let id = stream_id("dedup");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
 
         let pid = ProducerId("p1".to_owned());
         let req = || AppendRequest {
@@ -845,7 +862,7 @@ mod tests {
     fn producer_epoch_fencing() {
         let s = store();
         let id = stream_id("fencing");
-        s.create(&id, None).unwrap();
+        s.create(&id, &ContentType::OctetStream, None).unwrap();
 
         let pid = ProducerId("p2".to_owned());
 
@@ -886,8 +903,8 @@ mod tests {
         let mut tags = HashMap::new();
         tags.insert("env".to_owned(), "prod".to_owned());
 
-        s.create(&stream_id("s1"), Some(tags.clone())).unwrap();
-        s.create(&stream_id("s2"), None).unwrap();
+        s.create(&stream_id("s1"), &ContentType::OctetStream, Some(tags.clone())).unwrap();
+        s.create(&stream_id("s2"), &ContentType::OctetStream, None).unwrap();
 
         let all = s.list(None).expect("list all");
         assert_eq!(all.len(), 2);
@@ -900,8 +917,8 @@ mod tests {
     #[test]
     fn list_excludes_deleted() {
         let s = store();
-        s.create(&stream_id("keep"), None).unwrap();
-        s.create(&stream_id("gone"), None).unwrap();
+        s.create(&stream_id("keep"), &ContentType::OctetStream, None).unwrap();
+        s.create(&stream_id("gone"), &ContentType::OctetStream, None).unwrap();
         s.delete(&stream_id("gone")).unwrap();
 
         let all = s.list(None).expect("list");
@@ -913,7 +930,7 @@ mod tests {
     fn fork_copies_events_up_to_offset() {
         let store = SqliteStore::open_in_memory().expect("store");
         let src = StreamId("src".to_owned());
-        store.create(&src, None).expect("create src");
+        store.create(&src, &ContentType::OctetStream, None).expect("create src");
 
         let r1 = store.append(&src, AppendRequest {
             data: b"event-1".to_vec(), producer_id: None, epoch: None, seq: None,
@@ -951,7 +968,7 @@ mod tests {
     fn fork_empty_source_creates_empty_dest() {
         let store = SqliteStore::open_in_memory().expect("store");
         let src = StreamId("empty-src".to_owned());
-        store.create(&src, None).expect("create");
+        store.create(&src, &ContentType::OctetStream, None).expect("create");
         let dest = StreamId("fork-empty".to_owned());
         let meta = store.fork(&src, &Offset::now(), &dest, None).expect("fork");
         assert_eq!(meta.id.0, "fork-empty");
@@ -967,7 +984,7 @@ mod tests {
     fn register_producer_assigns_epoch() {
         let store = SqliteStore::open_in_memory().expect("store");
         let id = StreamId("multi".to_owned());
-        store.create(&id, None).expect("create");
+        store.create(&id, &ContentType::OctetStream, None).expect("create");
 
         let reg1 = store.register_producer(&id, &ProducerId("writer-a".to_owned())).expect("reg1");
         assert_eq!(reg1.0, 1);
@@ -983,7 +1000,7 @@ mod tests {
     fn list_producers_returns_registered() {
         let store = SqliteStore::open_in_memory().expect("store");
         let id = StreamId("multi-list".to_owned());
-        store.create(&id, None).expect("create");
+        store.create(&id, &ContentType::OctetStream, None).expect("create");
 
         store.register_producer(&id, &ProducerId("a".to_owned())).expect("reg");
         store.register_producer(&id, &ProducerId("b".to_owned())).expect("reg");
@@ -998,7 +1015,7 @@ mod tests {
     fn multi_writer_epoch_fencing() {
         let store = SqliteStore::open_in_memory().expect("store");
         let id = StreamId("fenced".to_owned());
-        store.create(&id, None).expect("create");
+        store.create(&id, &ContentType::OctetStream, None).expect("create");
 
         let pid_a = ProducerId("writer-a".to_owned());
         let pid_b = ProducerId("writer-b".to_owned());
@@ -1059,5 +1076,71 @@ mod tests {
         let id = StreamId("nope".to_owned());
         let result = store.register_producer(&id, &ProducerId("x".to_owned()));
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Content-type and next_offset tests (spec compliance)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_stores_explicit_content_type() {
+        let s = store();
+        let id = stream_id("ct-ndjson");
+
+        let meta = s
+            .create(&id, &ContentType::NdJson, None)
+            .expect("create with NdJson");
+        assert_eq!(meta.content_type, ContentType::NdJson);
+
+        // Idempotent second call — returns existing row with correct type.
+        let meta2 = s
+            .create(&id, &ContentType::OctetStream, None)
+            .expect("idempotent create");
+        assert_eq!(meta2.content_type, ContentType::NdJson, "idempotent create must not overwrite content_type");
+    }
+
+    #[test]
+    fn create_stores_custom_content_type() {
+        let s = store();
+        let id = stream_id("ct-custom");
+        let ct = ContentType::Custom("text/plain".to_owned());
+        let meta = s.create(&id, &ct, None).expect("create with custom type");
+        assert_eq!(meta.content_type, ct);
+
+        // Verify it round-trips through the database via head().
+        let head = s.head(&id).expect("head");
+        assert_eq!(head.content_type, ct);
+    }
+
+    #[test]
+    fn head_returns_next_offset_none_when_empty() {
+        let s = store();
+        let id = stream_id("empty-next-offset");
+        s.create(&id, &ContentType::OctetStream, None).expect("create");
+
+        let meta = s.head(&id).expect("head");
+        // Empty stream → next_offset is the "now" sentinel.
+        assert_eq!(
+            meta.next_offset,
+            Some(Offset::now()),
+            "empty stream next_offset should be now sentinel"
+        );
+    }
+
+    #[test]
+    fn head_returns_next_offset_after_appends() {
+        let s = store();
+        let id = stream_id("next-offset-after-appends");
+        s.create(&id, &ContentType::OctetStream, None).expect("create");
+
+        append(&s, &id, b"first");
+        let last = append(&s, &id, b"second");
+
+        let meta = s.head(&id).expect("head");
+        assert_eq!(
+            meta.next_offset,
+            Some(last.offset),
+            "next_offset should equal the last appended offset"
+        );
     }
 }

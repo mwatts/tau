@@ -63,7 +63,7 @@ impl StreamDb {
             if let Some(ref project) = session.project_name {
                 tags.insert("project".to_string(), project.clone());
             }
-            let _ = ds.create(&stream_id, Some(tags));
+            let _ = ds.create(&stream_id, &tau_streams::ContentType::NdJson, Some(tags));
 
             let meta_event = crate::stream_events::SessionEvent::SessionMeta {
                 key: "created".to_string(),
@@ -90,7 +90,7 @@ impl StreamDb {
 
         if let Some(ref ds) = self.streams {
             let stream_id = tau_streams::StreamId(format!("inbox-{target}"));
-            let _ = ds.create(&stream_id, {
+            let _ = ds.create(&stream_id, &tau_streams::ContentType::NdJson, {
                 let mut tags = std::collections::HashMap::new();
                 tags.insert("type".to_string(), "inbox".to_string());
                 tags.insert("session_id".to_string(), target.to_string());

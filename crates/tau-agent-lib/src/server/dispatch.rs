@@ -3496,16 +3496,17 @@ fn stream_not_configured() -> crate::protocol::Response {
 fn dispatch_stream_create(
     state: &super::state::SharedState,
     id: &str,
-    _content_type: Option<&str>,
+    content_type: Option<&str>,
     tags: Option<std::collections::HashMap<String, String>>,
 ) -> crate::protocol::Response {
-    use tau_streams::StreamId;
+    use tau_streams::{ContentType, StreamId};
     let st = lock_state(state);
     let Some(ref ds) = st.streams else {
         return stream_not_configured();
     };
     let stream_id = StreamId(id.to_string());
-    match ds.create(&stream_id, tags) {
+    let ct = content_type.map_or(ContentType::OctetStream, ContentType::from_mime);
+    match ds.create(&stream_id, &ct, tags) {
         Ok(_) => crate::protocol::Response::StreamCreated { id: id.to_string() },
         Err(e) => crate::protocol::Response::Error {
             message: format!("stream create failed: {e}"),

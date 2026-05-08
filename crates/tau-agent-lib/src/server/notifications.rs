@@ -102,7 +102,7 @@ pub(super) fn emit_system_event(state: &SharedState, event: crate::stream_events
     let Some(ref ds) = st.streams else { return };
     let daemon_id = format!("daemon-{}", std::process::id());
     let stream_id = tau_streams::StreamId(format!("system-{daemon_id}"));
-    let _ = ds.create(&stream_id, {
+    let _ = ds.create(&stream_id, &tau_streams::ContentType::NdJson, {
         let mut tags = std::collections::HashMap::new();
         tags.insert("type".to_string(), "system".to_string());
         tags.insert("daemon_id".to_string(), daemon_id.clone());
@@ -132,7 +132,7 @@ pub(super) fn emit_task_event(
     let st = lock_state(state);
     let Some(ref ds) = st.streams else { return };
     let stream_id = tau_streams::StreamId(format!("task-{task_id}"));
-    let _ = ds.create(&stream_id, {
+    let _ = ds.create(&stream_id, &tau_streams::ContentType::NdJson, {
         let mut tags = std::collections::HashMap::new();
         tags.insert("type".to_string(), "task".to_string());
         tags.insert("task_id".to_string(), task_id.to_string());
@@ -159,7 +159,7 @@ pub(super) fn create_coordination_group(
     let st = lock_state(state);
     let Some(ref ds) = st.streams else { return None };
     let stream_id = tau_streams::StreamId(format!("coord-{group_id}"));
-    let _ = ds.create(&stream_id, {
+    let _ = ds.create(&stream_id, &tau_streams::ContentType::NdJson, {
         let mut tags = std::collections::HashMap::new();
         tags.insert("type".to_string(), "coordination".to_string());
         tags.insert("group_id".to_string(), group_id.to_string());

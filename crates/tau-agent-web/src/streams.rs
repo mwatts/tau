@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Router;
 use tau_streams::{
-    AppendRequest, DurableStream, Offset, ProducerEpoch, ProducerId, ProducerSeq, SqliteStore,
-    StreamError, StreamId, StreamMeta, StreamState,
+    AppendRequest, ContentType, DurableStream, Offset, ProducerEpoch, ProducerId, ProducerSeq,
+    SqliteStore, StreamError, StreamId, StreamMeta, StreamState,
 };
 
 use crate::routes::AppState;
@@ -146,13 +146,25 @@ pub async fn create_stream(
         if tag_map.is_empty() { None } else { Some(tag_map) }
     };
 
-    match ds.create(&stream_id, tags) {
+    // Parse Content-Type from request headers; default to octet-stream.
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map_or(ContentType::OctetStream, ContentType::from_mime);
+
+    match ds.create(&stream_id, &content_type, tags) {
         Ok(meta) => {
             let mut resp_headers = meta_headers(&meta);
             resp_headers.insert(
                 "content-type",
                 HeaderValue::from_static("application/json"),
             );
+            // Return the tail offset so clients know where to start reading.
+            if let Some(ref next) = meta.next_offset {
+                if let Ok(v) = HeaderValue::from_str(&next.0) {
+                    resp_headers.insert("stream-next-offset", v);
+                }
+            }
             let body = serde_json::json!({
                 "id": meta.id.0,
                 "state": format!("{:?}", meta.state).to_lowercase(),
@@ -335,7 +347,12 @@ pub async fn head_stream(
             (StatusCode::GONE, "stream deleted").into_response()
         }
         Ok(meta) => {
-            let resp_headers = meta_headers(&meta);
+            let mut resp_headers = meta_headers(&meta);
+            if let Some(ref next) = meta.next_offset {
+                if let Ok(v) = HeaderValue::from_str(&next.0) {
+                    resp_headers.insert("stream-next-offset", v);
+                }
+            }
             (StatusCode::OK, resp_headers).into_response()
         }
         Err(e) => stream_error_response(e),

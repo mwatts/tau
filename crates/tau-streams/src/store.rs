@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     error::Result,
-    types::{AppendRequest, AppendResult, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
+    types::{AppendRequest, AppendResult, ContentType, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
 };
 
 /// Backend storage for durable streams.
@@ -12,13 +12,14 @@ use crate::{
 /// Implementors provide the persistence layer; callers interact with streams
 /// exclusively through this interface.
 pub trait StreamStore {
-    /// Creates a new stream with the given id and optional metadata tags.
+    /// Creates a new stream with the given id, content type, and optional metadata tags.
     ///
     /// Idempotent: if a stream with the same id already exists, returns its
     /// current metadata without error.
     fn create(
         &self,
         id: &StreamId,
+        content_type: &ContentType,
         tags: Option<HashMap<String, String>>,
     ) -> Result<StreamMeta>;
 

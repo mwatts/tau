@@ -205,6 +205,12 @@ pub struct StreamMeta {
     pub expires_at: Option<i64>,
     /// Arbitrary key/value tags for discovery and filtering.
     pub tags: HashMap<String, String>,
+    /// The offset a client should use for the next read/append (tail offset).
+    ///
+    /// Set by [`crate::store::StreamStore::head`] and create responses.
+    /// `None` when the caller did not request tail information.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<Offset>,
 }
 
 // ---------------------------------------------------------------------------

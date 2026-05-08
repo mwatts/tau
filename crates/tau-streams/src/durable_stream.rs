@@ -10,7 +10,7 @@ use crate::{
     error::Result,
     hub::LiveDeliveryHub,
     store::StreamStore,
-    types::{AppendRequest, AppendResult, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
+    types::{AppendRequest, AppendResult, ContentType, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
 };
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ impl<S: StreamStore> DurableStream<S> {
         &self.hub
     }
 
-    /// Creates a new stream.
+    /// Creates a new stream with the given content type and optional metadata tags.
     ///
     /// # Errors
     ///
@@ -51,9 +51,10 @@ impl<S: StreamStore> DurableStream<S> {
     pub fn create(
         &self,
         id: &StreamId,
+        content_type: &ContentType,
         tags: Option<HashMap<String, String>>,
     ) -> Result<StreamMeta> {
-        self.store.create(id, tags)
+        self.store.create(id, content_type, tags)
     }
 
     /// Appends an event to a stream and notifies live subscribers.
@@ -189,7 +190,7 @@ mod tests {
     async fn append_notifies_subscribers() {
         let ds = make_durable();
         let id = sid("stream-notify");
-        ds.create(&id, None).expect("create");
+        ds.create(&id, &ContentType::OctetStream, None).expect("create");
 
         let mut rx = ds.hub().subscribe(&id);
 
@@ -224,7 +225,7 @@ mod tests {
 
         let ds = make_durable();
         let id = sid("stream-dedup");
-        ds.create(&id, None).expect("create");
+        ds.create(&id, &ContentType::OctetStream, None).expect("create");
 
         let mut rx = ds.hub().subscribe(&id);
 
@@ -259,7 +260,7 @@ mod tests {
     async fn close_notifies_subscribers() {
         let ds = make_durable();
         let id = sid("stream-close");
-        ds.create(&id, None).expect("create");
+        ds.create(&id, &ContentType::OctetStream, None).expect("create");
 
         let mut rx = ds.hub().subscribe(&id);
 

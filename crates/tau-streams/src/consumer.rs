@@ -213,7 +213,7 @@ mod tests {
     use crate::{
         hub::LiveDeliveryHub,
         sqlite_store::SqliteStore,
-        types::{AppendRequest, StreamId},
+        types::{AppendRequest, ContentType, StreamId},
     };
 
     fn sid(s: &str) -> StreamId {
@@ -232,7 +232,7 @@ mod tests {
     ) -> StreamConsumer<SqliteStore> {
         let store = make_store();
         // Create the stream in the consumer's own store so reads don't error.
-        store.create(stream_id, None).expect("create");
+        store.create(stream_id, &ContentType::OctetStream, None).expect("create");
         StreamConsumer::new(
             stream_id.clone(),
             store,
@@ -253,7 +253,7 @@ mod tests {
 
         // Populate a shared store with two historical events.
         let shared_store = make_store();
-        shared_store.create(&id, None).expect("create");
+        shared_store.create(&id, &ContentType::OctetStream, None).expect("create");
         shared_store
             .append(
                 &id,
@@ -366,7 +366,7 @@ mod tests {
 
         // Populate store with one event and catch up fully.
         let shared_store = make_store();
-        shared_store.create(&id, None).expect("create");
+        shared_store.create(&id, &ContentType::OctetStream, None).expect("create");
         let res = shared_store
             .append(
                 &id,
