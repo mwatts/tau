@@ -18,8 +18,8 @@ use crate::{
     offset::OffsetGenerator,
     store::StreamStore,
     types::{
-        AppendRequest, AppendResult, ContentType, Offset, ReadResult, StreamEvent, StreamId,
-        StreamMeta, StreamState,
+        AppendRequest, AppendResult, ContentType, Offset, ProducerEpoch, ProducerId, ProducerInfo,
+        ReadResult, StreamEvent, StreamId, StreamMeta, StreamState,
     },
 };
 
@@ -104,6 +104,15 @@ impl SqliteStore {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_events_producer_dedup
                 ON stream_events (stream_id, producer_id, epoch, seq)
                 WHERE producer_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS stream_producers (
+                stream_id      TEXT NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+                producer_id    TEXT NOT NULL,
+                epoch          INTEGER NOT NULL DEFAULT 1,
+                registered_at  INTEGER NOT NULL,
+                last_append_at INTEGER,
+                PRIMARY KEY (stream_id, producer_id)
+            );
             ",
         );
         drop(conn);
@@ -239,8 +248,18 @@ impl StreamStore for SqliteStore {
             )]
             let seq_val: i64 = req.seq.map_or(0, |s| s.0 as i64);
 
-            // Check current max epoch for this producer.
-            let current_epoch: Option<i64> = conn
+            // Check registered epoch in stream_producers (authoritative fence).
+            let registered_epoch: Option<i64> = conn
+                .query_row(
+                    "SELECT epoch FROM stream_producers
+                     WHERE stream_id = ?1 AND producer_id = ?2",
+                    params![id.0, pid.0],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            // Also check the max epoch observed in stream_events (legacy/unregistered).
+            let events_epoch: Option<i64> = conn
                 .query_row(
                     "SELECT MAX(epoch) FROM stream_events
                      WHERE stream_id = ?1 AND producer_id = ?2",
@@ -249,6 +268,14 @@ impl StreamStore for SqliteStore {
                 )
                 .optional()?
                 .flatten();
+
+            // Fencing is enforced against the highest known epoch from either source.
+            let current_epoch = match (registered_epoch, events_epoch) {
+                (Some(r), Some(e)) => Some(r.max(e)),
+                (Some(r), None) => Some(r),
+                (None, Some(e)) => Some(e),
+                (None, None) => None,
+            };
 
             if let Some(current) = current_epoch {
                 if epoch_val < current {
@@ -560,6 +587,61 @@ impl StreamStore for SqliteStore {
             )?;
         }
         self.head(dest)
+    }
+
+    fn register_producer(&self, id: &StreamId, producer_id: &ProducerId) -> Result<ProducerEpoch> {
+        self.head(id)?; // verify stream exists
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO stream_producers (stream_id, producer_id, epoch, registered_at)
+             VALUES (?1, ?2, 1, ?3)
+             ON CONFLICT(stream_id, producer_id) DO UPDATE SET
+                epoch = stream_producers.epoch + 1,
+                registered_at = excluded.registered_at",
+            params![id.0, producer_id.0, now],
+        )?;
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "epoch is always a positive integer stored as i64"
+        )]
+        let epoch: u64 = conn.query_row(
+            "SELECT epoch FROM stream_producers WHERE stream_id = ?1 AND producer_id = ?2",
+            params![id.0, producer_id.0],
+            |r| r.get::<_, i64>(0),
+        )? as u64;
+        Ok(ProducerEpoch(epoch))
+    }
+
+    fn list_producers(&self, id: &StreamId) -> Result<Vec<ProducerInfo>> {
+        self.head(id)?;
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT producer_id, epoch, registered_at, last_append_at
+             FROM stream_producers WHERE stream_id = ?1
+             ORDER BY registered_at",
+        )?;
+        let rows = stmt.query_map(params![id.0], |row| {
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "epoch is always a positive integer stored as i64"
+            )]
+            let epoch = ProducerEpoch(row.get::<_, i64>(1)? as u64);
+            Ok(ProducerInfo {
+                producer_id: ProducerId(row.get(0)?),
+                epoch,
+                registered_at: row.get(2)?,
+                last_append_at: row.get(3)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 }
 
@@ -875,5 +957,107 @@ mod tests {
         assert_eq!(meta.id.0, "fork-empty");
         let read = store.read(&dest, &Offset::beginning(), 100).expect("read");
         assert_eq!(read.events.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Producer registration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_producer_assigns_epoch() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let id = StreamId("multi".to_owned());
+        store.create(&id, None).expect("create");
+
+        let reg1 = store.register_producer(&id, &ProducerId("writer-a".to_owned())).expect("reg1");
+        assert_eq!(reg1.0, 1);
+
+        let reg2 = store.register_producer(&id, &ProducerId("writer-b".to_owned())).expect("reg2");
+        assert_eq!(reg2.0, 1);
+
+        let reg3 = store.register_producer(&id, &ProducerId("writer-a".to_owned())).expect("reg3");
+        assert_eq!(reg3.0, 2);
+    }
+
+    #[test]
+    fn list_producers_returns_registered() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let id = StreamId("multi-list".to_owned());
+        store.create(&id, None).expect("create");
+
+        store.register_producer(&id, &ProducerId("a".to_owned())).expect("reg");
+        store.register_producer(&id, &ProducerId("b".to_owned())).expect("reg");
+
+        let producers = store.list_producers(&id).expect("list");
+        assert_eq!(producers.len(), 2);
+        assert_eq!(producers[0].producer_id.0, "a");
+        assert_eq!(producers[1].producer_id.0, "b");
+    }
+
+    #[test]
+    fn multi_writer_epoch_fencing() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let id = StreamId("fenced".to_owned());
+        store.create(&id, None).expect("create");
+
+        let pid_a = ProducerId("writer-a".to_owned());
+        let pid_b = ProducerId("writer-b".to_owned());
+        let epoch_a = store.register_producer(&id, &pid_a).expect("reg a");
+        let epoch_b = store.register_producer(&id, &pid_b).expect("reg b");
+
+        // Both write successfully
+        store.append(&id, AppendRequest {
+            data: b"from-a".to_vec(),
+            producer_id: Some(pid_a.clone()),
+            epoch: Some(epoch_a),
+            seq: Some(ProducerSeq(0)),
+        }).expect("a writes");
+
+        store.append(&id, AppendRequest {
+            data: b"from-b".to_vec(),
+            producer_id: Some(pid_b.clone()),
+            epoch: Some(epoch_b),
+            seq: Some(ProducerSeq(0)),
+        }).expect("b writes");
+
+        // Re-register writer-a bumps epoch, fencing old
+        let epoch_a2 = store.register_producer(&id, &pid_a).expect("re-reg a");
+        assert!(epoch_a2.0 > epoch_a.0);
+
+        // Old epoch fenced
+        let fenced = store.append(&id, AppendRequest {
+            data: b"stale-a".to_vec(),
+            producer_id: Some(pid_a.clone()),
+            epoch: Some(epoch_a),
+            seq: Some(ProducerSeq(1)),
+        });
+        assert!(matches!(fenced, Err(crate::error::StreamError::ProducerFenced { .. })));
+
+        // New epoch works
+        store.append(&id, AppendRequest {
+            data: b"fresh-a".to_vec(),
+            producer_id: Some(pid_a),
+            epoch: Some(epoch_a2),
+            seq: Some(ProducerSeq(0)),
+        }).expect("new epoch");
+
+        // writer-b unaffected
+        store.append(&id, AppendRequest {
+            data: b"from-b-2".to_vec(),
+            producer_id: Some(pid_b),
+            epoch: Some(epoch_b),
+            seq: Some(ProducerSeq(1)),
+        }).expect("b still works");
+
+        let read = store.read(&id, &Offset::beginning(), 100).expect("read");
+        assert_eq!(read.events.len(), 4);
+    }
+
+    #[test]
+    fn register_producer_nonexistent_stream_errors() {
+        let store = SqliteStore::open_in_memory().expect("store");
+        let id = StreamId("nope".to_owned());
+        let result = store.register_producer(&id, &ProducerId("x".to_owned()));
+        assert!(result.is_err());
     }
 }
