@@ -985,6 +985,17 @@ impl StreamStore for SqliteStore {
     ) -> Result<StreamMeta> {
         let source_meta = self.head(source)?;
 
+        // Validate fork offset doesn't exceed source tail
+        if !fork_offset.is_beginning() && !fork_offset.is_now() {
+            if let Some(ref tail) = source_meta.next_offset {
+                if !tail.is_now() && fork_offset.0 > tail.0 {
+                    return Err(StreamError::InvalidInput(
+                        format!("fork offset {} exceeds source tail {}", fork_offset.0, tail.0),
+                    ));
+                }
+            }
+        }
+
         let ct = match content_type {
             Some(ct) if *ct != source_meta.content_type => {
                 return Err(StreamError::AlreadyExists(dest.clone()));

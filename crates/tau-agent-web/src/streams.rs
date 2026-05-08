@@ -555,6 +555,19 @@ pub async fn read_stream(
                                 HeaderValue::from_static("public, max-age=31536000, immutable"),
                             );
                         }
+
+                        let closed_suffix = if result.stream_closed && result.up_to_date { ":c" } else { "" };
+                        let etag = format!("\"{}:{}:{}{}\"", stream_id.0, offset.0, result.next_offset.0, closed_suffix);
+                        if let Ok(v) = HeaderValue::from_str(&etag) {
+                            resp_headers.insert("etag", v);
+                        }
+
+                        if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+                            if inm == etag {
+                                return StatusCode::NOT_MODIFIED.into_response();
+                            }
+                        }
+
                         return (StatusCode::OK, resp_headers, body).into_response();
                     }
 
