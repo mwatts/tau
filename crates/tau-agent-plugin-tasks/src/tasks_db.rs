@@ -1363,7 +1363,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.budget_usd, t.spent_usd, t.no_merge, t.dispatch_failure_count, t.created_at,
                         t.updated_at
                  FROM task_relations r
                  JOIN tasks t ON t.id = r.to_task
@@ -1391,10 +1391,7 @@ impl TasksDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
-                        t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at,
-                        t.updated_at
+                &format!("SELECT {TASK_COLUMNS}
                  FROM tasks t
                  WHERE t.project_name = ?1 AND t.state IN ('ready', 'planning')
                    AND NOT t.held
@@ -1405,7 +1402,7 @@ impl TasksDb {
                          AND r.relation = 'depends_on'
                          AND dep.state NOT IN ('merged', 'closed')
                    )
-                 ORDER BY t.priority DESC, t.created_at ASC",
+                 ORDER BY t.priority DESC, t.created_at ASC"),
             )
             .map_err(plugin_io_err("prepare get_schedulable_tasks"))?;
 
@@ -2092,7 +2089,7 @@ impl TasksDb {
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.budget_usd, t.spent_usd, t.no_merge, t.dispatch_failure_count, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1 AND t.state = ?2
@@ -2111,7 +2108,7 @@ impl TasksDb {
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.budget_usd, t.spent_usd, t.no_merge, t.dispatch_failure_count, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1

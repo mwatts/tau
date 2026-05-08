@@ -481,7 +481,9 @@ mod tests {
                 }
                 // Skip `match` arms / destructuring patterns — they are
                 // deconstruction, not construction.
-                if line.contains("Request::CreateSession { .. }") {
+                if line.contains("Request::CreateSession { .. }")
+                    || line.contains(".. } =>")
+                {
                     continue;
                 }
                 hits.push(format!("{}:{}: {}", file_name, lineno + 1, line.trim()));

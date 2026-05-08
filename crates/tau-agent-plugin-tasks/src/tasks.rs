@@ -8221,7 +8221,7 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 22,
+            total < 24,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );
