@@ -24,6 +24,6 @@ pub use offset::OffsetGenerator;
 pub use sqlite_store::SqliteStore;
 pub use store::StreamStore;
 pub use types::{
-    AppendRequest, AppendResult, ContentType, Offset, ProducerEpoch, ProducerId, ProducerSeq,
-    ReadResult, StreamEnvelope, StreamEvent, StreamId, StreamMeta, StreamState,
+    AppendRequest, AppendResult, ContentType, Offset, ProducerEpoch, ProducerId, ProducerInfo,
+    ProducerSeq, ReadResult, StreamEnvelope, StreamEvent, StreamId, StreamMeta, StreamState,
 };

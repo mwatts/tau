@@ -10,7 +10,7 @@ use crate::{
     error::Result,
     hub::LiveDeliveryHub,
     store::StreamStore,
-    types::{AppendRequest, AppendResult, Offset, ReadResult, StreamId, StreamMeta},
+    types::{AppendRequest, AppendResult, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
 };
 
 // ---------------------------------------------------------------------------
@@ -141,6 +141,24 @@ impl<S: StreamStore> DurableStream<S> {
         tags: Option<HashMap<String, String>>,
     ) -> Result<StreamMeta> {
         self.store.fork(source, up_to, dest, tags)
+    }
+
+    /// Registers a producer on a stream, returning its new epoch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from the underlying store.
+    pub fn register_producer(&self, id: &StreamId, producer_id: &ProducerId) -> Result<ProducerEpoch> {
+        self.store.register_producer(id, producer_id)
+    }
+
+    /// Lists all producers registered on a stream, ordered by registration time.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from the underlying store.
+    pub fn list_producers(&self, id: &StreamId) -> Result<Vec<ProducerInfo>> {
+        self.store.list_producers(id)
     }
 }
 

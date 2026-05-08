@@ -105,6 +105,19 @@ pub struct ProducerEpoch(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProducerSeq(pub u64);
 
+/// Information about a registered producer on a stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProducerInfo {
+    /// The producer identifier.
+    pub producer_id: ProducerId,
+    /// Current epoch for this producer (monotonically increasing).
+    pub epoch: ProducerEpoch,
+    /// Unix timestamp (seconds) when the producer was first (or last) registered.
+    pub registered_at: i64,
+    /// Unix timestamp (seconds) of the last append by this producer, if any.
+    pub last_append_at: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // ContentType
 // ---------------------------------------------------------------------------

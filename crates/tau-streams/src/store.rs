@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     error::Result,
-    types::{AppendRequest, AppendResult, Offset, ReadResult, StreamId, StreamMeta},
+    types::{AppendRequest, AppendResult, Offset, ProducerEpoch, ProducerId, ProducerInfo, ReadResult, StreamId, StreamMeta},
 };
 
 /// Backend storage for durable streams.
@@ -92,4 +92,22 @@ pub trait StreamStore {
         dest: &StreamId,
         tags: Option<HashMap<String, String>>,
     ) -> Result<StreamMeta>;
+
+    /// Registers a producer on a stream, returning its new epoch.
+    ///
+    /// Each call increments the epoch for the given `producer_id`, fencing any
+    /// prior instances that hold an older epoch.  The first registration returns
+    /// epoch `1`.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::StreamError::NotFound`] — stream does not exist.
+    fn register_producer(&self, id: &StreamId, producer_id: &ProducerId) -> Result<ProducerEpoch>;
+
+    /// Lists all producers registered on a stream, ordered by registration time.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::error::StreamError::NotFound`] — stream does not exist.
+    fn list_producers(&self, id: &StreamId) -> Result<Vec<ProducerInfo>>;
 }
