@@ -48,6 +48,65 @@ impl StreamDb {
         }
         Ok(())
     }
+
+    /// Create a session in the legacy sessions table and, when a durable
+    /// stream backend is configured, also create the session stream and emit
+    /// a [`SessionMeta`] event with the session's initial metadata.
+    pub fn create_session(&self, session: &crate::db::StoredSession) -> crate::Result<()> {
+        self.db.create_session(session)?;
+
+        if let Some(ref ds) = self.streams {
+            let stream_id = tau_streams::StreamId(format!("session-{}", session.id));
+            let mut tags = std::collections::HashMap::new();
+            tags.insert("type".to_string(), "session".to_string());
+            tags.insert("session_id".to_string(), session.id.clone());
+            if let Some(ref project) = session.project_name {
+                tags.insert("project".to_string(), project.clone());
+            }
+            let _ = ds.create(&stream_id, Some(tags));
+
+            let meta_event = crate::stream_events::SessionEvent::SessionMeta {
+                key: "created".to_string(),
+                value: serde_json::json!({
+                    "model": session.model.id,
+                    "cwd": session.cwd,
+                    "project_name": session.project_name,
+                    "parent_id": session.parent_id,
+                }),
+            };
+            let data = meta_event.to_ndjson_bytes("server");
+            let _ = ds.append(&stream_id, tau_streams::AppendRequest {
+                data, producer_id: None, epoch: None, seq: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// Queue a message in the legacy queued_messages table and, when a durable
+    /// stream backend is configured, also emit an [`InboxEvent`] to the
+    /// target session's inbox stream.
+    pub fn queue_message(&self, target: &str, content: &str, sender_info: &str) -> crate::Result<()> {
+        self.db.queue_message(target, content, sender_info)?;
+
+        if let Some(ref ds) = self.streams {
+            let stream_id = tau_streams::StreamId(format!("inbox-{target}"));
+            let _ = ds.create(&stream_id, {
+                let mut tags = std::collections::HashMap::new();
+                tags.insert("type".to_string(), "inbox".to_string());
+                tags.insert("session_id".to_string(), target.to_string());
+                Some(tags)
+            });
+            let event = crate::stream_events::InboxEvent::Message {
+                content: content.to_string(),
+                sender_info: sender_info.to_string(),
+            };
+            let data = event.to_ndjson_bytes("server");
+            let _ = ds.append(&stream_id, tau_streams::AppendRequest {
+                data, producer_id: None, epoch: None, seq: None,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl std::ops::Deref for StreamDb {
