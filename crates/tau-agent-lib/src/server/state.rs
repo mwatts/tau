@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::auth::AuthStorage;
 use crate::config;
-use crate::db::Db;
 use crate::protocol::{ChatAttachment, Response};
 use crate::provider::ProviderRegistry;
 use crate::types::Model;
@@ -14,7 +13,7 @@ pub(crate) type ServerDurableStream =
     tau_streams::DurableStream<tau_streams::SqliteStore>;
 
 pub(crate) struct State {
-    pub(crate) db: Db,
+    pub(crate) db: crate::stream_db::StreamDb,
     pub(crate) registry: ProviderRegistry,
     pub(crate) auth: AuthStorage,
     pub(crate) config: config::Config,

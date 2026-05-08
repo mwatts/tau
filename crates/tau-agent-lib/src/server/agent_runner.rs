@@ -1646,7 +1646,7 @@ mod compaction_tests {
         )]));
         let model = mock_model();
         Arc::new(Mutex::new(State {
-            db,
+            db: crate::stream_db::StreamDb::new(db, None),
             registry,
             auth: crate::auth::AuthStorage::open_default(),
             config: crate::config::Config::default(),
@@ -1929,7 +1929,7 @@ mod panic_recovery_tests {
         ])]));
         let model = mock_model();
         Arc::new(Mutex::new(State {
-            db,
+            db: crate::stream_db::StreamDb::new(db, None),
             registry,
             auth: crate::auth::AuthStorage::open_default(),
             config: {

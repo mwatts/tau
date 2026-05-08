@@ -1032,7 +1032,7 @@ mod tests {
     fn mk_state() -> SharedState {
         let db = Db::open_memory().expect("open memory db");
         Arc::new(Mutex::new(State {
-            db,
+            db: crate::stream_db::StreamDb::new(db, None),
             registry: ProviderRegistry::new(),
             auth: crate::auth::AuthStorage::open_default(),
             config: crate::config::Config::default(),

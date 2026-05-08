@@ -401,7 +401,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     };
 
     let state: SharedState = Arc::new(Mutex::new(State {
-        db,
+        db: crate::stream_db::StreamDb::new(db, streams.clone()),
         registry: config.registry,
         auth: AuthStorage::open_default(),
         config: cfg,
@@ -646,7 +646,7 @@ pub async fn run() -> crate::Result<()> {
     let throttle = crate::throttle::ProviderThrottle::new();
 
     let state: SharedState = Arc::new(Mutex::new(State {
-        db,
+        db: crate::stream_db::StreamDb::new(db, streams.clone()),
         registry,
         auth: AuthStorage::open_default(),
         config: cfg,

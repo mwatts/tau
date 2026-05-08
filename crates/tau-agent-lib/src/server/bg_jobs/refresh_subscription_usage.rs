@@ -352,7 +352,7 @@ mod tests {
         let auth_dir = tempfile::tempdir().expect("tempdir for auth storage");
         let auth = AuthStorage::new(auth_dir.path().join("auth.json"));
         let state: SharedState = Arc::new(Mutex::new(State {
-            db,
+            db: crate::stream_db::StreamDb::new(db, None),
             registry: ProviderRegistry::new(),
             auth,
             config: crate::config::Config::default(),
