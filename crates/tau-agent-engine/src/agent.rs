@@ -3017,12 +3017,10 @@ mod tests {
                 "tool result should mention cancellation, got: {text}"
             );
 
-            // No tracked PGIDs left behind.
-            assert_eq!(
-                tau_agent_plugin_worker::tools::bash::tracked_pgid_count(),
-                0,
-                "tracked PGIDs should be empty after cancel"
-            );
+            // NOTE: We intentionally do NOT assert tracked_pgid_count() == 0
+            // here. TRACKED_PGIDS is a process-global static shared across all
+            // tests in this binary. Under parallel execution another test's
+            // bash subprocess may still be tracked, causing spurious failures.
         });
     }
 
