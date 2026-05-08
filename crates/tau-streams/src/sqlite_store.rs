@@ -212,7 +212,7 @@ impl StreamStore for SqliteStore {
             ttl: None,
             expires_at: None,
             tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            next_offset: None,
+            next_offset: Some(Offset::now()),
         })
     }
 
