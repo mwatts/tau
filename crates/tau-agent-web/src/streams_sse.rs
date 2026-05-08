@@ -18,6 +18,7 @@ use tau_streams::{LiveEvent, Offset, StreamId};
 use tokio::time::timeout;
 
 use crate::routes::AppState;
+use crate::streams::stream_error_response;
 
 const BATCH_SIZE: usize = 100;
 const SSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -39,6 +40,14 @@ pub async fn handle_sse(
         }
     };
 
+    // Determine encoding from content type
+    let meta = match ds.head(&stream_id) {
+        Ok(m) => m,
+        Err(e) => return stream_error_response(e),
+    };
+    let mime = meta.content_type.as_mime().to_owned();
+    let use_base64 = !mime.starts_with("text/") && mime != "application/json";
+
     let event_stream = stream! {
         let mut cursor = offset;
 
@@ -55,17 +64,12 @@ pub async fn handle_sse(
             };
 
             for ev in &result.events {
-                let json = match serde_json::to_string(&serde_json::json!({
-                    "offset": ev.offset.0,
-                    "data": base64_encode(&ev.data),
-                })) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        yield Err(format!("serialize error: {e}"));
-                        return;
-                    }
+                let data_payload = if use_base64 {
+                    base64_encode(&ev.data)
+                } else {
+                    String::from_utf8_lossy(&ev.data).into_owned()
                 };
-                yield Ok(Event::default().data(json));
+                yield Ok(Event::default().event("data").data(data_payload));
             }
 
             if let Some(last) = result.events.last() {
@@ -73,28 +77,17 @@ pub async fn handle_sse(
             }
 
             if result.up_to_date {
-                // Emit control: streamUpToDate
-                let ctrl = serde_json::json!({
-                    "streamUpToDate": true,
+                let mut ctrl = serde_json::json!({
                     "streamNextOffset": result.next_offset.0,
+                    "upToDate": true,
                 });
-                yield Ok(
-                    Event::default()
-                        .event("control")
-                        .data(ctrl.to_string()),
-                );
-
                 if result.stream_closed {
-                    let close_ctrl = serde_json::json!({"streamClosed": true});
-                    yield Ok(
-                        Event::default()
-                            .event("control")
-                            .data(close_ctrl.to_string()),
-                    );
+                    ctrl["streamClosed"] = serde_json::json!(true);
+                }
+                yield Ok(Event::default().event("control").data(ctrl.to_string()));
+                if result.stream_closed {
                     return;
                 }
-                // cursor not needed after break; live phase starts fresh.
-                let _ = result.next_offset;
                 break;
             }
         }
@@ -108,20 +101,23 @@ pub async fn handle_sse(
             let recv_fut = rx.recv();
             match timeout(SSE_TIMEOUT, recv_fut).await {
                 Ok(Ok(LiveEvent::Data { offset, data })) => {
-                    let json = match serde_json::to_string(&serde_json::json!({
-                        "offset": offset.0,
-                        "data": base64_encode(&data),
-                    })) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            yield Err(format!("serialize error: {e}"));
-                            return;
-                        }
+                    let data_payload = if use_base64 {
+                        base64_encode(&data)
+                    } else {
+                        String::from_utf8_lossy(&data).into_owned()
                     };
-                    yield Ok(Event::default().data(json));
+                    yield Ok(Event::default().event("data").data(data_payload));
+
+                    let ctrl = serde_json::json!({
+                        "streamNextOffset": offset.0,
+                    });
+                    yield Ok(Event::default().event("control").data(ctrl.to_string()));
                 }
                 Ok(Ok(LiveEvent::Closed)) => {
-                    let ctrl = serde_json::json!({"streamClosed": true});
+                    let ctrl = serde_json::json!({
+                        "streamClosed": true,
+                        "upToDate": true,
+                    });
                     yield Ok(
                         Event::default()
                             .event("control")
@@ -142,9 +138,16 @@ pub async fn handle_sse(
         }
     };
 
-    Sse::new(event_stream)
+    let mut response = Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response();
+    if use_base64 {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("stream-sse-data-encoding"),
+            axum::http::HeaderValue::from_static("base64"),
+        );
+    }
+    response
 }
 
 fn base64_encode(data: &[u8]) -> String {
