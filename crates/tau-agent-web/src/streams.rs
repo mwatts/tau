@@ -359,6 +359,7 @@ pub struct ReadQuery {
     pub limit: Option<usize>,
     /// `live=sse` → SSE; `live=long-poll` → long-poll; absent → immediate read
     pub live: Option<String>,
+    pub cursor: Option<String>,
 }
 
 pub async fn read_stream(
@@ -378,7 +379,7 @@ pub async fn read_stream(
             crate::streams_sse::handle_sse(stream_id, offset, state).await
         }
         Some("long-poll") => {
-            crate::streams_longpoll::handle_long_poll(stream_id, offset, limit, state).await
+            crate::streams_longpoll::handle_long_poll(stream_id, offset, limit, query.cursor, state).await
         }
         _ => {
             // Immediate read.

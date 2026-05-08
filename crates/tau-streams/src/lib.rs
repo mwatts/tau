@@ -9,6 +9,7 @@
 //! - Catch-up + live consumer via [`consumer::StreamConsumer`]
 
 pub mod consumer;
+pub mod cursor;
 pub mod durable_stream;
 pub mod error;
 pub mod hub;
@@ -17,6 +18,7 @@ pub mod sqlite_store;
 pub mod store;
 pub mod types;
 
+pub use cursor::generate_cursor;
 pub use durable_stream::DurableStream;
 pub use error::{Result, StreamError};
 pub use hub::{LiveDeliveryHub, LiveEvent};

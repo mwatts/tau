@@ -83,6 +83,9 @@ pub async fn handle_sse(
                 });
                 if result.stream_closed {
                     ctrl["streamClosed"] = serde_json::json!(true);
+                } else {
+                    let cursor_val = tau_streams::generate_cursor(None);
+                    ctrl["streamCursor"] = serde_json::json!(cursor_val);
                 }
                 yield Ok(Event::default().event("control").data(ctrl.to_string()));
                 if result.stream_closed {
@@ -108,8 +111,10 @@ pub async fn handle_sse(
                     };
                     yield Ok(Event::default().event("data").data(data_payload));
 
+                    let cursor_val = tau_streams::generate_cursor(None);
                     let ctrl = serde_json::json!({
                         "streamNextOffset": offset.0,
+                        "streamCursor": cursor_val,
                     });
                     yield Ok(Event::default().event("control").data(ctrl.to_string()));
                 }

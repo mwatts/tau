@@ -22,6 +22,7 @@ pub async fn handle_long_poll(
     stream_id: StreamId,
     offset: Offset,
     limit: usize,
+    cursor: Option<String>,
     state: Arc<AppState>,
 ) -> Response {
     let ds = match &state.streams {
@@ -31,6 +32,8 @@ pub async fn handle_long_poll(
         }
     };
 
+    let client_cursor = cursor.and_then(|c| c.parse::<u64>().ok());
+
     // First attempt: read immediately.
     let result = match ds.read(&stream_id, &offset, limit) {
         Ok(r) => r,
@@ -38,12 +41,12 @@ pub async fn handle_long_poll(
     };
 
     if !result.events.is_empty() {
-        return build_read_response(result);
+        return build_read_response(result, client_cursor);
     }
 
     if result.stream_closed {
         // Stream is done; return the empty result immediately with the closed header.
-        return build_read_response(result);
+        return build_read_response(result, client_cursor);
     }
 
     // No data yet — subscribe and wait.
@@ -53,20 +56,24 @@ pub async fn handle_long_poll(
         Ok(Ok(LiveEvent::Data { .. })) | Ok(Ok(LiveEvent::Closed)) => {
             // New event (or close): re-read from the store.
             match ds.read(&stream_id, &offset, limit) {
-                Ok(r) => build_read_response(r),
+                Ok(r) => build_read_response(r, client_cursor),
                 Err(e) => stream_error_response(e),
             }
         }
         Ok(Err(_lagged)) => {
             // Broadcast lagged — re-read anyway.
             match ds.read(&stream_id, &offset, limit) {
-                Ok(r) => build_read_response(r),
+                Ok(r) => build_read_response(r, client_cursor),
                 Err(e) => stream_error_response(e),
             }
         }
         Err(_timeout) => {
+            let cursor_val = tau_streams::generate_cursor(client_cursor);
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert("stream-up-to-date", HeaderValue::from_static("true"));
+            if let Ok(v) = HeaderValue::from_str(&cursor_val) {
+                resp_headers.insert("stream-cursor", v);
+            }
             if let Ok(meta) = ds.head(&stream_id) {
                 if let Some(ref next) = meta.next_offset {
                     if let Ok(v) = HeaderValue::from_str(&next.0) {
@@ -82,7 +89,7 @@ pub async fn handle_long_poll(
     }
 }
 
-fn build_read_response(result: tau_streams::ReadResult) -> Response {
+fn build_read_response(result: tau_streams::ReadResult, client_cursor: Option<u64>) -> Response {
     use axum::body::Body;
     use axum::http::Response as HttpResponse;
 
@@ -97,6 +104,8 @@ fn build_read_response(result: tau_streams::ReadResult) -> Response {
         lines.push('\n');
     }
 
+    let cursor_val = tau_streams::generate_cursor(client_cursor);
+
     let mut builder = HttpResponse::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/x-ndjson")
@@ -104,7 +113,10 @@ fn build_read_response(result: tau_streams::ReadResult) -> Response {
             "stream-next-offset",
             HeaderValue::from_str(&result.next_offset.0).unwrap_or_else(|_| HeaderValue::from_static("")),
         )
-    ;
+        .header(
+            "stream-cursor",
+            HeaderValue::from_str(&cursor_val).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
 
     // Presence headers: only insert when true (§5.6)
     if result.up_to_date {
